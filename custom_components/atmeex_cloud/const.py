@@ -1,2 +1,2 @@
 DOMAIN = "atmeex_cloud"
-PLATFORMS = ["climate", "fan", "select"]
+PLATFORMS = ["climate", "fan", "select", "sensor"]

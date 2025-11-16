@@ -1,7 +1,9 @@
-from typing import Any, Dict, Optional
-from aiohttp import ClientSession, ClientError
-import asyncio
+from __future__ import annotations
 
+from typing import Any, Dict, Optional
+
+import asyncio
+from aiohttp import ClientSession, ClientError, ClientResponse 
 API_BASE = "https://api.iot.atmeex.com"
 
 
@@ -10,6 +12,8 @@ class ApiError(Exception):
 
 
 class AtmeexApi:
+    """Thin async client for the Atmeex Cloud HTTP API."""
+
     def __init__(self, session: ClientSession):
         self._session = session
         self._token: Optional[str] = None
@@ -23,12 +27,12 @@ class AtmeexApi:
         """
 
     def _headers(self) -> Dict[str, str]:
-        hdrs = {"Accept": "application/json"}
+        hdrs: Dict[str, str] = {"Accept": "application/json"}
         if self._token:
             hdrs["Authorization"] = f"Bearer {self._token}"
         return hdrs
 
-    async def _json(self, resp):
+    async def _json(self, resp: ClientResponse) -> Any:
         """Parse JSON with helpful error if body is not valid JSON."""
         try:
             return await resp.json()
@@ -43,7 +47,7 @@ class AtmeexApi:
         action_name: str,
         timeout: int = 20,
     ) -> None:
-        """unified helper for all param-setting PUT calls."""
+        """Unified helper for all param-setting PUT calls."""
         try:
             async with self._session.put(
                 f"{API_BASE}/devices/{device_id}/params",
@@ -57,11 +61,9 @@ class AtmeexApi:
         except (asyncio.TimeoutError, ClientError) as e:
             raise ApiError(f"{action_name} network error: {e}") from e
 
-
-    async def login(self, email: str, password: str):
+    async def login(self, email: str, password: str) -> None:
         """Authenticate user and store access token."""
         try:
-            # CHANGE: тест ожидает /auth/signin
             async with self._session.post(
                 f"{API_BASE}/auth/signin",
                 json={"email": email, "password": password},
@@ -76,14 +78,11 @@ class AtmeexApi:
                 if not self._token:
                     raise ApiError("login: token missing in response")
         except (asyncio.TimeoutError, ClientError) as e:
-            # Формат network-ошибок можем оставить как есть — тесты это не проверяют
             raise ApiError(f"login network error: {e}") from e
-
 
     async def get_devices(self, fallback: bool = False) -> list[dict[str, Any]]:
         """Fetch devices, with optional fallback behavior.
 
-        added `fallback` parameter to match usage in __init__.
         When `fallback=True`, this method returns [] instead of raising ApiError.
         """
         try:
@@ -101,7 +100,8 @@ class AtmeexApi:
                 data = await self._json(resp)
                 # Return list; reshape if backend uses wrapper { "items": [...] }
                 if isinstance(data, dict) and "items" in data:
-                    return data["items"]
+                    items = data["items"]
+                    return items if isinstance(items, list) else []
                 if isinstance(data, list):
                     return data
                 msg = "get_devices: unexpected response shape"
@@ -113,7 +113,7 @@ class AtmeexApi:
                 return []
             raise ApiError(f"get_devices network error: {e}") from e
 
-    async def get_device(self, device_id: int | str):
+    async def get_device(self, device_id: int | str) -> dict[str, Any]:
         """Fetch a single device by id with timeout and error wrapping."""
         try:
             async with self._session.get(
@@ -126,26 +126,32 @@ class AtmeexApi:
                     raise ApiError(
                         f"GET /devices/{device_id} {resp.status}: {txt[:300]}"
                     )
-                return await self._json(resp)
+                data = await self._json(resp)
+                return data if isinstance(data, dict) else {}
         except (asyncio.TimeoutError, ClientError) as e:
             raise ApiError(f"get_device network error for {device_id}: {e}") from e
 
-    async def set_power(self, device_id: int | str, on: bool):
+    async def set_power(self, device_id: int | str, on: bool) -> None:
+        """Set power state (bool) via u_pwr_on."""
         body = {"u_pwr_on": bool(on)}
         await self._put_params(device_id, body, "set_power")
 
-    async def set_target_temperature(self, device_id: int | str, temp_c: float):
+    async def set_target_temperature(self, device_id: int | str, temp_c: float) -> None:
+        """Set target temperature in °C, converted to деци-°C for API."""
         body = {"u_temp_room": int(round(temp_c * 10))}
         await self._put_params(device_id, body, "set_target_temperature")
 
-    async def set_fan_speed(self, device_id: int | str, speed: int):
+    async def set_fan_speed(self, device_id: int | str, speed: int) -> None:
+        """Set discrete fan speed 0..7."""
         body = {"u_fan_speed": int(speed)}
         await self._put_params(device_id, body, "set_fan_speed")
 
-    async def set_brizer_mode(self, device_id: int | str, damp_pos: int):
+    async def set_brizer_mode(self, device_id: int | str, damp_pos: int) -> None:
+        """Set brizer (damper) mode, 0..3."""
         body = {"u_damp_pos": int(damp_pos)}
         await self._put_params(device_id, body, "set_brizer_mode")
 
-    async def set_humid_stage(self, device_id: int | str, stage: int):
+    async def set_humid_stage(self, device_id: int | str, stage: int) -> None:
+        """Set humidifier stage 0..3."""
         body = {"u_hum_stg": int(stage)}
-        await self._put_params(device_id, body, "set_humid_stage")
+        await self._put_params(device_id, body, "set_hum_stg")

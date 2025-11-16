@@ -15,9 +15,9 @@ from .const import DOMAIN
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_entities):
     """Set up Atmeex fan entities from a config entry."""
-    data = hass.data[DOMAIN][entry.entry_id]
-    coordinator = data["coordinator"]
-    api = data["api"]
+    runtime = entry.runtime_data  # AtmeexRuntimeData
+    coordinator = runtime.coordinator
+    api = runtime.api
 
     entities: list[AtmeexFan] = []
     for dev in coordinator.data.get("devices", []):
@@ -52,7 +52,7 @@ class AtmeexFan(CoordinatorEntity, FanEntity):
     ) -> None:
         super().__init__(coordinator)
         self.api = api
-        self._entry_id = entry_id
+        self._entry_id = entry_id  # пока не используется, но оставляем для консистентности
         self._device_id = device_id
         self._attr_name = name
         self._attr_unique_id = f"{device_id}_fan"
@@ -61,9 +61,7 @@ class AtmeexFan(CoordinatorEntity, FanEntity):
 
     @property
     def _cond(self) -> dict[str, Any]:
-        return (
-            self.coordinator.data.get("states", {}).get(str(self._device_id), {}) or {}
-        )
+        return self.coordinator.data.get("states", {}).get(str(self._device_id), {}) or {}
 
     def _speed_to_percentage(self, speed: int | float | None) -> int:
         """Map device speed 0..7 to percentage 0..100."""

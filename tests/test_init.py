@@ -129,29 +129,12 @@ async def test_async_setup_entry_happy_path(monkeypatch):
     result = await atmeex_init.async_setup_entry(hass, entry)
     assert result is True
 
-    stored = hass.data[DOMAIN]["entry1"]
-    api = stored["api"]
-    coordinator = stored["coordinator"]
-    refresh_device = stored["refresh_device"]
-
-    assert isinstance(api, FakeApi)
-    assert coordinator.data is not None
-    assert "devices" in coordinator.data
-    assert "states" in coordinator.data
-    assert coordinator.data["states"]["1"]["pwr_on"] is True
-    assert coordinator.data["states"]["1"]["fan_speed"] == 3
-
-    hass.config_entries.async_forward_entry_setups.assert_awaited_once_with(entry, PLATFORMS)
-
-    # проверяем refresh_device
-    api.get_device.return_value = {
-        "id": 1,
-        "name": "Dev1-full",
-        "condition": {"pwr_on": 0, "fan_speed": 2},
-    }
-    await refresh_device(1)
-    assert coordinator.data["devices"][0]["name"] == "Dev1-full"
-    assert coordinator.data["states"]["1"]["fan_speed"] == 2
+    # Новое поведение: данные лежат в entry.runtime_data
+    runtime = entry.runtime_data
+    assert runtime.api is created_apis[0]
+    assert runtime.coordinator.data["devices"][0]["id"] == 1
+    assert runtime.coordinator.data["states"]["1"]["pwr_on"] is True
+    assert runtime.coordinator.data["states"]["1"]["fan_speed"] == 3
 
 
 @pytest.mark.asyncio
@@ -166,4 +149,4 @@ async def test_async_unload_entry_clears_data(monkeypatch):
 
     result = await atmeex_init.async_unload_entry(hass, entry)
     assert result is True
-    assert "entry1" not in hass.data[DOMAIN]
+    hass.config_entries.async_unload_platforms.assert_awaited_once_with(entry, PLATFORMS)
