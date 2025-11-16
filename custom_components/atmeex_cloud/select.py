@@ -9,6 +9,7 @@ from homeassistant.core import HomeAssistant
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from .const import DOMAIN
+from . import AtmeexRuntimeData
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -23,9 +24,9 @@ BRIZER_OPTIONS = [
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_entities):
     """Set up Atmeex select entities (humidifier + brizer mode)."""
-    data = hass.data[DOMAIN][entry.entry_id]
-    coordinator = data["coordinator"]
-    api = data["api"]
+    runtime: AtmeexRuntimeData = entry.runtime_data
+    coordinator = runtime.coordinator
+    api = runtime.api
 
     entities: list[SelectEntity] = []
     for dev in coordinator.data.get("devices", []):
@@ -64,9 +65,7 @@ class _BaseSelect(CoordinatorEntity, SelectEntity):
 
     @property
     def _cond(self) -> dict[str, Any]:
-        return (
-            self.coordinator.data.get("states", {}).get(str(self._device_id), {}) or {}
-        )
+        return self.coordinator.data.get("states", {}).get(str(self._device_id), {}) or {}
 
     @property
     def available(self) -> bool:
@@ -75,7 +74,6 @@ class _BaseSelect(CoordinatorEntity, SelectEntity):
 
     @property
     def device_info(self):
-        # Имя устройства без хвостов " humidification mode"/" brizer mode"
         base_name = (
             self._attr_name.replace(" humidification mode", "")
             .replace(" brizer mode", "")
@@ -96,11 +94,9 @@ class HumidificationSelect(_BaseSelect):
 
     @property
     def current_option(self) -> str | None:
-        # Сервер может отдавать либо hum_stg (0..3), либо только показания влажности hum_room — пробуем hum_stg.
         stg = self._cond.get("hum_stg")
         if isinstance(stg, int) and 0 <= stg <= 3:
             return HUM_OPTIONS[stg] if stg > 0 else "off"
-        # fallback
         return getattr(self, "_attr_current_option", "off")
 
     async def async_select_option(self, option: str) -> None:
@@ -129,7 +125,7 @@ class BrizerModeSelect(_BaseSelect):
     async def async_select_option(self, option: str) -> None:
         if option not in BRIZER_OPTIONS:
             return
-        pos = BRIZER_OPTIONS.index(option)  # 0..3
+        pos = BRIZER_OPTIONS.index(option)
         await self.api.set_brizer_mode(self._device_id, pos)
         self._attr_current_option = option
         await self.coordinator.async_request_refresh()

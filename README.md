@@ -5,7 +5,8 @@
 Atmeex Cloud is a custom integration for [Home Assistant](https://www.home-assistant.io/) that connects your Atmeex (AirNanny) ventilation devices to the Home Assistant ecosystem.
 It uses the official Atmeex Cloud REST API (https://api.iot.atmeex.com) to provide reliable control and monitoring of your brizers directly from Home Assistant dashboards and automations.
 
-🧩 Originally based on the open-source integration developed by [[@anpavlov](https://github.com/anpavlov)], and extensively rewritten and expanded by Sergei Polunovskii to support modern Home Assistant releases and the current Atmeex API.
+🧩 Originally based on the open-source integration developed by [[@anpavlov](https://github.com/anpavlov)], and extensively rewritten and expanded by Sergei Polunovskii to support modern Home Assistant releases and the current Atmeex API. Most recent improvements were contributed by Roman Khodukin, who fully refactored the integration to modern HA standards, added strict typing and unified runtime data architecture, implemented comprehensive diagnostics and fallback logic, created a complete automated test suite with 83% test coverage.
+The integration is now significantly more robust, maintainable, and predictable.
 
 ## Features
 * 	Auto-discovery of all devices linked to your Atmeex Cloud account.
@@ -24,7 +25,7 @@ Option 1 — via HACS (recommended)
 1. Open HACS → Integrations → Custom repositories.
 2. Add this repository:
 
-https://github.com/pols1/atmeex_hacs
+https://github.com/rdscoo1/atmeex_hacs
 
 Choose **Integration** as the repository type.
 
@@ -87,7 +88,7 @@ Settings → System → Logs → custom_components.atmeex_cloud
 
 ### Local setup
 
-`git clone https://github.com/pols1/atmeex_hacs.git`
+`git clone https://github.com/rdscoo1/atmeex_hacs.git`
 `cd atmeex_hacs`
 
 All requests use Home Assistant’s shared async session (async_get_clientsession(hass)), ensuring clean resource management and no unclosed sessions.
@@ -130,16 +131,19 @@ or with more verbose output:
 
 `pytest -vv`
 
-By default, tests live under the tests/ directory and cover:
+### 🧪 Tests & Coverage
 
+All tests are located in the tests/ directory and currently cover:
 * API client (api.py)
-* Integration setup and coordinator logic (__init__.py)
+* Integration setup & DataUpdateCoordinator logic (__init__.py)
 * Climate entity behaviour (climate.py)
 * Select entities (select.py)
 * Fan entity (fan.py)
 * Config flow (config_flow.py)
+* Diagnostics & diagnostic sensor (diagnostics.py, diagnostics_sensor.py)
 
-If you are using a different Python version than your Home Assistant instance, make sure it is still supported by the Home Assistant version installed via **pytest-homeassistant-custom-component**.
+The test suite is executed using pytest together with
+pytest-homeassistant-custom-component, which provides a lightweight Home Assistant test environment.
 
 ### Releasing a new version
 1. Update the "version" field in manifest.json.
@@ -152,8 +156,8 @@ If you are using a different Python version than your Home Assistant instance, m
 4. Create a GitHub Release (optionally auto-generate release notes).
 
 ## Credits
-* 🧠 Development: [Sergei Polunovskii](https://github.com/pols1)
-* ⚙️ Original base integration: [(https://github.com/anpavlov)]
+* 🧠 Development: [Roman Khodukin](https://github.com/rdscoo1)
+* ⚙️ Original base integration: [(https://github.com/anpavlov)], [Sergei Polunovskii](https://github.com/pols1)
 * 🌐 API & platform: [Atmeex / AirNanny Cloud](https://api.iot.atmeex.com/)
 * 🧩 Framework: [Home Assistant](https://www.home-assistant.io/)
 

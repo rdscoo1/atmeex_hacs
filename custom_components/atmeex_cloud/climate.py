@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import logging
-from typing import Any, Callable, Optional
+from datetime import datetime, timezone 
+from typing import Any, Callable, Awaitable
+
 
 from homeassistant.components.climate import (
     ClimateEntity,
@@ -18,6 +20,7 @@ from homeassistant.core import HomeAssistant
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from .const import DOMAIN
+from . import AtmeexRuntimeData
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -42,9 +45,10 @@ def _quantize_humidity(val: int | float | None) -> int:
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_entities):
-    data = hass.data[DOMAIN][entry.entry_id]
-    coordinator = data["coordinator"]
-    api = data["api"]
+    """Set up Atmeex climate entities from a config entry."""
+    runtime: AtmeexRuntimeData = entry.runtime_data
+    coordinator = runtime.coordinator
+    api = runtime.api
 
     entities: list[AtmeexClimateEntity] = []
     for dev in coordinator.data.get("devices", []):
@@ -53,7 +57,14 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_e
             continue
         name = dev.get("name") or f"Device {did}"
         entities.append(
-            AtmeexClimateEntity(coordinator, api, entry.entry_id, did, name)
+            AtmeexClimateEntity(
+                coordinator=coordinator,
+                api=api,
+                entry_id=entry.entry_id,
+                device_id=did,
+                name=name,
+                refresh_device_cb=runtime.refresh_device,
+            )
         )
 
     if entities:
@@ -87,14 +98,20 @@ class AtmeexClimateEntity(CoordinatorEntity, ClimateEntity):
         self,
         coordinator,
         api,
-        entry_id: str,
+        entry_id: str | None,
         device_id: int | str,
         name: str,
+        refresh_device_cb: Callable[[int | str], Awaitable[None]] | None = None,
     ) -> None:
+        """Init climate entity.
+
+        entry_id и refresh_device_cb нужны только в проде, в тестах могут быть None.
+        """
         super().__init__(coordinator)
         self.api = api
         self._entry_id = entry_id
         self._device_id = device_id
+        self._refresh_device_cb = refresh_device_cb
         self._attr_name = name
         self._attr_unique_id = f"{device_id}_climate"
         self._attr_device_info = {
@@ -107,21 +124,19 @@ class AtmeexClimateEntity(CoordinatorEntity, ClimateEntity):
 
     @property
     def _cond(self) -> dict[str, Any]:
-        return (
-            self.coordinator.data.get("states", {}).get(str(self._device_id), {}) or {}
-        )
+        return self.coordinator.data.get("states", {}).get(str(self._device_id), {}) or {}
 
     def _has_humidifier(self) -> bool:
-        """clarified semantics, but preserved behavior."""
         stg = self._cond.get("hum_stg")
-        return isinstance(stg, (int, float)) or "hum_stg" in self._cond
+        return isinstance(stg, (int, float)) or ("hum_stg" in self._cond)
 
     async def _refresh(self) -> None:
-        cb: Optional[Callable[[int | str], Any]] = (
-            self.hass.data.get(DOMAIN, {}).get(self._entry_id, {}).get("refresh_device")
-        )
-        if callable(cb):
-            await cb(self._device_id)
+        """Обновить состояние устройства через refresh_device из runtime_data.
+
+        В тестах этот метод часто переопределяется на AsyncMock().
+        """
+        if callable(self._refresh_device_cb):
+            await self._refresh_device_cb(self._device_id)
 
     # ---------- доступность ----------
 
@@ -157,7 +172,7 @@ class AtmeexClimateEntity(CoordinatorEntity, ClimateEntity):
 
     @property
     def target_temperature(self) -> float:
-        # Защита от −100: если цели нет, показываем текущую/20.0
+        # если цели нет, показываем текущую/20.0
         val = self._cond.get("u_temp_room")  # деци-°C (цель)
         if isinstance(val, (int, float)):
             return val / 10
@@ -168,9 +183,19 @@ class AtmeexClimateEntity(CoordinatorEntity, ClimateEntity):
         t = kwargs.get(ATTR_TEMPERATURE)
         if t is None:
             return
+
+        # клампинг температуры к min/max
+        try:
+            t_float = float(t)
+        except (ValueError, TypeError):
+            _LOGGER.warning("Invalid temperature value: %s", t)
+            return
+
+        t_clamped = max(self._attr_min_temp, min(self._attr_max_temp, t_float))
+
         if not bool(self._cond.get("pwr_on")):
             await self.api.set_power(self._device_id, True)
-        await self.api.set_target_temperature(self._device_id, float(t))
+        await self.api.set_target_temperature(self._device_id, t_clamped)
         await self._refresh()
 
     # ---------- Влажность (слайдер с квантованием) ----------
@@ -213,10 +238,8 @@ class AtmeexClimateEntity(CoordinatorEntity, ClimateEntity):
     async def async_set_fan_mode(self, fan_mode: str) -> None:
         try:
             speed = int(fan_mode)
-        except Exception:
-            _LOGGER.warning(
-                "Unsupported fan_mode %s for device %s", fan_mode, self._device_id
-            )
+        except (ValueError, TypeError):
+            _LOGGER.warning("Unsupported fan_mode: %s", fan_mode)
             return
         await self.api.set_fan_speed(self._device_id, speed)
         await self._refresh()
@@ -232,15 +255,9 @@ class AtmeexClimateEntity(CoordinatorEntity, ClimateEntity):
 
     async def async_set_swing_mode(self, swing_mode: str) -> None:
         if swing_mode not in BRIZER_SWING_MODES:
-            _LOGGER.warning(
-                "Unsupported swing_mode %s for device %s",
-                swing_mode,
-                self._device_id,
-            )
+            _LOGGER.warning("Unsupported swing_mode: %s", swing_mode)
             return
-        await self.api.set_brizer_mode(
-            self._device_id, BRIZER_SWING_MODES.index(swing_mode)
-        )
+        await self.api.set_brizer_mode(self._device_id, BRIZER_SWING_MODES.index(swing_mode))
         await self._refresh()
 
     # ---------- Атрибуты для UI/отладки ----------
@@ -255,4 +272,17 @@ class AtmeexClimateEntity(CoordinatorEntity, ClimateEntity):
         if isinstance(ut, (int, float)):
             attrs["target_temp_c"] = round(ut / 10, 1)
         attrs["has_humidifier"] = self._has_humidifier()
+
+        # expose last_success_ts from coordinator data
+        data = getattr(self.coordinator, "data", {}) or {}
+        ts = data.get("last_success_ts")
+        if isinstance(ts, (int, float)):
+            attrs["last_success_ts"] = ts
+            try:
+                attrs["last_success_utc"] = datetime.fromtimestamp(
+                    ts, tz=timezone.utc
+                ).isoformat()
+            except Exception:  # pragma: no cover - defensive only
+                pass
+
         return attrs
