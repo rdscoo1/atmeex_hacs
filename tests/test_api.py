@@ -1,4 +1,3 @@
-# tests/test_api.py
 import pytest
 
 from custom_components.atmeex_cloud.api import AtmeexApi, ApiError, API_BASE
@@ -35,15 +34,15 @@ class FakeSession:
         assert self._responses, "No queued response"
         return self._responses.pop(0)
 
-    def post(self, url, json=None, headers=None):
+    def post(self, url, json=None, headers=None, timeout=None):
         self.requests.append(("POST", url, json, headers))
         return self._pop_response()
 
-    def get(self, url, headers=None):
+    def get(self, url, headers=None, timeout=None):
         self.requests.append(("GET", url, None, headers))
         return self._pop_response()
 
-    def put(self, url, json=None, headers=None):
+    def put(self, url, json=None, headers=None, timeout=None):
         self.requests.append(("PUT", url, json, headers))
         return self._pop_response()
 

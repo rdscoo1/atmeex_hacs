@@ -52,7 +52,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_e
         if did is None:
             continue
         name = dev.get("name") or f"Device {did}"
-        entities.append(AtmeexClimateEntity(coordinator, api, entry.entry_id, did, name))
+        entities.append(
+            AtmeexClimateEntity(coordinator, api, entry.entry_id, did, name)
+        )
 
     if entities:
         async_add_entities(entities)
@@ -95,16 +97,24 @@ class AtmeexClimateEntity(CoordinatorEntity, ClimateEntity):
         self._device_id = device_id
         self._attr_name = name
         self._attr_unique_id = f"{device_id}_climate"
+        self._attr_device_info = {
+            "identifiers": {(DOMAIN, str(device_id))},
+            "name": name,
+            "manufacturer": "Atmeex",
+        }
 
     # ---------- helpers ----------
 
     @property
     def _cond(self) -> dict[str, Any]:
-        return self.coordinator.data.get("states", {}).get(str(self._device_id), {}) or {}
+        return (
+            self.coordinator.data.get("states", {}).get(str(self._device_id), {}) or {}
+        )
 
     def _has_humidifier(self) -> bool:
+        """clarified semantics, but preserved behavior."""
         stg = self._cond.get("hum_stg")
-        return isinstance(stg, (int, float)) or ("hum_stg" in self._cond)
+        return isinstance(stg, (int, float)) or "hum_stg" in self._cond
 
     async def _refresh(self) -> None:
         cb: Optional[Callable[[int | str], Any]] = (
@@ -141,12 +151,12 @@ class AtmeexClimateEntity(CoordinatorEntity, ClimateEntity):
     # ---------- Температура ----------
 
     @property
-    def current_temperature(self):
+    def current_temperature(self) -> float | None:
         val = self._cond.get("temp_room")  # деци-°C
         return (val / 10) if isinstance(val, (int, float)) else None
 
     @property
-    def target_temperature(self):
+    def target_temperature(self) -> float:
         # Защита от −100: если цели нет, показываем текущую/20.0
         val = self._cond.get("u_temp_room")  # деци-°C (цель)
         if isinstance(val, (int, float)):
@@ -204,7 +214,9 @@ class AtmeexClimateEntity(CoordinatorEntity, ClimateEntity):
         try:
             speed = int(fan_mode)
         except Exception:
-            _LOGGER.warning("Unsupported fan_mode: %s", fan_mode)
+            _LOGGER.warning(
+                "Unsupported fan_mode %s for device %s", fan_mode, self._device_id
+            )
             return
         await self.api.set_fan_speed(self._device_id, speed)
         await self._refresh()
@@ -220,9 +232,15 @@ class AtmeexClimateEntity(CoordinatorEntity, ClimateEntity):
 
     async def async_set_swing_mode(self, swing_mode: str) -> None:
         if swing_mode not in BRIZER_SWING_MODES:
-            _LOGGER.warning("Unsupported swing_mode: %s", swing_mode)
+            _LOGGER.warning(
+                "Unsupported swing_mode %s for device %s",
+                swing_mode,
+                self._device_id,
+            )
             return
-        await self.api.set_brizer_mode(self._device_id, BRIZER_SWING_MODES.index(swing_mode))
+        await self.api.set_brizer_mode(
+            self._device_id, BRIZER_SWING_MODES.index(swing_mode)
+        )
         await self._refresh()
 
     # ---------- Атрибуты для UI/отладки ----------

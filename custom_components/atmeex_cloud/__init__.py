@@ -9,13 +9,14 @@ from homeassistant.core import HomeAssistant
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 
-from .api import AtmeexApi
+from .api import AtmeexApi, ApiError  # CHANGE: import ApiError for more specific logging
 from .const import DOMAIN, PLATFORMS
 
 _LOGGER = logging.getLogger(__name__)
 
 
 def _to_bool(v: Any) -> bool:
+    """Best-effort normalization to bool."""
     if isinstance(v, bool):
         return v
     try:
@@ -25,7 +26,7 @@ def _to_bool(v: Any) -> bool:
 
 
 def _normalize_item(item: dict[str, Any]) -> dict[str, Any]:
-    """Склеить condition + settings → нормализованное состояние (+ online)."""
+    """Merge condition + settings → normalized state (+ online flag)."""
     cond = dict(item.get("condition") or {})
     st = dict(item.get("settings") or {})
 
@@ -36,7 +37,12 @@ def _normalize_item(item: dict[str, Any]) -> dict[str, Any]:
     # Скорость вентилятора
     fan = cond.get("fan_speed")
     u_fan = st.get("u_fan_speed")
-    if (fan is None or int(fan) == 0) and pwr and isinstance(u_fan, (int, float)) and int(u_fan) > 0:
+    if (
+        (fan is None or int(fan) == 0)
+        and pwr
+        and isinstance(u_fan, (int, float))
+        and int(u_fan) > 0
+    ):
         fan = int(u_fan)
 
     # Заслонка
@@ -92,12 +98,17 @@ def _normalize_item(item: dict[str, Any]) -> dict[str, Any]:
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+    """Set up Atmeex Cloud from a config entry."""
+
     # ВАЖНО: берём сессию HA, чтобы не было "Unclosed client session"
     session = async_get_clientsession(hass)
     api = AtmeexApi(session)
     await api.async_init()
+
     await api.login(entry.data["email"], entry.data["password"])
 
+    # CHANGE: explicit shape comment to aid maintainability
+    # last_ok keeps the last successful snapshot: {"devices": [...], "states": {...}}
     last_ok: dict[str, Any] = {"devices": [], "states": {}}
 
     async def _fetch_devices_safely() -> List[dict]:
@@ -106,13 +117,19 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             devs = await api.get_devices()
             if isinstance(devs, list) and devs:
                 return devs
-        except Exception as e:
+        except ApiError as e:
             _LOGGER.debug("get_devices failed: %s", e)
+        except Exception as e:
+            _LOGGER.warning("Unexpected error in get_devices: %s", e)
 
+        # CHANGE: use get_devices(fallback=True) which now exists on the API
         try:
             devs = await api.get_devices(fallback=True)
-        except Exception as e:
+        except ApiError as e:
             _LOGGER.warning("fallback get_devices failed: %s", e)
+            devs = []
+        except Exception as e:
+            _LOGGER.warning("Unexpected error in fallback get_devices: %s", e)
             devs = []
 
         result: List[dict] = []
@@ -124,8 +141,11 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             try:
                 full = await api.get_device(did)
                 result.append(full if isinstance(full, dict) else d)
-            except Exception as e:
+            except ApiError as e:
                 _LOGGER.debug("get_device(%s) failed: %s", did, e)
+                result.append(d)
+            except Exception as e:
+                _LOGGER.warning("Unexpected error in get_device(%s): %s", did, e)
                 result.append(d)
         return result
 
@@ -134,7 +154,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         nonlocal last_ok
         try:
             new_devices = await _fetch_devices_safely()
-            new_by_id: Dict[str, dict] = {str(d.get("id")): d for d in new_devices if d.get("id") is not None}
+            new_by_id: Dict[str, dict] = {
+                str(d.get("id")): d for d in new_devices if d.get("id") is not None
+            }
 
             # не теряем устройства, пока оффлайн
             for d in last_ok.get("devices", []):
@@ -155,7 +177,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             return last_ok
 
         except Exception as err:
-            _LOGGER.warning("Atmeex update failed: %s, using last state", err)
+            # CHANGE: clarify log text; still returning last_ok by design
+            _LOGGER.warning("Atmeex update failed (%s), using last known state", err)
             return last_ok
 
     coordinator = DataUpdateCoordinator(
@@ -172,8 +195,11 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         """Дочитать одно устройство и обновить координатор."""
         try:
             full = await api.get_device(device_id)
-        except Exception as e:
+        except ApiError as e:
             _LOGGER.warning("Failed to refresh device %s: %s", device_id, e)
+            return
+        except Exception as e:
+            _LOGGER.warning("Unexpected error in refresh_device(%s): %s", device_id, e)
             return
 
         cond_norm = _normalize_item(full)
@@ -204,6 +230,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+    """Unload Atmeex Cloud config entry."""
     unload_ok = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
     if unload_ok:
         hass.data[DOMAIN].pop(entry.entry_id, None)

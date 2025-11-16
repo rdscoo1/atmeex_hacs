@@ -22,6 +22,7 @@ BRIZER_OPTIONS = [
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_entities):
+    """Set up Atmeex select entities (humidifier + brizer mode)."""
     data = hass.data[DOMAIN][entry.entry_id]
     coordinator = data["coordinator"]
     api = data["api"]
@@ -32,8 +33,22 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_e
         if did is None:
             continue
         name = dev.get("name") or f"Device {did}"
-        entities.append(HumidificationSelect(coordinator, api, did, f"{name} humidification mode"))
-        entities.append(BrizerModeSelect(coordinator, api, did, f"{name} brizer mode"))
+        entities.append(
+            HumidificationSelect(
+                coordinator,
+                api,
+                did,
+                f"{name} humidification mode",
+            )
+        )
+        entities.append(
+            BrizerModeSelect(
+                coordinator,
+                api,
+                did,
+                f"{name} brizer mode",
+            )
+        )
 
     if entities:
         async_add_entities(entities)
@@ -49,11 +64,27 @@ class _BaseSelect(CoordinatorEntity, SelectEntity):
 
     @property
     def _cond(self) -> dict[str, Any]:
-        return self.coordinator.data.get("states", {}).get(str(self._device_id), {}) or {}
+        return (
+            self.coordinator.data.get("states", {}).get(str(self._device_id), {}) or {}
+        )
 
     @property
     def available(self) -> bool:
+        # Если координатор временно без данных — не хотим мигать unavailable
         return True
+
+    @property
+    def device_info(self):
+        # Имя устройства без хвостов " humidification mode"/" brizer mode"
+        base_name = (
+            self._attr_name.replace(" humidification mode", "")
+            .replace(" brizer mode", "")
+        )
+        return {
+            "identifiers": {(DOMAIN, str(self._device_id))},
+            "name": base_name,
+            "manufacturer": "Atmeex",
+        }
 
 
 class HumidificationSelect(_BaseSelect):
@@ -65,7 +96,7 @@ class HumidificationSelect(_BaseSelect):
 
     @property
     def current_option(self) -> str | None:
-        # сервер может отдавать либо hum_stg (0..3), либо только показания влажности hum_room — пробуем оба
+        # Сервер может отдавать либо hum_stg (0..3), либо только показания влажности hum_room — пробуем hum_stg.
         stg = self._cond.get("hum_stg")
         if isinstance(stg, int) and 0 <= stg <= 3:
             return HUM_OPTIONS[stg] if stg > 0 else "off"
@@ -91,7 +122,7 @@ class BrizerModeSelect(_BaseSelect):
     @property
     def current_option(self) -> str | None:
         pos = self._cond.get("damp_pos")
-        if isinstance(pos, int) and 0 <= pos <= 3:
+        if isinstance(pos, int) and 0 <= pos < len(BRIZER_OPTIONS):
             return BRIZER_OPTIONS[pos]
         return getattr(self, "_attr_current_option", BRIZER_OPTIONS[0])
 
