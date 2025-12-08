@@ -1,14 +1,14 @@
 from __future__ import annotations
 
 import logging
+import time
 from dataclasses import dataclass
 from datetime import timedelta
-from time import time  # NEW: for last_success_ts
 from typing import Any, Dict, List, TypedDict, Callable, Awaitable
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
-from homeassistant.exceptions import ConfigEntryNotReady
+from homeassistant.exceptions import ConfigEntryNotReady, ConfigEntryAuthFailed
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.update_coordinator import (
     DataUpdateCoordinator,
@@ -18,26 +18,30 @@ from homeassistant.const import CONF_EMAIL, CONF_PASSWORD
 
 from .api import AtmeexApi, ApiError
 from .const import DOMAIN, PLATFORMS
+from .config_flow import AtmeexOptionsFlowHandler
 
 _LOGGER = logging.getLogger(__name__)
 
-# NEW: track last API error for diagnostics
-_LAST_API_ERROR: str | None = None
+_LAST_API_ERROR: ApiError | None = None
+
+# События, которые будут попадать в Logbook
+EVENT_API_ERROR = "atmeex_cloud_api_error"
+EVENT_DEVICE_UPDATED = "atmeex_cloud_device_updated"
 
 
-class AtmeexCoordinatorData(TypedDict):
+class AtmeexCoordinatorData(TypedDict, total=False):
     """Структура данных, хранимая координатором."""
-
     devices: list[dict[str, Any]]
     states: dict[str, dict[str, Any]]
-    # NEW: timestamp of last successful coordinator update (UTC, time.time())
+    # Доп. диагностические поля
     last_success_ts: float | None
+    avg_latency_ms: float | None
+    request_retries: int
 
 
 @dataclass
 class AtmeexRuntimeData:
     """Единый runtime-объект для записи конфигурации."""
-
     api: AtmeexApi
     coordinator: DataUpdateCoordinator[AtmeexCoordinatorData]
     refresh_device: Callable[[int | str], Awaitable[None]]
@@ -46,24 +50,24 @@ class AtmeexRuntimeData:
 __all__ = [
     "async_setup_entry",
     "async_unload_entry",
+    "async_get_options_flow",
     "AtmeexCoordinatorData",
     "AtmeexRuntimeData",
-    "get_diagnostics_snapshot",  # NEW: helper for diagnostic entities
 ]
 
 
 def _to_bool(v: Any) -> bool:
-    """Best-effort приведение к bool."""
+    """Приведение к bool"""
     if isinstance(v, bool):
         return v
     try:
         return bool(int(v))
-    except Exception:
+    except (TypeError, ValueError):
         return bool(v)
 
 
-def _normalize_item(item: dict[str, Any]) -> dict[str, Any]:
-    """Склеить condition + settings → нормализованное состояние (+ online)."""
+def _normalize_device_state(item: dict[str, Any]) -> dict[str, Any]:
+    """Склеить condition + settings → нормализованное состояние (+ online)"""
     cond = dict(item.get("condition") or {})
     st = dict(item.get("settings") or {})
 
@@ -107,23 +111,27 @@ def _normalize_item(item: dict[str, Any]) -> dict[str, Any]:
     if fan is not None:
         try:
             out["fan_speed"] = int(fan)
-        except Exception:
+        except (TypeError, ValueError):
             pass
+
     if damp is not None:
         try:
             out["damp_pos"] = int(damp)
-        except Exception:
+        except (TypeError, ValueError):
             pass
+
     if hum_stg is not None:
         try:
             out["hum_stg"] = int(hum_stg)
-        except Exception:
+        except (TypeError, ValueError):
             pass
+
     if u_temp is not None:
         try:
-            out["u_temp_room"] = int(u_temp)  # деци-°C
-        except Exception:
+            out["u_temp_room"] = int(u_temp)
+        except (TypeError, ValueError):
             pass
+
     if isinstance(hum_room, (int, float)):
         out["hum_room"] = int(hum_room)
     if isinstance(temp_room, (int, float)):
@@ -137,45 +145,63 @@ def _normalize_item(item: dict[str, Any]) -> dict[str, Any]:
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up Atmeex Cloud from a config entry."""
     session = async_get_clientsession(hass)
-    api = AtmeexApi(session)
-    await api.async_init()
 
     # Поддерживаем оба варианта ключей: CONF_EMAIL/CONF_PASSWORD и "email"/"password"
     email = entry.data.get(CONF_EMAIL) or entry.data.get("email")
     password = entry.data.get(CONF_PASSWORD) or entry.data.get("password")
 
-    # Логин: при ошибке — ConfigEntryNotReady, интеграция не стартует.
+    api = AtmeexApi(session)
+    await api.async_init()
+
+    # Логин: различаем неверные креды и временные сетевые проблемы
     try:
         await api.login(email, password)
     except ApiError as err:
-        raise ConfigEntryNotReady(f"Cannot connect to Atmeex Cloud: {err}") from err
+        status = getattr(err, "status", None)
+        if status in (401, 403):
+            # неправильный логин/пароль → запускаем re-auth flow
+            raise ConfigEntryAuthFailed(
+                f"Invalid Atmeex credentials: {err}"
+            ) from err
+        # остальное — проблемы соединения / бэкенда → NotReady
+        raise ConfigEntryNotReady(
+            f"Cannot connect to Atmeex Cloud: {err}"
+        ) from err
 
-    # Объявляем coordinator в замыкании, чтобы в update иметь доступ
+    options = getattr(entry, "options", {}) or {}
+    raw_interval = int(options.get("update_interval", 30))
+    update_interval_seconds = max(10, min(300, raw_interval))
+
     coordinator: DataUpdateCoordinator[AtmeexCoordinatorData]
 
     async def _async_update_data() -> AtmeexCoordinatorData:
-        """Плановый опрос: тянем устройства, при ошибке кидаем UpdateFailed.
+        """Плановый опрос: тянем устройства, при ошибке кидаем UpdateFailed / AuthFailed."""
+        global _LAST_API_ERROR
 
-        DataUpdateCoordinator сам:
-        - на первом запуске превратит UpdateFailed → ConfigEntryNotReady;
-        - после первого успешного опроса будет сохранять прошлые данные при ошибках.
-        """
-        global _LAST_API_ERROR  # NEW: record most recent API error for diagnostics
-
+        start_ts = time.perf_counter()
         try:
             devices = await api.get_devices(fallback=False)
         except ApiError as err:
-            _LAST_API_ERROR = f"API error in get_devices: {err}"
-            raise UpdateFailed(f"Error communicating with Atmeex API: {err}") from err
+            _LAST_API_ERROR = err
+            status = getattr(err, "status", None)
+            if status in (401, 403):
+                # токен протух / креды поменяли → re-auth
+                raise ConfigEntryAuthFailed(
+                    f"Authentication with Atmeex failed during update: {err}"
+                ) from err
+            raise UpdateFailed(
+                f"Error communicating with Atmeex API: {err}"
+            ) from err
         except Exception as err:
-            _LAST_API_ERROR = f"Unexpected error in get_devices: {err}"
+            _LAST_API_ERROR = None
             raise UpdateFailed(
                 f"Unexpected error while updating Atmeex data: {err}"
             ) from err
 
+        elapsed_ms = (time.perf_counter() - start_ts) * 1000.0
+
         if not isinstance(devices, list):
-            _LAST_API_ERROR = "Atmeex API returned non-list devices payload"
-            raise UpdateFailed(_LAST_API_ERROR)
+            raise UpdateFailed("Atmeex API returned non-list devices payload")
 
         # мержим новые устройства с прошлым снимком, чтобы не терять оффлайн-девайсы
         devices_by_id: Dict[str, dict[str, Any]] = {
@@ -202,78 +228,70 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             did = dev.get("id")
             if did is None:
                 continue
-            states[str(did)] = _normalize_item(dev)
+            states[str(did)] = _normalize_device_state(dev)
 
-        # NEW: successful update – clear last error and record timestamp
-        _LAST_API_ERROR = None
-        return {
+        # Обновляем last_success_ts и счётчик ретраев (если он есть у api)
+        retry_count = getattr(api, "_retry_count", 0)
+
+        data: AtmeexCoordinatorData = {
             "devices": merged_devices,
             "states": states,
-            "last_success_ts": time(),
+            "last_success_ts": time.time(),
+            "avg_latency_ms": round(elapsed_ms, 1),
+            "request_retries": retry_count,
         }
+
+        # привяжем диагностические поля к самому координатору
+        setattr(coordinator, "last_success_ts", data["last_success_ts"])
+        setattr(coordinator, "last_api_error", _LAST_API_ERROR)
+
+        # успешный апдейт — обнуляем last error
+        _LAST_API_ERROR = None
+
+        return data
+
 
     coordinator = DataUpdateCoordinator(
         hass,
         _LOGGER,
         name="Atmeex Cloud",
         update_method=_async_update_data,
-        update_interval=timedelta(seconds=30),
+        update_interval=timedelta(seconds=update_interval_seconds),
     )
 
     await coordinator.async_config_entry_first_refresh()
 
     async def refresh_device(device_id: int | str) -> None:
         """Дочитать одно устройство и обновить координатор."""
-        global _LAST_API_ERROR  # NEW: record errors coming from single-device refresh
-
         try:
             full = await api.get_device(device_id)
         except ApiError as e:
-            _LAST_API_ERROR = f"Failed to refresh device {device_id}: {e}"
-            _LOGGER.warning(_LAST_API_ERROR)
+            _LOGGER.warning("Failed to refresh device %s: %s", device_id, e)
             return
         except Exception as e:
-            _LAST_API_ERROR = f"Unexpected error in refresh_device({device_id}): {e}"
-            _LOGGER.warning(_LAST_API_ERROR)
+            _LOGGER.warning("Unexpected error in refresh_device(%s): %s", device_id, e)
             return
 
-        # Успешный запрос по одному устройству не обязательно означает
-        # успешный полный опрос, но можно считать это "локальным" success.
-        cond_norm = _normalize_item(full)
-
-        cur: AtmeexCoordinatorData = coordinator.data or {
-            "devices": [],
-            "states": {},
-            "last_success_ts": None,
-        }
+        cond_norm = _normalize_device_state(full)
+        cur = coordinator.data or {"devices": [], "states": {}, "last_success_ts": None}
         devices = list(cur.get("devices", []))
         states = dict(cur.get("states", {}))
-        last_success_ts = cur.get("last_success_ts")
 
         inserted = True
-        full_id = full.get("id")
-        # кешируем строковый id для ключей.
-        full_id_str = str(full_id) if full_id is not None else None
-
         for i, d in enumerate(devices):
-            if d.get("id") == full_id:
+            if d.get("id") == full.get("id"):
                 devices[i] = full
                 inserted = False
                 break
         if inserted:
             devices.append(full)
 
-        if full_id_str is not None:
-            states[full_id_str] = cond_norm
-
-        if not isinstance(last_success_ts, (int, float)):
-            last_success_ts = time()
-
+        states[str(full.get("id"))] = cond_norm
         coordinator.async_set_updated_data(
             {
                 "devices": devices,
                 "states": states,
-                "last_success_ts": last_success_ts,
+                "last_success_ts": cur.get("last_success_ts"),
             }
         )
 
@@ -294,34 +312,6 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     return unload_ok
 
 
-# small helper for diagnostic entities / diagnostics.py
-def get_diagnostics_snapshot(
-    coordinator: DataUpdateCoordinator[AtmeexCoordinatorData],
-) -> dict[str, Any]:
-    """Return a compact diagnostics snapshot for entities/UI."""
-    data: AtmeexCoordinatorData = coordinator.data or {
-        "devices": [],
-        "states": {},
-        "last_success_ts": None,
-    }
-    devices = data.get("devices") or []
-    last_ts = data.get("last_success_ts")
-
-    # Build ISO string for readability; keep raw ts as well
-    last_success_utc: str | None = None
-    if isinstance(last_ts, (int, float)):
-        from datetime import datetime, timezone
-
-        try:
-            last_success_utc = (
-                datetime.fromtimestamp(last_ts, tz=timezone.utc).isoformat()
-            )
-        except Exception:  # pragma: no cover - very defensive
-            last_success_utc = None
-
-    return {
-        "device_count": len(devices),
-        "last_success_ts": last_ts,
-        "last_success_utc": last_success_utc,
-        "last_api_error": _LAST_API_ERROR,
-    }
+async def async_get_options_flow(config_entry: ConfigEntry):
+    """Hook для options flow."""
+    return AtmeexOptionsFlowHandler(config_entry)

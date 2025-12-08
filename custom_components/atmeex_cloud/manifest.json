@@ -1,6 +1,7 @@
 {
   "domain": "atmeex_cloud",
   "name": "Atmeex Cloud",
+  "render_readme": true,
   "version": "0.3.6",
   "config_flow": true,
   "documentation": "https://github.com/rdscoo1/atmeex_hacs",

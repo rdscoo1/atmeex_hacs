@@ -1,6 +1,9 @@
 from __future__ import annotations
 
-from typing import Any
+import logging
+from typing import Any, Callable, Awaitable
+from . import AtmeexRuntimeData
+from .api import ApiError
 
 from homeassistant.components.fan import (
     FanEntity,
@@ -12,10 +15,12 @@ from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from .const import DOMAIN
 
+_LOGGER = logging.getLogger(__name__)
+
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_entities):
     """Set up Atmeex fan entities from a config entry."""
-    runtime = entry.runtime_data  # AtmeexRuntimeData
+    runtime: AtmeexRuntimeData = entry.runtime_data 
     coordinator = runtime.coordinator
     api = runtime.api
 
@@ -25,7 +30,16 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_e
         if did is None:
             continue
         name = dev.get("name") or f"Device {did}"
-        entities.append(AtmeexFan(coordinator, api, entry.entry_id, did, name))
+        entities.append(
+            AtmeexFan(
+                coordinator,
+                api,
+                entry.entry_id,
+                did,
+                name,
+                refresh_device_cb=runtime.refresh_device,
+            )
+        )
 
     if entities:
         async_add_entities(entities)
@@ -49,19 +63,36 @@ class AtmeexFan(CoordinatorEntity, FanEntity):
         entry_id: str,
         device_id: int | str,
         name: str,
+        refresh_device_cb: Callable[[int | str], Awaitable[None]] | None = None,
     ) -> None:
         super().__init__(coordinator)
         self.api = api
-        self._entry_id = entry_id  # пока не используется, но оставляем для консистентности
+        self._entry_id = entry_id  # пока не используется, но оставляем на будущее
         self._device_id = device_id
+        self._refresh_device_cb = refresh_device_cb
         self._attr_name = name
         self._attr_unique_id = f"{device_id}_fan"
+        self._attr_device_info = {
+            "identifiers": {(DOMAIN, str(self._device_id))},
+            "name": name,
+            "manufacturer": "Atmeex",
+        }
+
+    async def _refresh(self) -> None:
+        if callable(self._refresh_device_cb):
+            await self._refresh_device_cb(self._device_id)
+        else:
+            await self.coordinator.async_request_refresh()
 
     # ----- helpers -----
 
     @property
-    def _cond(self) -> dict[str, Any]:
+    def _device_state(self) -> dict[str, Any]:
         return self.coordinator.data.get("states", {}).get(str(self._device_id), {}) or {}
+
+    @property
+    def available(self) -> bool:
+        return bool(self._device_state.get("online", True))
 
     def _speed_to_percentage(self, speed: int | float | None) -> int:
         """Map device speed 0..7 to percentage 0..100."""
@@ -77,7 +108,7 @@ class AtmeexFan(CoordinatorEntity, FanEntity):
         """Map percentage 0..100 back to discrete speed 0..7."""
         try:
             p = max(0, min(100, int(percentage)))
-        except Exception:
+        except (TypeError, ValueError):
             p = 0
         if p <= 0:
             return 0
@@ -88,11 +119,11 @@ class AtmeexFan(CoordinatorEntity, FanEntity):
 
     @property
     def is_on(self) -> bool:
-        return bool(self._cond.get("pwr_on", False))
+        return bool(self._device_state.get("pwr_on", False))
 
     @property
     def percentage(self) -> int | None:
-        return self._speed_to_percentage(self._cond.get("fan_speed"))
+        return self._speed_to_percentage(self._device_state.get("fan_speed"))
 
     # ----- commands -----
 
@@ -100,17 +131,21 @@ class AtmeexFan(CoordinatorEntity, FanEntity):
         if percentage is None:
             percentage = self.percentage or 100
         speed = self._percentage_to_speed(percentage)
-        await self.api.set_fan_speed(self._device_id, speed)
-        await self.coordinator.async_request_refresh()
+        try:
+            await self.api.set_fan_speed(self._device_id, speed)
+        except ApiError as err:
+            _LOGGER.error("Failed to set fan speed for %s: %s", self._device_id, err)
+            return
+        await self._refresh()
 
     async def async_turn_off(self, **kwargs) -> None:
         await self.api.set_fan_speed(self._device_id, 0)
-        await self.coordinator.async_request_refresh()
+        await self._refresh()
 
     async def async_set_percentage(self, percentage: int) -> None:
         speed = self._percentage_to_speed(percentage)
         await self.api.set_fan_speed(self._device_id, speed)
-        await self.coordinator.async_request_refresh()
+        await self._refresh()
 
     # ----- device registry -----
 

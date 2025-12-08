@@ -24,7 +24,7 @@ def test_to_bool(value, expected):
     assert atmeex_init._to_bool(value) is expected
 
 
-def test_normalize_item_basic():
+def test_normalize_device_state_basic():
     item = {
         "condition": {
             "pwr_on": 1,
@@ -37,7 +37,7 @@ def test_normalize_item_basic():
         },
         "online": False,
     }
-    out = atmeex_init._normalize_item(item)
+    out = atmeex_init._normalize_device_state(item)
     assert out["pwr_on"] is True
     assert out["fan_speed"] == 3
     assert out["damp_pos"] == 2
@@ -48,7 +48,7 @@ def test_normalize_item_basic():
     assert out["online"] is False
 
 
-def test_normalize_item_uses_settings_and_fan_fallback():
+def test_normalize_device_state_uses_settings_and_fan_fallback():
     item = {
         "condition": {
             "pwr_on": None,
@@ -62,7 +62,7 @@ def test_normalize_item_uses_settings_and_fan_fallback():
             "u_hum_stg": "2",
         },
     }
-    out = atmeex_init._normalize_item(item)
+    out = atmeex_init._normalize_device_state(item)
     assert out["pwr_on"] is True
     assert out["fan_speed"] == 4
     assert out["damp_pos"] == 1
