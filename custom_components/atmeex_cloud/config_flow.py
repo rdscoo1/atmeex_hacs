@@ -4,11 +4,18 @@ import logging
 
 import voluptuous as vol
 from homeassistant import config_entries
+from homeassistant.data_entry_flow import FlowResult
 from homeassistant.const import CONF_EMAIL, CONF_PASSWORD
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 
 from .api import AtmeexApi, ApiError
-from .const import DOMAIN
+from .const import (
+    DOMAIN,
+    CONF_UPDATE_INTERVAL,
+    DEFAULT_UPDATE_INTERVAL,
+    MIN_UPDATE_INTERVAL,
+    MAX_UPDATE_INTERVAL,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -66,10 +73,7 @@ class AtmeexConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             except ApiError as err:
                 # Ошибка авторизации / сети → показываем стандартную ошибку cannot_connect.
                 status = getattr(err, "status", None)
-                if status in (401, 403):
-                    errors["base"] = "invalid_auth"
-                else:
-                    errors["base"] = "cannot_connect"
+                errors["base"] = "invalid_auth" if status in (401, 403) else "cannot_connect"
             except Exception as err:  # noqa: BLE001 — хотим залогировать вообще всё
                 _LOGGER.exception(
                     "Unexpected error during Atmeex config flow: %s",
@@ -86,34 +90,28 @@ class AtmeexConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 
 
 class AtmeexOptionsFlowHandler(config_entries.OptionsFlow):
-    """Options flow для Atmeex Cloud (пока минимальная заглушка).
-
-    Сейчас не даёт дополнительных опций, но:
-    * позволяет HA открывать диалог «Настройки интеграции»;
-    * в будущем сюда легко добавить реальные настройки (флаги, интервалы и т.п.).
-    """
-
     def __init__(self, config_entry: config_entries.ConfigEntry) -> None:
-        """Сохраняем ссылку на ConfigEntry для будущих расширений."""
         self._config_entry = config_entry
 
-    async def async_step_init(self, user_input=None):
-        """Единственный шаг options flow.
-
-        Сейчас:
-        * при первом открытии показываем пустую форму;
-        * при submit просто создаём запись без изменений (data = {}).
-
-        Позже здесь можно добавить:
-        * чекбоксы (например, enable_diagnostics_sensor);
-        * выбор интервала опроса и т.п.
-        """
+    async def async_step_init(self, user_input=None) -> FlowResult:
         if user_input is not None:
-            # Пока никаких опций не сохраняем — просто завершаем поток.
-            return self.async_create_entry(title="", data={})
+            interval = int(user_input[CONF_UPDATE_INTERVAL])
+            interval = max(MIN_UPDATE_INTERVAL, min(MAX_UPDATE_INTERVAL, interval))
+            return self.async_create_entry(
+                title="",
+                data={CONF_UPDATE_INTERVAL: interval},
+            )
 
-        # Пустая форма — просто кнопка «Сохранить».
-        return self.async_show_form(
-            step_id="init",
-            data_schema=vol.Schema({}),
+        current = (getattr(self._config_entry, "options", {}) or {}).get(
+            CONF_UPDATE_INTERVAL, DEFAULT_UPDATE_INTERVAL
         )
+
+        schema = vol.Schema(
+            {
+                vol.Optional(CONF_UPDATE_INTERVAL, default=current): vol.All(
+                    vol.Coerce(int),
+                    vol.Clamp(min=MIN_UPDATE_INTERVAL, max=MAX_UPDATE_INTERVAL),
+                )
+            }
+        )
+        return self.async_show_form(step_id="init", data_schema=schema)

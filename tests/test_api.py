@@ -1,6 +1,6 @@
 import pytest
 
-from custom_components.atmeex_cloud.api import AtmeexApi, ApiError, API_BASE
+from custom_components.atmeex_cloud.api import AtmeexApi, ApiError, API_BASE_URL, AtmeexDevice
 
 
 class FakeResponse:
@@ -66,7 +66,7 @@ async def test_login_success():
     assert api._token == "token123"
     method, url, payload, _headers = session.requests[0]
     assert method == "POST"
-    assert url == f"{API_BASE}/auth/signin"
+    assert url == f"{API_BASE_URL}/auth/signin"
     # теперь login отправляет grant_type="basic"
     assert payload["email"] == "user@example.com"
     assert payload["password"] == "pwd"
@@ -96,12 +96,16 @@ async def test_get_devices_success():
     # токен уже есть → _authorized_request не будет логиниться
     api._token = "t"
 
-    devices = await api.get_devices()
-    assert devices == [{"id": 1}]
+    result = await api.get_devices()
+    assert len(result) == 1
+    dev = result[0]
+    assert isinstance(dev, AtmeexDevice)
+    assert dev.id == 1
+    assert dev.raw["id"] == 1  # если хочется проверить "сырой" dict
 
     method, url, _payload, headers = session.requests[0]
     assert method == "GET"
-    assert url == f"{API_BASE}/devices"
+    assert url == f"{API_BASE_URL}/devices"
     assert headers["Authorization"] == "Bearer t"
 
 
@@ -141,11 +145,13 @@ async def test_get_device_success():
     api._token = "t"
 
     dev = await api.get_device(1)
-    assert dev["id"] == 1
+    assert isinstance(dev, AtmeexDevice)
+    assert dev.id == 1
+    assert dev.raw["id"] == 1
 
     method, url, _payload, headers = session.requests[0]
     assert method == "GET"
-    assert url == f"{API_BASE}/devices/1"
+    assert url == f"{API_BASE_URL}/devices/1"
     assert headers["Authorization"] == "Bearer t"
 
 
@@ -192,7 +198,7 @@ async def test_setters_success(method_name, body):
 
     req = session.requests[0]
     assert req[0] == "PUT"
-    assert req[1].startswith(f"{API_BASE}/devices/1/params")
+    assert req[1].startswith(f"{API_BASE_URL}/devices/1/params")
     assert req[2] == body
 
 

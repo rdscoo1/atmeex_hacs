@@ -2,7 +2,8 @@ import pytest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
-from custom_components.atmeex_cloud.fan import AtmeexFan
+from custom_components.atmeex_cloud.fan import AtmeexFanEntity
+from custom_components.atmeex_cloud.api import AtmeexDevice
 
 
 def _make_fan_entity():
@@ -19,8 +20,11 @@ def _make_fan_entity():
     api = MagicMock()
     api.set_fan_speed = AsyncMock()
 
-    # Новый контракт: (coordinator, api, entry_id, device_id, name)
-    fan = AtmeexFan(coordinator, api, "entry1", 1, "Fan Device")
+    dev = AtmeexDevice.from_raw(
+        {"id": 1, "name": "Dev1", "model": "m", "online": True}
+    )
+
+    fan = AtmeexFanEntity(coordinator, api, "entry1", dev)
     return fan, cond, api, coordinator
 
 

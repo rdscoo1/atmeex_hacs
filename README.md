@@ -5,7 +5,7 @@
 Atmeex Cloud is a custom integration for [Home Assistant](https://www.home-assistant.io/) that connects your Atmeex (AirNanny) ventilation devices to the Home Assistant ecosystem.
 It uses the official Atmeex Cloud REST API (https://api.iot.atmeex.com) to provide reliable control and monitoring of your brizers directly from Home Assistant dashboards and automations.
 
-🧩 Originally based on the open-source integration developed by [[@anpavlov](https://github.com/anpavlov)], and extensively rewritten and expanded by Sergei Polunovskii to support modern Home Assistant releases and the current Atmeex API. Most recent improvements were contributed by Roman Khodukin, who fully refactored the integration to modern HA standards, added strict typing and unified runtime data architecture, implemented comprehensive diagnostics and fallback logic, created a complete automated test suite with 83% test coverage.
+🧩 Originally based on the open-source integration developed by [[@anpavlov](https://github.com/anpavlov)], and extensively rewritten and expanded by Sergei Polunovskii [[@pols1](https://github.com/pols1)] to support modern Home Assistant releases and the current Atmeex API. Most recent improvements were contributed by Roman Khodukin [[@rdscoo1](https://github.com/rdscoo1)], who fully refactored the integration to modern HA standards, added strict typing and unified runtime data architecture, implemented comprehensive diagnostics and fallback logic, created a complete automated test suite with 83% test coverage.
 The integration is now significantly more robust, maintainable, and predictable.
 
 ## Features
@@ -15,8 +15,9 @@ The integration is now significantly more robust, maintainable, and predictable.
 * 	Operation modes: ventilation, recirculation, mixed, and fresh-air intake.
 * 	Target temperature control (°C).
 * 	Optional humidifier control (if supported by the device).
-* 	Real-time sensors for temperature and humidity.
+* 	Sensors for temperature and humidity.
 * 	Online/offline status displayed directly on the climate card.
+*  Periodically updated from Atmeex Cloud (default: 30s, configurable in integration options).
 * 	Clean asynchronous I/O using Home Assistant’s shared aiohttp client session.
 
 ## Installation
@@ -53,11 +54,11 @@ The integration uses an internal update coordinator with a 30-second polling int
 
 ## Entities
 
-Entity Type	Example	Description
-**climate**	`climate.brizer_bedroom`	Main entity: on/off, fan, temperature, mode, humidifier
-**sensor**	`sensor.brizer_bedroom_temperature`	Current room temperature
-**sensor**	`sensor.brizer_bedroom_humidity`	Current humidity
-**binary_sensor**	`binary_sensor.brizer_bedroom_online`	Online/offline status
+| Platform | Entity type | Description |
+|---|---|---|
+| climate | `climate.brizer_bedroom` | Main entity: power, fan speed, modes, temperature, humidifier (if supported) |
+| fan | `fan.brizer_bedroom_fan` | Fan speed as percentage |
+| select | `select.brizer_bedroom_brizer_mode` | Brizer/airflow mode |
 
 ## Humidifier Control
 
@@ -80,6 +81,22 @@ Problem	Cause	Fix
 2. Auth failed during setup	Wrong credentials →	Verify your Atmeex Cloud email and password
 3. Temperature shows -100°C → API didn’t return room temperature	Wait for the next update or restart Home Assistant
 4. Second brizer missing → API returned null for device condition	Fixed in recent releases
+
+Logging
+## Troubleshooting
+
+### Enable debug logging
+Add to `configuration.yaml`:
+
+```
+yaml
+logger:
+  default: info
+  logs:
+    custom_components.atmeex_cloud: debug
+```
+
+Restart Home Assistant and reproduce the issue.
 
 You can check detailed logs in:
 Settings → System → Logs → custom_components.atmeex_cloud
@@ -157,7 +174,7 @@ pytest-homeassistant-custom-component, which provides a lightweight Home Assista
 
 ## Credits
 * 🧠 Development: [Roman Khodukin](https://github.com/rdscoo1)
-* ⚙️ Original base integration: [(https://github.com/anpavlov)], [Sergei Polunovskii](https://github.com/pols1)
+* ⚙️ Original base integration: [[@anpavlov](https://github.com/anpavlov)], [Sergei Polunovskii](https://github.com/pols1)
 * 🌐 API & platform: [Atmeex / AirNanny Cloud](https://api.iot.atmeex.com/)
 * 🧩 Framework: [Home Assistant](https://www.home-assistant.io/)
 

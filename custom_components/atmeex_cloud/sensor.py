@@ -38,6 +38,7 @@ class AtmeexDiagnosticsSensor(CoordinatorEntity, SensorEntity):
     _attr_entity_category = EntityCategory.DIAGNOSTIC
     _attr_icon = "mdi:cloud-check"
     _attr_name = "Atmeex diagnostics"
+    _attr_native_unit_of_measurement = "devices"
 
     def __init__(self, runtime: AtmeexRuntimeData, entry_id: str) -> None:
         """Инициализация сенсора диагностики.
@@ -73,9 +74,8 @@ class AtmeexDiagnosticsSensor(CoordinatorEntity, SensorEntity):
         devices = data.get("devices") or []
         states = data.get("states") or {}
 
-        # timestamp и последняя ошибка читаются ИМЕННО с атрибутов координатора
-        last_success_ts = getattr(self.coordinator, "last_success_ts", None)
-        last_api_error = getattr(self.coordinator, "last_api_error", None)
+        last_success_ts = data.get("last_success_ts")
+        last_api_error = data.get("last_api_error")
 
         if isinstance(last_success_ts, (int, float)):
             last_success_utc = datetime.fromtimestamp(
@@ -92,19 +92,4 @@ class AtmeexDiagnosticsSensor(CoordinatorEntity, SensorEntity):
             "last_success_utc": last_success_utc,
             "last_api_error": last_api_error,
             "domain": DOMAIN,
-        }
-
-    # ---------- привязка к устройству/интеграции ----------
-
-    @property
-    def device_info(self) -> dict[str, Any]:
-        """Информация об устройстве для Device Registry.
-
-        Делаем отдельное «виртуальное» устройство диагностики,
-        привязанное к интеграции Atmeex Cloud.
-        """
-        return {
-            "identifiers": {(DOMAIN, f"{self._entry_id}_diagnostics")},
-            "name": "Atmeex Cloud diagnostics",
-            "manufacturer": "Atmeex",
         }

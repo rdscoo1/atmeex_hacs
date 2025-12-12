@@ -1,7 +1,7 @@
 import pytest
 from aiohttp import ClientError
 
-from custom_components.atmeex_cloud.api import AtmeexApi, ApiError, API_BASE
+from custom_components.atmeex_cloud.api import AtmeexApi, ApiError, API_BASE_URL
 
 
 class ErrorSession:

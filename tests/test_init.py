@@ -3,7 +3,9 @@ from unittest.mock import AsyncMock
 from types import SimpleNamespace
 
 import custom_components.atmeex_cloud as atmeex_init
+from custom_components.atmeex_cloud.helpers import to_bool
 from custom_components.atmeex_cloud.const import DOMAIN, PLATFORMS
+from custom_components.atmeex_cloud.api import AtmeexDevice
 
 
 @pytest.mark.parametrize(
@@ -21,7 +23,7 @@ from custom_components.atmeex_cloud.const import DOMAIN, PLATFORMS
     ],
 )
 def test_to_bool(value, expected):
-    assert atmeex_init._to_bool(value) is expected
+    assert to_bool(value) is expected
 
 
 def test_normalize_device_state_basic():
@@ -81,13 +83,22 @@ async def test_async_setup_entry_happy_path(monkeypatch):
             self.session = session
             self.async_init = AsyncMock()
             self.login = AsyncMock()
-            self.get_devices = AsyncMock(
-                return_value=[
-                    {"id": 1, "name": "Dev1", "condition": {"pwr_on": 1, "fan_speed": 3}}
-                ]
-            )
-            self.get_device = AsyncMock()
+            dev_raw = {
+                "id": 1,
+                "name": "Dev1",
+                "model": "test-model",
+                "online": True,
+                "condition": {"pwr_on": 1, "fan_speed": 3},
+                "settings": {},
+            }
+            dev = AtmeexDevice.from_raw(dev_raw)
+
+            self.get_devices = AsyncMock(return_value=[dev])
+            self.get_device = AsyncMock(return_value=dev)
+
             created_apis.append(self)
+
+
 
     monkeypatch.setattr(atmeex_init, "AtmeexApi", FakeApi)
 
@@ -121,9 +132,21 @@ async def test_async_setup_entry_happy_path(monkeypatch):
         ),
     )
 
+    def _add_update_listener(_listener):
+    # в HA возвращает callback, который снимет listener
+        return lambda: None
+
+    def _async_on_unload(_cb):
+        # в HA регистрирует callback на выгрузку entry
+        return None
+
+
     entry = SimpleNamespace(
         data={"email": "user@example.com", "password": "pwd"},
+        options={"update_interval": 60},  # где нужно
         entry_id="entry1",
+        add_update_listener=_add_update_listener,
+        async_on_unload=_async_on_unload,
     )
 
     result = await atmeex_init.async_setup_entry(hass, entry)
@@ -150,3 +173,71 @@ async def test_async_unload_entry_clears_data(monkeypatch):
     result = await atmeex_init.async_unload_entry(hass, entry)
     assert result is True
     hass.config_entries.async_unload_platforms.assert_awaited_once_with(entry, PLATFORMS)
+
+
+@pytest.mark.asyncio
+async def test_async_setup_entry_uses_options_update_interval(monkeypatch):
+    created_apis = []
+
+    class FakeApi:
+        def __init__(self, session):
+            self.session = session
+            self.async_init = AsyncMock()
+            self.login = AsyncMock()
+            dev = AtmeexDevice.from_raw({"id": 1, "condition": {}})
+            self.get_devices = AsyncMock(return_value=[dev])
+            self.get_device = AsyncMock(return_value=dev)
+            created_apis.append(self)
+
+    monkeypatch.setattr(atmeex_init, "AtmeexApi", FakeApi)
+    monkeypatch.setattr(atmeex_init, "async_get_clientsession", lambda hass: object())
+
+    captured = {}
+
+    class DummyCoordinator:
+        def __init__(self, hass, logger, name, update_method, update_interval):
+            captured["update_interval"] = update_interval
+            self.hass = hass
+            self.logger = logger
+            self.name = name
+            self.update_method = update_method
+            self.update_interval = update_interval
+            self.data = None
+
+        async def async_config_entry_first_refresh(self):
+            self.data = await self.update_method()
+
+        def async_set_updated_data(self, data):
+            self.data = data
+
+    monkeypatch.setattr(atmeex_init, "DataUpdateCoordinator", DummyCoordinator)
+
+    hass = SimpleNamespace(
+        data={},
+        config_entries=SimpleNamespace(
+            async_forward_entry_setups=AsyncMock(),
+            async_unload_platforms=AsyncMock(return_value=True),
+        ),
+    )
+
+    def _add_update_listener(_listener):
+        # в HA возвращает callback, который снимет listener
+        return lambda: None
+
+    def _async_on_unload(_cb):
+        # в HA регистрирует callback на выгрузку entry
+        return None
+
+
+    entry = SimpleNamespace(
+        data={"email": "user@example.com", "password": "pwd"},
+        options={"update_interval": 60},  # где нужно
+        entry_id="entry1",
+        add_update_listener=_add_update_listener,
+        async_on_unload=_async_on_unload,
+    )
+
+
+    ok = await atmeex_init.async_setup_entry(hass, entry)
+    assert ok is True
+    assert captured["update_interval"].total_seconds() == 60
