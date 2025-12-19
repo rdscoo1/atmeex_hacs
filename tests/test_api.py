@@ -1,6 +1,6 @@
 import pytest
 
-from custom_components.atmeex_cloud.api import AtmeexApi, ApiError, API_BASE
+from custom_components.atmeex_cloud.api import AtmeexApi, ApiError, API_BASE_URL, AtmeexDevice
 
 
 class FakeResponse:
@@ -34,23 +34,30 @@ class FakeSession:
         assert self._responses, "No queued response"
         return self._responses.pop(0)
 
-    def post(self, url, json=None, headers=None, timeout=None):
-        self.requests.append(("POST", url, json, headers))
+    # Новый универсальный метод, который использует AtmeexApi через _authorized_request
+    def request(self, method, url, json=None, headers=None, timeout=None):
+        self.requests.append((method, url, json, headers))
         return self._pop_response()
 
+    # login() внутри Api использует session.post(...)
+    def post(self, url, json=None, headers=None, timeout=None):
+        return self.request("POST", url, json=json, headers=headers, timeout=timeout)
+
+    # На всякий случай оставляем get/put как обёртки
     def get(self, url, headers=None, timeout=None):
-        self.requests.append(("GET", url, None, headers))
-        return self._pop_response()
+        return self.request("GET", url, json=None, headers=headers, timeout=timeout)
 
     def put(self, url, json=None, headers=None, timeout=None):
-        self.requests.append(("PUT", url, json, headers))
-        return self._pop_response()
+        return self.request("PUT", url, json=json, headers=headers, timeout=timeout)
 
 
 @pytest.mark.asyncio
 async def test_login_success():
     session = FakeSession()
-    session.queue_response(FakeResponse(200, json_data={"access_token": "token123"}))
+    # token_type не обязателен, но добавим для реалистичности
+    session.queue_response(
+        FakeResponse(200, json_data={"access_token": "token123", "token_type": "Bearer"})
+    )
 
     api = AtmeexApi(session)
     await api.async_init()
@@ -59,9 +66,11 @@ async def test_login_success():
     assert api._token == "token123"
     method, url, payload, _headers = session.requests[0]
     assert method == "POST"
-    assert url == f"{API_BASE}/auth/signin"
+    assert url == f"{API_BASE_URL}/auth/signin"
+    # теперь login отправляет grant_type="basic"
     assert payload["email"] == "user@example.com"
     assert payload["password"] == "pwd"
+    assert payload["grant_type"] == "basic"
 
 
 @pytest.mark.asyncio
@@ -74,6 +83,7 @@ async def test_login_error_raises_apierror():
     with pytest.raises(ApiError) as exc:
         await api.login("user@example.com", "wrong")
 
+    # формат сообщения сохраняем
     assert "Auth failed 401" in str(exc.value)
 
 
@@ -83,14 +93,19 @@ async def test_get_devices_success():
     session.queue_response(FakeResponse(200, json_data=[{"id": 1}]))
 
     api = AtmeexApi(session)
+    # токен уже есть → _authorized_request не будет логиниться
     api._token = "t"
 
-    devices = await api.get_devices()
-    assert devices == [{"id": 1}]
+    result = await api.get_devices()
+    assert len(result) == 1
+    dev = result[0]
+    assert isinstance(dev, AtmeexDevice)
+    assert dev.id == 1
+    assert dev.raw["id"] == 1  # если хочется проверить "сырой" dict
 
-    method, url, _, headers = session.requests[0]
+    method, url, _payload, headers = session.requests[0]
     assert method == "GET"
-    assert url == f"{API_BASE}/devices"
+    assert url == f"{API_BASE_URL}/devices"
     assert headers["Authorization"] == "Bearer t"
 
 
@@ -100,9 +115,13 @@ async def test_get_devices_error_no_fallback():
     session.queue_response(FakeResponse(500, text_data="error"))
 
     api = AtmeexApi(session)
+    api._token = "t"  # чтобы не упереться в "credentials not set"
 
-    with pytest.raises(ApiError):
+    with pytest.raises(ApiError) as exc:
         await api.get_devices()
+
+    # Сообщение вида "get_devices 500: error" — можно при желании проверить
+    assert "get_devices 500" in str(exc.value)
 
 
 @pytest.mark.asyncio
@@ -111,8 +130,10 @@ async def test_get_devices_error_with_fallback_returns_empty_list():
     session.queue_response(FakeResponse(500, text_data="error"))
 
     api = AtmeexApi(session)
+    api._token = "t"
+
     result = await api.get_devices(fallback=True)
-    assert result == []
+    assert result == []  # HTTP-ошибка в fallback-режиме → пустой список
 
 
 @pytest.mark.asyncio
@@ -124,11 +145,13 @@ async def test_get_device_success():
     api._token = "t"
 
     dev = await api.get_device(1)
-    assert dev["id"] == 1
+    assert isinstance(dev, AtmeexDevice)
+    assert dev.id == 1
+    assert dev.raw["id"] == 1
 
-    method, url, _, headers = session.requests[0]
+    method, url, _payload, headers = session.requests[0]
     assert method == "GET"
-    assert url == f"{API_BASE}/devices/1"
+    assert url == f"{API_BASE_URL}/devices/1"
     assert headers["Authorization"] == "Bearer t"
 
 
@@ -138,9 +161,12 @@ async def test_get_device_error_raises():
     session.queue_response(FakeResponse(404, text_data="not found"))
 
     api = AtmeexApi(session)
+    api._token = "t"
 
-    with pytest.raises(ApiError):
+    with pytest.raises(ApiError) as exc:
         await api.get_device(123)
+
+    assert "GET /devices/123 404" in str(exc.value)
 
 
 @pytest.mark.asyncio
@@ -172,7 +198,7 @@ async def test_setters_success(method_name, body):
 
     req = session.requests[0]
     assert req[0] == "PUT"
-    assert req[1].startswith(f"{API_BASE}/devices/1/params")
+    assert req[1].startswith(f"{API_BASE_URL}/devices/1/params")
     assert req[2] == body
 
 
@@ -184,5 +210,7 @@ async def test_setter_error_raises():
     api = AtmeexApi(session)
     api._token = "t"
 
-    with pytest.raises(ApiError):
+    with pytest.raises(ApiError) as exc:
         await api.set_power(1, True)
+
+    assert "set_power 500" in str(exc.value)

@@ -7,9 +7,10 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import CONF_EMAIL, CONF_PASSWORD
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.device_registry import DeviceEntry
+from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 
 from .const import DOMAIN
-from . import AtmeexRuntimeData, get_diagnostics_snapshot  # runtime_data + helper
+from . import AtmeexRuntimeData, AtmeexCoordinatorData
 
 # Поля, которые всегда редактируем (удаляем/маскируем) из diagnostics
 TO_REDACT: set[str] = {
@@ -23,6 +24,46 @@ TO_REDACT: set[str] = {
 }
 
 
+def get_diagnostics_snapshot(
+    coordinator: DataUpdateCoordinator[AtmeexCoordinatorData],
+) -> dict[str, Any]:
+    """Компактный snapshot для диагностики (entities / diagnostics UI).
+
+    Возвращает:
+    - количество устройств;
+    - timestamp последнего успешного обновления (raw + ISO-строка);
+    - последнее сообщение об ошибке API (если есть).
+    """
+    data: AtmeexCoordinatorData = getattr(coordinator, "data", None) or {
+        "devices": [],
+        "states": {},
+    }
+    devices = data.get("devices") or []
+
+    # Метаданные лежат как атрибуты координатора (см. DummyCoordinator в тестах)
+    last_ts = getattr(coordinator, "last_success_ts", None)
+    last_error = getattr(coordinator, "last_api_error", None)
+
+    # Читаемый ISO-формат времени последнего успеха
+    last_success_utc: str | None = None
+    if isinstance(last_ts, (int, float)):
+        from datetime import datetime, timezone
+
+        try:
+            last_success_utc = datetime.fromtimestamp(
+                last_ts, tz=timezone.utc
+            ).isoformat()
+        except Exception:  # pragma: no cover — сильно защитный код
+            last_success_utc = None
+
+    return {
+        "device_count": len(devices),
+        "last_success_ts": last_ts,
+        "last_success_utc": last_success_utc,
+        "last_api_error": last_error,
+    }
+
+
 async def async_get_config_entry_diagnostics(
     hass: HomeAssistant,
     entry: ConfigEntry,
@@ -32,14 +73,13 @@ async def async_get_config_entry_diagnostics(
     Вызывается Home Assistant при нажатии "Download diagnostics"
     для всей интеграции (config entry).
     """
-
     runtime: AtmeexRuntimeData = entry.runtime_data
     coordinator = runtime.coordinator
     api = runtime.api
 
     coordinator_data: dict[str, Any] = getattr(coordinator, "data", {}) or {}
 
-    # NEW: компактный snapshot по координатору (device_count, last_success_ts, last_api_error)
+    # компактный snapshot по координатору (device_count, last_success_ts, last_api_error)
     coordinator_diag = get_diagnostics_snapshot(coordinator)
 
     diag: dict[str, Any] = {

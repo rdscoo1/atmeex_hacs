@@ -3,12 +3,13 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 from custom_components.atmeex_cloud.select import (
-    HumidificationSelect,
-    BrizerModeSelect,
+    AtmeexHumidificationSelect,
+    AtmeexBrizerSelect,
     HUM_OPTIONS,
     BRIZER_OPTIONS,
 )
 from custom_components.atmeex_cloud.const import DOMAIN
+from custom_components.atmeex_cloud.api import AtmeexDevice
 
 
 def _make_selects(cond_overrides: dict | None = None):
@@ -29,8 +30,12 @@ def _make_selects(cond_overrides: dict | None = None):
     api.set_humid_stage = AsyncMock()
     api.set_brizer_mode = AsyncMock()
 
-    hum = HumidificationSelect(coordinator, api, "1", "Hum mode")
-    brizer = BrizerModeSelect(coordinator, api, "1", "Brizer mode")
+    dev = AtmeexDevice.from_raw(
+        {"id": 1, "name": "Dev1", "model": "m", "online": True}
+    )
+
+    hum = AtmeexHumidificationSelect(coordinator, api, dev, "Hum mode")
+    brizer = AtmeexBrizerSelect(coordinator, api, dev, "Brizer mode")
 
     # hass не нужен, т.к. эти классы не используют _refresh
     hum.hass = SimpleNamespace(data={DOMAIN: {}})
@@ -59,7 +64,7 @@ async def test_humidification_select_async_select_option():
     hum, brizer, cond, api, coord = _make_selects({"hum_stg": 0})
     await hum.async_select_option("3")
 
-    api.set_humid_stage.assert_awaited_once_with("1", 3)
+    api.set_humid_stage.assert_awaited_once_with(1, 3)
     coord.async_request_refresh.assert_awaited_once()
     assert hum._attr_current_option == "3"
 
@@ -86,7 +91,7 @@ async def test_brizer_select_async_select_option():
     hum, brizer, cond, api, coord = _make_selects()
     await brizer.async_select_option(BRIZER_OPTIONS[3])
 
-    api.set_brizer_mode.assert_awaited_once_with("1", 3)
+    api.set_brizer_mode.assert_awaited_once_with(1, 3)
     coord.async_request_refresh.assert_awaited_once()
     assert brizer._attr_current_option == BRIZER_OPTIONS[3]
 

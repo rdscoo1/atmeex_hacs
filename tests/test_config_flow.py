@@ -3,9 +3,9 @@ import pytest
 from unittest.mock import AsyncMock, patch
 
 from homeassistant.const import CONF_EMAIL, CONF_PASSWORD
+from types import SimpleNamespace
 from homeassistant import data_entry_flow
-
-from custom_components.atmeex_cloud.config_flow import AtmeexConfigFlow
+from custom_components.atmeex_cloud.config_flow import AtmeexConfigFlow, AtmeexOptionsFlowHandler
 from custom_components.atmeex_cloud.api import ApiError
 
 
@@ -100,3 +100,13 @@ async def test_config_flow_unknown_error():
 
     assert result["type"] == data_entry_flow.FlowResultType.FORM
     assert result["errors"]["base"] == "unknown"
+
+@pytest.mark.asyncio
+async def test_options_flow_sets_update_interval():
+    entry = SimpleNamespace(options={"update_interval": 30})
+    flow = AtmeexOptionsFlowHandler(entry)
+
+    result = await flow.async_step_init(user_input={"update_interval": 60})
+
+    assert result["type"] == data_entry_flow.FlowResultType.CREATE_ENTRY
+    assert result["data"]["update_interval"] == 60

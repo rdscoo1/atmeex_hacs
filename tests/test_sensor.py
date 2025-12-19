@@ -4,7 +4,7 @@ from unittest.mock import AsyncMock
 
 from custom_components.atmeex_cloud import AtmeexRuntimeData
 from custom_components.atmeex_cloud.const import DOMAIN
-from custom_components.atmeex_cloud.diagnostics_sensor import async_setup_entry
+from custom_components.atmeex_cloud.sensor import async_setup_entry
 
 
 class DummyCoordinator:
@@ -21,16 +21,16 @@ class DummyCoordinator:
 
 
 @pytest.mark.asyncio
-async def test_diagnostics_sensor_exposes_basic_attrs(hass):
+async def test_sensor_exposes_basic_attrs(hass):
     # coordinator с 2 устройствами и заполненной диагностикой
     coord = DummyCoordinator(
-        data={
-            "devices": [{"id": 1}, {"id": 2}],
-            "states": {},
-        },
-        last_success_ts=1234567890.0,
-        last_api_error="some error",
-    )
+    data={
+        "devices": [{"id": 1}, {"id": 2}],
+        "states": {},
+        "last_success_ts": 1234567890.0,
+        "last_api_error": "some error",
+    }
+)
 
     runtime = AtmeexRuntimeData(
         api=SimpleNamespace(),  # api тут не нужен
@@ -69,7 +69,7 @@ async def test_diagnostics_sensor_exposes_basic_attrs(hass):
 
 
 @pytest.mark.asyncio
-async def test_diagnostics_sensor_handles_no_data(hass):
+async def test_sensor_handles_no_data(hass):
     coord = DummyCoordinator(data={}, last_success_ts=None, last_api_error=None)
 
     runtime = AtmeexRuntimeData(
