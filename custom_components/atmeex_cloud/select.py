@@ -81,6 +81,7 @@ class _BaseSelect(AtmeexEntityMixin, CoordinatorEntity, SelectEntity):
 
 class AtmeexHumidificationSelect(_BaseSelect):
     _attr_options = HUM_OPTIONS
+    _attr_translation_key = "humidification_mode"
 
     def __init__(
         self,
@@ -113,6 +114,7 @@ class AtmeexHumidificationSelect(_BaseSelect):
 
 class AtmeexBrizerSelect(_BaseSelect):
     _attr_options = BRIZER_OPTIONS
+    _attr_translation_key = "breezer_mode"
 
     def __init__(
         self,

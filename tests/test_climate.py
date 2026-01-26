@@ -81,6 +81,7 @@ def _make_entity(overrides: dict[str, Any] | None = None):
         device=dev,
         # refresh_device_cb в этих тестах не нужен
         refresh_device_cb=None,
+        runtime=None,
     )
 
     return ent, cond, api

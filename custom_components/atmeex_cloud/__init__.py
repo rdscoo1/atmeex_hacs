@@ -3,14 +3,17 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import timedelta
 from typing import Any, TypedDict, Callable, Awaitable
 
 import aiohttp
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.core import HomeAssistant
+from homeassistant.core import HomeAssistant, ServiceCall, callback
 from homeassistant.exceptions import ConfigEntryNotReady, ConfigEntryAuthFailed
+from homeassistant.helpers.device_registry import DeviceEntry
+import voluptuous as vol
+from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.update_coordinator import (
     DataUpdateCoordinator,
@@ -20,9 +23,11 @@ from homeassistant.const import CONF_EMAIL, CONF_PASSWORD
 
 from .api import AtmeexApi, ApiError, AtmeexDevice, AtmeexState
 from .const import (
+    DOMAIN,
     PLATFORMS,
     CONF_UPDATE_INTERVAL,
-    DEFAULT_UPDATE_INTERVAL
+    DEFAULT_UPDATE_INTERVAL,
+    BRIZER_MODES,
 )
 from .config_flow import AtmeexOptionsFlowHandler
 from .helpers import to_bool
@@ -46,11 +51,96 @@ class AtmeexCoordinatorData(TypedDict, total=False):
 
 
 @dataclass
+class PendingCommand:
+    """Tracks a pending command to prevent stale state overwrites."""
+    value: Any
+    timestamp: float
+    attribute: str  # e.g., "fan_speed", "pwr_on"
+
+
+@dataclass
 class AtmeexRuntimeData:
     """Единый runtime-объект для записи конфигурации."""
     api: AtmeexApi
     coordinator: DataUpdateCoordinator[AtmeexCoordinatorData]
     refresh_device: Callable[[int | str], Awaitable[None]]
+    # Per-device locks to serialize set+refresh operations
+    device_locks: dict[str, asyncio.Lock] = field(default_factory=dict)
+    # Per-device pending commands: device_id -> {attribute -> PendingCommand}
+    pending_commands: dict[str, dict[str, PendingCommand]] = field(default_factory=dict)
+
+    def get_device_lock(self, device_id: int | str) -> asyncio.Lock:
+        """Get or create a lock for the given device."""
+        key = str(device_id)
+        if key not in self.device_locks:
+            self.device_locks[key] = asyncio.Lock()
+        return self.device_locks[key]
+
+    def set_pending(self, device_id: int | str, attribute: str, value: Any) -> float:
+        """Record a pending command. Returns the timestamp."""
+        key = str(device_id)
+        ts = time.monotonic()
+        if key not in self.pending_commands:
+            self.pending_commands[key] = {}
+        self.pending_commands[key][attribute] = PendingCommand(
+            value=value, timestamp=ts, attribute=attribute
+        )
+        _LOGGER.debug(
+            "Pending command set: device=%s attr=%s value=%s ts=%.3f",
+            device_id, attribute, value, ts
+        )
+        return ts
+
+    def get_pending(self, device_id: int | str, attribute: str) -> PendingCommand | None:
+        """Get pending command if exists."""
+        key = str(device_id)
+        return self.pending_commands.get(key, {}).get(attribute)
+
+    def clear_pending(self, device_id: int | str, attribute: str) -> None:
+        """Clear a pending command after confirmation."""
+        key = str(device_id)
+        if key in self.pending_commands and attribute in self.pending_commands[key]:
+            del self.pending_commands[key][attribute]
+            _LOGGER.debug("Pending command cleared: device=%s attr=%s", device_id, attribute)
+
+    def clear_pending_if_confirmed(
+        self, device_id: int | str, attribute: str, confirmed_value: Any, tolerance: float = 5.0
+    ) -> bool:
+        """Clear pending if device confirmed the value or TTL expired.
+        
+        Returns True if the confirmed_value should be used (no stale pending).
+        Returns False if there's a newer pending command that should take precedence.
+        """
+        pending = self.get_pending(device_id, attribute)
+        if pending is None:
+            return True  # No pending, use confirmed value
+        
+        age = time.monotonic() - pending.timestamp
+        
+        # If pending command is too old, clear it and use confirmed
+        if age > tolerance:
+            self.clear_pending(device_id, attribute)
+            _LOGGER.debug(
+                "Pending command expired: device=%s attr=%s age=%.1fs",
+                device_id, attribute, age
+            )
+            return True
+        
+        # If device confirmed our pending value, clear it
+        if pending.value == confirmed_value:
+            self.clear_pending(device_id, attribute)
+            _LOGGER.debug(
+                "Pending command confirmed: device=%s attr=%s value=%s",
+                device_id, attribute, confirmed_value
+            )
+            return True
+        
+        # Pending command is newer than this response - ignore stale data
+        _LOGGER.debug(
+            "Ignoring stale value: device=%s attr=%s confirmed=%s pending=%s age=%.1fs",
+            device_id, attribute, confirmed_value, pending.value, age
+        )
+        return False
 
 
 __all__ = [
@@ -59,6 +149,7 @@ __all__ = [
     "async_get_options_flow",
     "AtmeexCoordinatorData",
     "AtmeexRuntimeData",
+    "PendingCommand",
 ]
 
 
@@ -423,3 +514,42 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 async def async_get_options_flow(config_entry: ConfigEntry):
     """Hook для options flow."""
     return AtmeexOptionsFlowHandler(config_entry)
+
+
+async def async_remove_config_entry_device(
+    hass: HomeAssistant,
+    config_entry: ConfigEntry,
+    device_entry: DeviceEntry,
+) -> bool:
+    """Remove a device from the integration.
+    
+    This allows users to remove individual devices that are no longer
+    connected or needed.
+    """
+    # We allow removal of any device - the device will reappear
+    # on next poll if it's still connected to the account
+    return True
+
+
+async def async_migrate_entry(hass: HomeAssistant, config_entry: ConfigEntry) -> bool:
+    """Migrate old entry to new version.
+    
+    This function handles config entry version upgrades when the
+    integration schema changes.
+    """
+    _LOGGER.debug("Migrating from version %s", config_entry.version)
+
+    if config_entry.version == 1:
+        # Current version, no migration needed
+        pass
+
+    # Future migrations would go here:
+    # if config_entry.version == 1:
+    #     new_data = {**config_entry.data}
+    #     # ... modify new_data ...
+    #     hass.config_entries.async_update_entry(
+    #         config_entry, data=new_data, version=2
+    #     )
+
+    _LOGGER.debug("Migration to version %s successful", config_entry.version)
+    return True

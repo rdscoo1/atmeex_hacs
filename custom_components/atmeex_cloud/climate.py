@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from datetime import datetime, timezone
 import logging
 from typing import Any, Callable, Awaitable
@@ -32,6 +33,9 @@ from . import AtmeexRuntimeData
 
 _LOGGER = logging.getLogger(__name__)
 
+# Tolerance for pending command expiration (seconds)
+PENDING_COMMAND_TTL = 5.0
+
 # Доступные скорости вентилятора (строки — так их удобнее показывать в UI)
 FAN_MODES = ["1", "2", "3", "4", "5", "6", "7"]
 
@@ -61,6 +65,7 @@ async def async_setup_entry(
                 entry_id=entry.entry_id,
                 device=dev,
                 refresh_device_cb=runtime.refresh_device,
+                runtime=runtime,
             )
         )
 
@@ -95,6 +100,7 @@ class AtmeexClimateEntity(AtmeexEntityMixin, CoordinatorEntity, ClimateEntity):
     _attr_swing_modes = BRIZER_SWING_MODES
     _attr_icon = "mdi:air-purifier"
     _attr_has_entity_name = True
+    _attr_translation_key = "breezer"
     _attr_preset_modes = [PRESET_NONE, PRESET_BOOST, PRESET_SLEEP]
     _attr_preset_mode = PRESET_NONE
 
@@ -105,6 +111,7 @@ class AtmeexClimateEntity(AtmeexEntityMixin, CoordinatorEntity, ClimateEntity):
         entry_id: str | None,
         device: AtmeexDevice,
         refresh_device_cb: Callable[[int | str], Awaitable[None]] | None = None,
+        runtime: AtmeexRuntimeData | None = None,
     ) -> None:
         super().__init__(coordinator)
         self.api = api
@@ -112,6 +119,7 @@ class AtmeexClimateEntity(AtmeexEntityMixin, CoordinatorEntity, ClimateEntity):
         self._device_meta = device
         self._device_id = device.id
         self._refresh_device_cb = refresh_device_cb
+        self._runtime = runtime
 
         self._attr_name = device.name
         self._attr_unique_id = f"{device.id}_climate"
@@ -273,27 +281,88 @@ class AtmeexClimateEntity(AtmeexEntityMixin, CoordinatorEntity, ClimateEntity):
 
     @property
     def fan_mode(self) -> str | None:
-        """Текущая скорость вентилятора в виде строки 1..7."""
-        speed = self._device_state.get("fan_speed")
-        if isinstance(speed, (int, float)):
-            speed = int(speed)
-        return FAN_MODES[speed - 1] if speed in range(1, 8) else None
+        """Текущая скорость вентилятора в виде строки 1..7.
+        
+        Uses pending command value if a recent command was sent and not yet
+        confirmed by the device, to prevent UI regression during rapid changes.
+        """
+        confirmed_speed = self._device_state.get("fan_speed")
+        
+        # Check if there's a pending fan_speed command that should take precedence
+        if self._runtime is not None:
+            pending = self._runtime.get_pending(self._device_id, "fan_speed")
+            if pending is not None:
+                age = time.monotonic() - pending.timestamp
+                if age <= PENDING_COMMAND_TTL:
+                    # Use pending value if not expired and not yet confirmed
+                    if pending.value != confirmed_speed:
+                        _LOGGER.debug(
+                            "Climate: Using pending fan_speed=%s instead of confirmed=%s (age=%.1fs)",
+                            pending.value, confirmed_speed, age
+                        )
+                        speed = pending.value
+                        if isinstance(speed, (int, float)):
+                            speed = int(speed)
+                        return FAN_MODES[speed - 1] if speed in range(1, 8) else None
+                    else:
+                        # Device confirmed our value, clear pending
+                        self._runtime.clear_pending(self._device_id, "fan_speed")
+                else:
+                    # Pending expired, clear it
+                    self._runtime.clear_pending(self._device_id, "fan_speed")
+        
+        if isinstance(confirmed_speed, (int, float)):
+            confirmed_speed = int(confirmed_speed)
+        return FAN_MODES[confirmed_speed - 1] if confirmed_speed in range(1, 8) else None
 
     async def async_set_fan_mode(self, fan_mode: str) -> None:
-        """Установить скорость вентилятора по выбранному режиму."""
+        """Установить скорость вентилятора по выбранному режиму.
+        
+        Uses device lock to serialize operations and tracks pending command
+        to prevent stale responses from overwriting newer state.
+        """
         try:
             speed = int(fan_mode)
         except (ValueError, TypeError):
             _LOGGER.warning("Unsupported fan_mode: %s", fan_mode)
             return
-        try:
-            await self.api.set_fan_speed(self._device_id, speed)
-        except ApiError as err:
-            _LOGGER.error(
-                "Failed to set fan speed for %s: %s", self._device_id, err
+        
+        # Record pending command BEFORE acquiring lock
+        if self._runtime is not None:
+            self._runtime.set_pending(self._device_id, "fan_speed", speed)
+        
+        _LOGGER.debug(
+            "Climate: Setting fan speed: device=%s speed=%s",
+            self._device_id, speed
+        )
+        
+        # Use device lock to serialize set+refresh operations
+        lock = self._runtime.get_device_lock(self._device_id) if self._runtime else None
+        
+        async def _do_set_and_refresh():
+            try:
+                await self.api.set_fan_speed(self._device_id, speed)
+            except ApiError as err:
+                _LOGGER.error(
+                    "Failed to set fan speed for %s: %s", self._device_id, err
+                )
+                # Clear pending on error
+                if self._runtime is not None:
+                    self._runtime.clear_pending(self._device_id, "fan_speed")
+                raise HomeAssistantError("Failed to set fan mode") from err
+            
+            await self._refresh()
+            
+            _LOGGER.debug(
+                "Climate: Fan speed set complete: device=%s speed=%s",
+                self._device_id, speed
             )
-            raise HomeAssistantError("Failed to set fan mode") from err
-        await self._refresh()
+        
+        if lock is not None:
+            async with lock:
+                await _do_set_and_refresh()
+        else:
+            await _do_set_and_refresh()
 
     # ---------- режим заслонки (swing) ----------
 
