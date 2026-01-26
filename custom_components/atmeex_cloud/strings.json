@@ -1,0 +1,137 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Atmeex Cloud",
+        "description": "Enter your Atmeex Cloud account credentials to connect your devices.",
+        "data": {
+          "email": "Email",
+          "password": "Password"
+        }
+      },
+      "reauth_confirm": {
+        "title": "Re-authenticate Atmeex Cloud",
+        "description": "Your session has expired. Please re-enter your credentials.",
+        "data": {
+          "email": "Email",
+          "password": "Password"
+        }
+      }
+    },
+    "error": {
+      "cannot_connect": "Failed to connect to Atmeex Cloud. Please check your internet connection.",
+      "invalid_auth": "Invalid email or password.",
+      "unknown": "An unexpected error occurred."
+    },
+    "abort": {
+      "already_configured": "This account is already configured.",
+      "reauth_successful": "Re-authentication successful."
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Atmeex Cloud Options",
+        "description": "Configure integration settings.",
+        "data": {
+          "update_interval": "Update interval (seconds)"
+        }
+      }
+    }
+  },
+  "entity": {
+    "climate": {
+      "breezer": {
+        "name": "Climate",
+        "state_attributes": {
+          "fan_mode": {
+            "name": "Fan speed",
+            "state": {
+              "1": "Speed 1",
+              "2": "Speed 2",
+              "3": "Speed 3",
+              "4": "Speed 4",
+              "5": "Speed 5",
+              "6": "Speed 6",
+              "7": "Speed 7"
+            }
+          },
+          "swing_mode": {
+            "name": "Breezer mode",
+            "state": {
+              "приточная вентиляция": "Supply ventilation",
+              "рециркуляция": "Recirculation",
+              "смешанный режим": "Mixed mode",
+              "приточный клапан": "Supply valve"
+            }
+          }
+        }
+      }
+    },
+    "fan": {
+      "breezer_fan": {
+        "name": "Fan"
+      }
+    },
+    "select": {
+      "humidification_mode": {
+        "name": "Humidification",
+        "state": {
+          "off": "Off",
+          "1": "Stage 1",
+          "2": "Stage 2",
+          "3": "Stage 3"
+        }
+      },
+      "breezer_mode": {
+        "name": "Breezer mode",
+        "state": {
+          "приточная вентиляция": "Supply ventilation",
+          "рециркуляция": "Recirculation",
+          "смешанный режим": "Mixed mode",
+          "приточный клапан": "Supply valve"
+        }
+      }
+    },
+    "binary_sensor": {
+      "online": {
+        "name": "Online"
+      }
+    },
+    "sensor": {
+      "diagnostics": {
+        "name": "Diagnostics"
+      }
+    }
+  },
+  "services": {
+    "set_breezer_mode": {
+      "name": "Set breezer mode",
+      "description": "Set the breezer operation mode (damper position).",
+      "fields": {
+        "device_id": {
+          "name": "Device",
+          "description": "The Atmeex device to control."
+        },
+        "mode": {
+          "name": "Mode",
+          "description": "The breezer mode to set."
+        }
+      }
+    },
+    "set_humidifier_stage": {
+      "name": "Set humidifier stage",
+      "description": "Set the humidifier stage (0-3).",
+      "fields": {
+        "device_id": {
+          "name": "Device",
+          "description": "The Atmeex device to control."
+        },
+        "stage": {
+          "name": "Stage",
+          "description": "The humidifier stage (0=off, 1-3=stages)."
+        }
+      }
+    }
+  }
+}

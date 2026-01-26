@@ -1,5 +1,5 @@
 DOMAIN = "atmeex_cloud"
-PLATFORMS = ["climate", "fan", "select", "sensor"]
+PLATFORMS = ["binary_sensor", "climate", "fan", "select", "sensor"]
 BRIZER_MODES = [
     "приточная вентиляция",  # 0
     "рециркуляция",          # 1

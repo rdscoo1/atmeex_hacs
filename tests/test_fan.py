@@ -24,7 +24,8 @@ def _make_fan_entity():
         {"id": 1, "name": "Dev1", "model": "m", "online": True}
     )
 
-    fan = AtmeexFanEntity(coordinator, api, "entry1", dev)
+    # runtime=None for backward compatibility in simple tests
+    fan = AtmeexFanEntity(coordinator, api, "entry1", dev, runtime=None)
     return fan, cond, api, coordinator
 
 
