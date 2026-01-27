@@ -1,13 +1,13 @@
 {
   "domain": "atmeex_cloud",
   "name": "Atmeex Cloud",
-  "version": "0.6.0",
+  "codeowners": ["@rdscoo1"],
   "config_flow": true,
   "documentation": "https://github.com/rdscoo1/atmeex_hacs",
-  "issue_tracker": "https://github.com/rdscoo1/atmeex_hacs/issues",
-  "requirements": ["aiohttp>=3.9.0"],
-  "codeowners": ["@rdscoo1"],
+  "integration_type": "hub",
   "iot_class": "cloud_polling",
+  "issue_tracker": "https://github.com/rdscoo1/atmeex_hacs/issues",
   "loggers": ["custom_components.atmeex_cloud"],
-  "integration_type": "hub"
+  "requirements": ["aiohttp>=3.9.0"],
+  "version": "0.6.0"
 }
