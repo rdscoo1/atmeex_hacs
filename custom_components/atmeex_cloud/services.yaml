@@ -10,14 +10,14 @@ set_breezer_mode:
       name: Mode
       description: The breezer mode to set.
       required: true
-      example: "рециркуляция"
+      example: "recirculation"
       selector:
         select:
           options:
-            - "приточная вентиляция"
-            - "рециркуляция"
-            - "смешанный режим"
-            - "приточный клапан"
+            - "supply_ventilation"
+            - "recirculation"
+            - "mixed_mode"
+            - "supply_valve"
 
 set_humidifier_stage:
   name: Set humidifier stage

@@ -57,11 +57,14 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_e
 class AtmeexFanEntity(AtmeexEntityMixin, CoordinatorEntity, FanEntity):
     """Fan entity exposing Atmeex fan speed as percentage."""
 
-    _attr_supported_features = (
-        FanEntityFeature.SET_SPEED
-        | FanEntityFeature.TURN_ON
-        | FanEntityFeature.TURN_OFF
-    )
+    # Build supported features - TURN_ON/TURN_OFF added in HA 2024.8
+    _supported_features = FanEntityFeature.SET_SPEED
+    if hasattr(FanEntityFeature, "TURN_ON"):
+        _supported_features |= FanEntityFeature.TURN_ON
+    if hasattr(FanEntityFeature, "TURN_OFF"):
+        _supported_features |= FanEntityFeature.TURN_OFF
+    
+    _attr_supported_features = _supported_features
     _attr_has_entity_name = True
     _attr_percentage_step = 1
     _attr_translation_key = "breezer_fan"

@@ -59,10 +59,10 @@
           "swing_mode": {
             "name": "Breezer mode",
             "state": {
-              "приточная вентиляция": "Supply ventilation",
-              "рециркуляция": "Recirculation",
-              "смешанный режим": "Mixed mode",
-              "приточный клапан": "Supply valve"
+              "supply_ventilation": "Supply ventilation",
+              "recirculation": "Recirculation",
+              "mixed_mode": "Mixed mode",
+              "supply_valve": "Supply valve"
             }
           }
         }
@@ -86,10 +86,10 @@
       "breezer_mode": {
         "name": "Breezer mode",
         "state": {
-          "приточная вентиляция": "Supply ventilation",
-          "рециркуляция": "Recirculation",
-          "смешанный режим": "Mixed mode",
-          "приточный клапан": "Supply valve"
+          "supply_ventilation": "Supply ventilation",
+          "recirculation": "Recirculation",
+          "mixed_mode": "Mixed mode",
+          "supply_valve": "Supply valve"
         }
       }
     },

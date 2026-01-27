@@ -1,10 +1,10 @@
 DOMAIN = "atmeex_cloud"
 PLATFORMS = ["binary_sensor", "climate", "fan", "select", "sensor"]
 BRIZER_MODES = [
-    "приточная вентиляция",  # 0
-    "рециркуляция",          # 1
-    "смешанный режим",       # 2
-    "приточный клапан",      # 3
+    "supply_ventilation",  # 0
+    "recirculation",       # 1
+    "mixed_mode",          # 2
+    "supply_valve",        # 3
 ]
 
 HUMIDIFICATION_OPTIONS = ["off", "1", "2", "3"]
