@@ -243,6 +243,11 @@ class WebSocketManager:
             if not self._running:
                 break
             
+            # Check if already reconnected (e.g., by another task)
+            if self.is_connected:
+                _LOGGER.debug("WebSocket already reconnected, skipping reconnect attempt")
+                break
+            
             success = await self.connect()
             
             if success:
