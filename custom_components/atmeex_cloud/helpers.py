@@ -60,25 +60,27 @@ def fan_speed_to_api(speed: int) -> int:
 def api_to_fan_speed(api_speed: int | float | str | None) -> int:
     """Convert API fan speed (0-6) to HA fan speed (1-7).
     
-    API uses 0-6, HA uses 1-7.
-    Speed 0 stays 0 (off).
-    Speed 0-6 → 1-7
+    API uses 0-6 for working speeds, HA uses 1-7.
+    Power on/off is determined by pwr_on field, not fan_speed.
+    
+    API 0 → HA 1 (minimum speed)
+    API 1 → HA 2
+    ...
+    API 6 → HA 7 (maximum speed)
     
     API may return string values, so we handle that.
     """
     if api_speed is None:
-        return 0
+        return 1  # Default to minimum speed if not specified
     
     try:
         s = int(api_speed)
     except (TypeError, ValueError):
-        return 0
+        return 1  # Default to minimum speed on parse error
     
-    if s <= 0:
-        return 0
-    
-    # Convert 0-6 to 1-7
-    return min(FAN_MAX, s + 1)
+    # Clamp to valid range and convert: 0-6 → 1-7
+    s = max(0, min(6, s))
+    return s + 1
 
 
 def deci_to_c(value: int | float | None) -> float | None:

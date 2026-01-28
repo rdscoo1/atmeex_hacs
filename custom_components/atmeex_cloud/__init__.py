@@ -191,18 +191,18 @@ def _normalize_device_state(item: dict[str, Any]) -> dict[str, Any]:
         fan_raw, u_fan_raw, pwr
     )
     
-    # Convert API speed (0-6) to HA speed (1-7)
-    fan = api_to_fan_speed(fan_raw) if fan_raw is not None else None
-    u_fan = api_to_fan_speed(u_fan_raw) if u_fan_raw is not None else None
-    
-    # Prefer settings.u_fan_speed if condition is stale or zero
+    # Prefer settings.u_fan_speed if condition.fan_speed is missing/None or 0 when device is on
+    # This handles cases where condition data is stale but settings has the target speed
     if (
-        (fan is None or fan == 0)
+        (fan_raw is None or (fan_raw == 0 and pwr))
+        and u_fan_raw is not None
         and pwr
-        and isinstance(u_fan, int)
-        and u_fan > 0
     ):
-        fan = u_fan
+        # Use settings speed
+        fan = api_to_fan_speed(u_fan_raw)
+    else:
+        # Use condition speed (or None if missing)
+        fan = api_to_fan_speed(fan_raw) if fan_raw is not None else None
 
     # Заслонка
     damp = cond.get("damp_pos")
@@ -591,16 +591,11 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         if "fan_speed" in condition_data:
             api_fan = condition_data["fan_speed"]
             ha_fan = api_to_fan_speed(api_fan)
+            normalized["fan_speed"] = ha_fan
             _LOGGER.debug(
                 "WebSocket fan_speed conversion: API=%s -> HA=%s",
                 api_fan, ha_fan
             )
-            # Only update if valid (non-zero when device is on)
-            if ha_fan > 0:
-                normalized["fan_speed"] = ha_fan
-            elif not normalized.get("pwr_on", False):
-                # Device is off, fan_speed 0 is valid
-                normalized["fan_speed"] = 0
         
         # Update other fields directly (no conversion needed)
         for field in ["temp_room", "temp_in", "hum_room", "co2_ppm", 
@@ -609,12 +604,12 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 normalized[field] = condition_data[field]
         
         # Preserve fields not in condition
-        for field in ["u_temp_room", "u_fan_speed", "online"]:
+        for field in ["u_temp_room", "u_fan_speed"]:
             if field in existing_state and field not in normalized:
                 normalized[field] = existing_state[field]
         
-        # Update online status based on condition time
-        normalized["online"] = _is_device_online(condition_data)
+        # Update online status - if we received condition data via WebSocket, device is online
+        normalized["online"] = bool(condition_data.get("time"))
         
         # Update states
         states[key] = normalized
