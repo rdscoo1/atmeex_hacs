@@ -364,7 +364,7 @@ class AtmeexClimateEntity(AtmeexEntityMixin, CoordinatorEntity, ClimateEntity):
                         speed = pending.value
                         if isinstance(speed, (int, float)):
                             speed = int(speed)
-                        return FAN_MODES[speed - 1] if speed in range(1, 8) else None
+                        return str(speed) if speed in range(1, 8) else None
                     else:
                         # Device confirmed our value, clear pending
                         self._runtime.clear_pending(self._device_id, "fan_speed")
@@ -374,7 +374,7 @@ class AtmeexClimateEntity(AtmeexEntityMixin, CoordinatorEntity, ClimateEntity):
         
         if isinstance(confirmed_speed, (int, float)):
             confirmed_speed = int(confirmed_speed)
-        return FAN_MODES[confirmed_speed - 1] if confirmed_speed in range(1, 8) else None
+        return str(confirmed_speed) if confirmed_speed in range(1, 8) else None
 
     async def async_set_fan_mode(self, fan_mode: str) -> None:
         """Установить скорость вентилятора по выбранному режиму.
