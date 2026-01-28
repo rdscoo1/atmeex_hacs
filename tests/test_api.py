@@ -171,16 +171,20 @@ async def test_get_device_error_raises():
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "method_name, body",
+    "method_name, ha_value, expected_body",
     [
-        ("set_power", {"u_pwr_on": True}),
-        ("set_target_temperature", {"u_temp_room": 215}),
-        ("set_fan_speed", {"u_fan_speed": 3}),
-        ("set_brizer_mode", {"u_damp_pos": 2}),
-        ("set_humid_stage", {"u_hum_stg": 1}),
+        ("set_power", True, {"u_pwr_on": True}),
+        ("set_target_temperature", 21.5, {"u_temp_room": 215}),
+        ("set_fan_speed", 3, {"u_fan_speed": 2}),  # HA speed 3 → API speed 2
+        ("set_brizer_mode", 2, {"u_damp_pos": 2}),
+        ("set_humid_stage", 1, {"u_hum_stg": 1}),
     ],
 )
-async def test_setters_success(method_name, body):
+async def test_setters_success(method_name, ha_value, expected_body):
+    """Test that setters convert HA values to API values correctly.
+    
+    For fan_speed: HA uses 1-7, API uses 0-6, so HA speed 3 → API speed 2.
+    """
     session = FakeSession()
     session.queue_response(FakeResponse(200))
 
@@ -188,18 +192,12 @@ async def test_setters_success(method_name, body):
     api._token = "t"
 
     method = getattr(api, method_name)
-    if method_name == "set_target_temperature":
-        await method(1, 21.5)
-    elif method_name == "set_power":
-        await method(1, True)
-    else:
-        # для остальных уже int
-        await method(1, list(body.values())[0])
+    await method(1, ha_value)
 
     req = session.requests[0]
     assert req[0] == "PUT"
     assert req[1].startswith(f"{API_BASE_URL}/devices/1/params")
-    assert req[2] == body
+    assert req[2] == expected_body
 
 
 @pytest.mark.asyncio

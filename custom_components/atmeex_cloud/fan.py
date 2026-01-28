@@ -25,7 +25,8 @@ from .const import DOMAIN
 _LOGGER = logging.getLogger(__name__)
 
 # Tolerance for pending command expiration (seconds)
-PENDING_COMMAND_TTL = 5.0
+# Increased to 8s because API condition updates are slow
+PENDING_COMMAND_TTL = 8.0
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_entities):
     """Set up Atmeex fan entities from a config entry."""
@@ -116,7 +117,34 @@ class AtmeexFanEntity(AtmeexEntityMixin, CoordinatorEntity, FanEntity):
 
     @property
     def is_on(self) -> bool:
-        return bool(self._device_state.get("pwr_on", False))
+        """Return True if the fan is on.
+        
+        Uses pending command value if a recent command was sent and not yet
+        confirmed by the device, to prevent UI regression.
+        """
+        confirmed_pwr = self._device_state.get("pwr_on", False)
+        
+        # Check if there's a pending pwr_on command that should take precedence
+        if self._runtime is not None:
+            pending = self._runtime.get_pending(self._device_id, "pwr_on")
+            if pending is not None:
+                age = time.monotonic() - pending.timestamp
+                if age <= PENDING_COMMAND_TTL:
+                    # Use pending value if not expired and not yet confirmed
+                    if pending.value != confirmed_pwr:
+                        _LOGGER.debug(
+                            "Fan: Using pending pwr_on=%s instead of confirmed=%s (age=%.1fs)",
+                            pending.value, confirmed_pwr, age
+                        )
+                        return bool(pending.value)
+                    else:
+                        # Device confirmed our value, clear pending
+                        self._runtime.clear_pending(self._device_id, "pwr_on")
+                else:
+                    # Pending expired, clear it
+                    self._runtime.clear_pending(self._device_id, "pwr_on")
+        
+        return bool(confirmed_pwr)
 
     @property
     def percentage(self) -> int | None:
@@ -200,9 +228,15 @@ class AtmeexFanEntity(AtmeexEntityMixin, CoordinatorEntity, FanEntity):
         if percentage is None:
             percentage = self.percentage or 100
         speed = self._percentage_to_speed(percentage)
+        # Set pending pwr_on=True for immediate UI feedback
+        if self._runtime is not None:
+            self._runtime.set_pending(self._device_id, "pwr_on", True)
         await self._set_fan_speed_with_lock(speed)
 
     async def async_turn_off(self, **kwargs) -> None:
+        # Set pending pwr_on=False for immediate UI feedback
+        if self._runtime is not None:
+            self._runtime.set_pending(self._device_id, "pwr_on", False)
         await self._set_fan_speed_with_lock(0)
 
     async def async_set_percentage(self, percentage: int) -> None:

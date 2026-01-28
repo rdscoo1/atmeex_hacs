@@ -5,6 +5,9 @@ from typing import Any
 
 FAN_MIN = 1
 FAN_MAX = 7
+# API uses 0-6 range, so we need to convert 1-7 to 0-6
+API_FAN_MIN = 0
+API_FAN_MAX = 6
 
 
 def clamp(value: float | int, min_value: float, max_value: float) -> float:
@@ -12,7 +15,11 @@ def clamp(value: float | int, min_value: float, max_value: float) -> float:
 
 
 def fan_speed_to_percent(speed: int | float | None) -> int:
-    """1..7 → 14..100, 0/None → 0."""
+    """Convert fan speed (1-7) to percentage (14-100).
+    
+    Speed 0 or None → 0%
+    Speed 1-7 → 14-100%
+    """
     if not isinstance(speed, (int, float)):
         return 0
     s = int(clamp(speed, 0, FAN_MAX))
@@ -22,7 +29,11 @@ def fan_speed_to_percent(speed: int | float | None) -> int:
 
 
 def percent_to_fan_speed(percent: int | float) -> int:
-    """0..100 → 0..7, с округлением."""
+    """Convert percentage (0-100) to fan speed (0-7).
+    
+    0% → 0
+    1-100% → 1-7
+    """
     try:
         p = int(clamp(percent, 0, 100))
     except (TypeError, ValueError):
@@ -31,6 +42,43 @@ def percent_to_fan_speed(percent: int | float) -> int:
         return 0
     s = int(round(p * FAN_MAX / 100))
     return max(FAN_MIN, min(FAN_MAX, s))
+
+
+def fan_speed_to_api(speed: int) -> int:
+    """Convert HA fan speed (1-7) to API fan speed (0-6).
+    
+    HA uses 1-7, API uses 0-6.
+    Speed 0 stays 0 (off).
+    Speed 1-7 → 0-6
+    """
+    if speed <= 0:
+        return 0
+    # Convert 1-7 to 0-6
+    return max(API_FAN_MIN, min(API_FAN_MAX, speed - 1))
+
+
+def api_to_fan_speed(api_speed: int | float | str | None) -> int:
+    """Convert API fan speed (0-6) to HA fan speed (1-7).
+    
+    API uses 0-6, HA uses 1-7.
+    Speed 0 stays 0 (off).
+    Speed 0-6 → 1-7
+    
+    API may return string values, so we handle that.
+    """
+    if api_speed is None:
+        return 0
+    
+    try:
+        s = int(api_speed)
+    except (TypeError, ValueError):
+        return 0
+    
+    if s <= 0:
+        return 0
+    
+    # Convert 0-6 to 1-7
+    return min(FAN_MAX, s + 1)
 
 
 def deci_to_c(value: int | float | None) -> float | None:

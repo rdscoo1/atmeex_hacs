@@ -34,8 +34,17 @@ async def async_setup_entry(
     entities: list[BinarySensorEntity] = []
 
     for dev in device_map.values():
+        # Online status sensor
         entities.append(
             AtmeexOnlineSensor(
+                coordinator=coordinator,
+                device=dev,
+                entry_id=entry.entry_id,
+            )
+        )
+        # No water sensor (for humidifier)
+        entities.append(
+            AtmeexNoWaterSensor(
                 coordinator=coordinator,
                 device=dev,
                 entry_id=entry.entry_id,
@@ -70,3 +79,29 @@ class AtmeexOnlineSensor(AtmeexEntityMixin, CoordinatorEntity, BinarySensorEntit
     def is_on(self) -> bool:
         """Return True if the device is online."""
         return bool(self._device_state.get("online", False))
+
+
+class AtmeexNoWaterSensor(AtmeexEntityMixin, CoordinatorEntity, BinarySensorEntity):
+    """Binary sensor indicating no water in humidifier."""
+
+    _attr_device_class = BinarySensorDeviceClass.PROBLEM
+    _attr_has_entity_name = True
+    _attr_translation_key = "no_water"
+
+    def __init__(
+        self,
+        coordinator,
+        device: AtmeexDevice,
+        entry_id: str,
+    ) -> None:
+        """Initialize the no water sensor."""
+        super().__init__(coordinator)
+        self._device_meta = device
+        self._device_id = device.id
+        self._entry_id = entry_id
+        self._attr_unique_id = f"{device.id}_no_water"
+
+    @property
+    def is_on(self) -> bool:
+        """Return True if there is no water (problem state)."""
+        return bool(self._device_state.get("no_water", False))

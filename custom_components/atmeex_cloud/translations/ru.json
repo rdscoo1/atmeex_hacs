@@ -34,7 +34,12 @@
         "title": "Настройки Atmeex Cloud",
         "description": "Настройте параметры интеграции.",
         "data": {
-          "update_interval": "Интервал обновления (секунды)"
+          "update_interval": "Интервал обновления (секунды)",
+          "enable_websocket": "Включить WebSocket (обновления в реальном времени)"
+        },
+        "data_description": {
+          "update_interval": "Как часто опрашивать API (10-300 секунд). Меньше значение = чаще обновления, но больше запросов к API.",
+          "enable_websocket": "Использовать WebSocket для мгновенных обновлений. Отключите для использования только HTTP опроса (надежнее, но медленнее)."
         }
       }
     }
@@ -96,11 +101,23 @@
     "binary_sensor": {
       "online": {
         "name": "В сети"
+      },
+      "no_water": {
+        "name": "Нет воды"
       }
     },
     "sensor": {
       "diagnostics": {
         "name": "Диагностика"
+      },
+      "co2": {
+        "name": "CO2"
+      },
+      "inlet_temperature": {
+        "name": "Температура входящего воздуха"
+      },
+      "humidity": {
+        "name": "Влажность"
       }
     }
   },

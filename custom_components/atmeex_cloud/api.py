@@ -36,7 +36,15 @@ class AtmeexDevice:
         did = int(raw["id"])
         name = str(raw.get("name") or f"Device {did}")
         model = str(raw.get("model") or "unknown")
-        online = bool(raw.get("online", True))
+        # Don't default to True - if API doesn't provide online status, check condition
+        online_raw = raw.get("online")
+        if online_raw is not None:
+            online = bool(online_raw)
+        else:
+            # Check if device has fresh condition data
+            cond = raw.get("condition") or {}
+            online = bool(cond and cond.get("time"))
+        
         return cls(
             id=did,
             name=name,
@@ -397,8 +405,22 @@ class AtmeexApi:
         await self._put_params(device_id, body, "set_target_temperature")
 
     async def set_fan_speed(self, device_id: int | str, speed: int) -> None:
-        """Установить дискретную скорость вентилятора 0..7."""
-        body = {"u_fan_speed": int(speed)}
+        """Установить дискретную скорость вентилятора 1..7 (конвертируется в API 0..6).
+        
+        HA uses speed 1-7, but API expects 0-6.
+        Speed 0 = off, Speed 1-7 → API 0-6
+        """
+        from .helpers import fan_speed_to_api
+        
+        speed_int = int(speed)
+        api_speed = fan_speed_to_api(speed_int)
+        
+        _LOGGER.debug(
+            "API set_fan_speed: device=%s HA_speed=%s → API_speed=%s",
+            device_id, speed_int, api_speed
+        )
+        
+        body = {"u_fan_speed": api_speed}
         await self._put_params(device_id, body, "set_fan_speed")
 
     async def set_brizer_mode(self, device_id: int | str, damp_pos: int) -> None:

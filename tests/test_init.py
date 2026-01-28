@@ -27,10 +27,14 @@ def test_to_bool(value, expected):
 
 
 def test_normalize_device_state_basic():
+    """Test normalization converts API fan_speed (0-6) to HA fan_speed (1-7).
+    
+    API returns fan_speed=3, which should be converted to HA fan_speed=4.
+    """
     item = {
         "condition": {
             "pwr_on": 1,
-            "fan_speed": "3",
+            "fan_speed": "3",  # API speed 3 → HA speed 4
             "damp_pos": "2",
             "hum_stg": "1",
             "u_temp_room": "215",
@@ -41,7 +45,7 @@ def test_normalize_device_state_basic():
     }
     out = atmeex_init._normalize_device_state(item)
     assert out["pwr_on"] is True
-    assert out["fan_speed"] == 3
+    assert out["fan_speed"] == 4  # API 3 → HA 4
     assert out["damp_pos"] == 2
     assert out["hum_stg"] == 1
     assert out["u_temp_room"] == 215
@@ -51,14 +55,20 @@ def test_normalize_device_state_basic():
 
 
 def test_normalize_device_state_uses_settings_and_fan_fallback():
+    """Test fallback to settings.u_fan_speed when condition.fan_speed is 0.
+    
+    API settings.u_fan_speed=4 → HA fan_speed=5.
+    Device is online if condition has time field.
+    """
     item = {
         "condition": {
             "pwr_on": None,
             "fan_speed": 0,
+            "time": "2026-01-27 21:24:15",  # Fresh condition data = online
         },
         "settings": {
             "u_pwr_on": "1",
-            "u_fan_speed": 4.2,
+            "u_fan_speed": 4.2,  # API speed 4 → HA speed 5
             "u_damp_pos": "1",
             "u_temp_room": 205.6,
             "u_hum_stg": "2",
@@ -66,11 +76,11 @@ def test_normalize_device_state_uses_settings_and_fan_fallback():
     }
     out = atmeex_init._normalize_device_state(item)
     assert out["pwr_on"] is True
-    assert out["fan_speed"] == 4
+    assert out["fan_speed"] == 5  # API 4 → HA 5
     assert out["damp_pos"] == 1
     assert out["u_temp_room"] == 205
     assert out["hum_stg"] == 2
-    assert out["online"] is True
+    assert out["online"] is True  # Has condition.time = online
 
 
 @pytest.mark.asyncio
@@ -157,7 +167,7 @@ async def test_async_setup_entry_happy_path(monkeypatch):
     assert runtime.api is created_apis[0]
     assert runtime.coordinator.data["devices"][0]["id"] == 1
     assert runtime.coordinator.data["states"]["1"]["pwr_on"] is True
-    assert runtime.coordinator.data["states"]["1"]["fan_speed"] == 3
+    assert runtime.coordinator.data["states"]["1"]["fan_speed"] == 4  # API 3 → HA 4
 
 
 @pytest.mark.asyncio
@@ -168,7 +178,10 @@ async def test_async_unload_entry_clears_data(monkeypatch):
             async_unload_platforms=AsyncMock(return_value=True),
         ),
     )
-    entry = SimpleNamespace(entry_id="entry1")
+    entry = SimpleNamespace(
+        entry_id="entry1",
+        runtime_data=SimpleNamespace(websocket_manager=None)
+    )
 
     result = await atmeex_init.async_unload_entry(hass, entry)
     assert result is True

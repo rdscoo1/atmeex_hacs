@@ -76,7 +76,7 @@ class _BaseSelect(AtmeexEntityMixin, CoordinatorEntity, SelectEntity):
     @property
     def available(self) -> bool:
         st = self._device_state
-        return bool(st.get("online", getattr(self._device_meta, "online", True)))
+        return bool(st.get("online", getattr(self._device_meta, "online", False)))
 
 
 class AtmeexHumidificationSelect(_BaseSelect):

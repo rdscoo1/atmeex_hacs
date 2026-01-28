@@ -26,7 +26,9 @@ from .const import (
     DOMAIN,
     PLATFORMS,
     CONF_UPDATE_INTERVAL,
+    CONF_ENABLE_WEBSOCKET,
     DEFAULT_UPDATE_INTERVAL,
+    DEFAULT_ENABLE_WEBSOCKET,
     BRIZER_MODES,
 )
 from .config_flow import AtmeexOptionsFlowHandler
@@ -68,6 +70,8 @@ class AtmeexRuntimeData:
     device_locks: dict[str, asyncio.Lock] = field(default_factory=dict)
     # Per-device pending commands: device_id -> {attribute -> PendingCommand}
     pending_commands: dict[str, dict[str, PendingCommand]] = field(default_factory=dict)
+    # WebSocket manager for real-time updates (optional, can be None for HTTP-only mode)
+    websocket_manager: Any = None  # WebSocketManager | None
 
     def get_device_lock(self, device_id: int | str) -> asyncio.Lock:
         """Get or create a lock for the given device."""
@@ -160,19 +164,45 @@ def _normalize_device_state(item: dict[str, Any]) -> dict[str, Any]:
 
     # Питание
     pwr_cond = cond.get("pwr_on")
-    pwr = to_bool(pwr_cond) if pwr_cond is not None else to_bool(
-        st.get("u_pwr_on"))
+    pwr_settings = st.get("u_pwr_on")
+    
+    # Prefer condition.pwr_on if available, fallback to settings.u_pwr_on
+    if pwr_cond is not None:
+        pwr = to_bool(pwr_cond)
+    elif pwr_settings is not None:
+        pwr = to_bool(pwr_settings)
+    else:
+        pwr = False  # Default to off if no data available
+    
+    _LOGGER.debug(
+        "Normalize pwr_on: condition=%s, settings=%s, result=%s",
+        pwr_cond, pwr_settings, pwr
+    )
 
     # Скорость вентилятора
-    fan = cond.get("fan_speed")
-    u_fan = st.get("u_fan_speed")
+    # API uses 0-6, we need to convert to HA 1-7
+    from .helpers import api_to_fan_speed
+    
+    fan_raw = cond.get("fan_speed")
+    u_fan_raw = st.get("u_fan_speed")
+    
+    _LOGGER.debug(
+        "Normalize fan_speed: condition.fan_speed=%s, settings.u_fan_speed=%s, pwr=%s",
+        fan_raw, u_fan_raw, pwr
+    )
+    
+    # Convert API speed (0-6) to HA speed (1-7)
+    fan = api_to_fan_speed(fan_raw) if fan_raw is not None else None
+    u_fan = api_to_fan_speed(u_fan_raw) if u_fan_raw is not None else None
+    
+    # Prefer settings.u_fan_speed if condition is stale or zero
     if (
-        (fan is None or int(fan) == 0)
+        (fan is None or fan == 0)
         and pwr
-        and isinstance(u_fan, (int, float))
-        and int(u_fan) > 0
+        and isinstance(u_fan, int)
+        and u_fan > 0
     ):
-        fan = int(u_fan)
+        fan = u_fan
 
     # Заслонка
     damp = cond.get("damp_pos")
@@ -225,8 +255,17 @@ def _normalize_device_state(item: dict[str, Any]) -> dict[str, Any]:
     if isinstance(temp_room, (int, float)):
         out["temp_room"] = int(temp_room)
 
-    # meta
-    out["online"] = bool(item.get("online", True))
+    # meta - если API не вернул online, считаем что устройство оффлайн
+    # это важно для корректного отображения состояния при физическом включении
+    online = item.get("online")
+    if online is not None:
+        out["online"] = bool(online)
+    else:
+        # Если поле отсутствует, проверяем наличие свежих данных condition
+        # Если condition есть и свежий - устройство онлайн
+        has_condition = bool(cond and cond.get("time"))
+        out["online"] = has_condition
+    
     return out
 
 
@@ -494,10 +533,83 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             }
         )
 
+    # Initialize WebSocket manager if enabled
+    websocket_manager = None
+    enable_websocket = options.get(CONF_ENABLE_WEBSOCKET, DEFAULT_ENABLE_WEBSOCKET)
+    
+    if enable_websocket:
+        try:
+            from .websocket import WebSocketManager
+            
+            def on_websocket_message(message: dict[str, Any]) -> None:
+                """Handle WebSocket message and update coordinator.
+                
+                Message format from Atmeex WebSocket:
+                {
+                    "type": "condition",
+                    "data": [
+                        {
+                            "id": 13555,
+                            "condition": {...},
+                            "mac": "..."
+                        },
+                        ...
+                    ]
+                }
+                """
+                try:
+                    msg_type = message.get("type")
+                    
+                    if msg_type == "condition":
+                        # Device state update
+                        data = message.get("data", [])
+                        if isinstance(data, list):
+                            for device_data in data:
+                                device_id = device_data.get("id")
+                                if device_id:
+                                    _LOGGER.debug("WebSocket update for device %s", device_id)
+                                    # Trigger device refresh asynchronously
+                                    hass.async_create_task(refresh_device(device_id))
+                        else:
+                            _LOGGER.warning("WebSocket message has unexpected data format: %s", data)
+                    else:
+                        _LOGGER.debug("WebSocket message type '%s' ignored", msg_type)
+                        
+                except Exception as err:
+                    _LOGGER.error("Error processing WebSocket message: %s", err)
+            
+            websocket_manager = WebSocketManager(
+                session=session,
+                token=api._token,
+                on_message=on_websocket_message,
+            )
+            
+            # Try to connect WebSocket (non-blocking)
+            async def _start_websocket():
+                try:
+                    success = await websocket_manager.connect()
+                    if success:
+                        _LOGGER.info("WebSocket connected for real-time updates")
+                    else:
+                        _LOGGER.warning("WebSocket connection failed, using HTTP polling only")
+                except Exception as err:
+                    _LOGGER.warning("Failed to start WebSocket: %s. Using HTTP polling only.", err)
+            
+            # Start WebSocket in background
+            hass.async_create_task(_start_websocket())
+            
+        except ImportError:
+            _LOGGER.warning("WebSocket module not available, using HTTP polling only")
+        except Exception as err:
+            _LOGGER.warning("Failed to initialize WebSocket: %s. Using HTTP polling only.", err)
+    else:
+        _LOGGER.info("WebSocket disabled in options, using HTTP polling only")
+    
     runtime_data = AtmeexRuntimeData(
         api=api,
         coordinator=coordinator,
         refresh_device=refresh_device,
+        websocket_manager=websocket_manager,
     )
     entry.runtime_data = runtime_data
 
@@ -507,6 +619,15 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Unload Atmeex Cloud config entry."""
+    # Disconnect WebSocket if active
+    runtime: AtmeexRuntimeData = entry.runtime_data
+    if runtime and runtime.websocket_manager:
+        try:
+            await runtime.websocket_manager.disconnect()
+            _LOGGER.info("WebSocket disconnected during unload")
+        except Exception as err:
+            _LOGGER.warning("Error disconnecting WebSocket: %s", err)
+    
     unload_ok = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
     return unload_ok
 

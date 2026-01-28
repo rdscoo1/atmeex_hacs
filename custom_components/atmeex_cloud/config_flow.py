@@ -14,7 +14,9 @@ from .api import AtmeexApi, ApiError
 from .const import (
     DOMAIN,
     CONF_UPDATE_INTERVAL,
+    CONF_ENABLE_WEBSOCKET,
     DEFAULT_UPDATE_INTERVAL,
+    DEFAULT_ENABLE_WEBSOCKET,
     MIN_UPDATE_INTERVAL,
     MAX_UPDATE_INTERVAL,
 )
@@ -174,21 +176,27 @@ class AtmeexOptionsFlowHandler(config_entries.OptionsFlow):
         if user_input is not None:
             interval = int(user_input[CONF_UPDATE_INTERVAL])
             interval = max(MIN_UPDATE_INTERVAL, min(MAX_UPDATE_INTERVAL, interval))
+            enable_ws = user_input.get(CONF_ENABLE_WEBSOCKET, DEFAULT_ENABLE_WEBSOCKET)
+            
             return self.async_create_entry(
                 title="",
-                data={CONF_UPDATE_INTERVAL: interval},
+                data={
+                    CONF_UPDATE_INTERVAL: interval,
+                    CONF_ENABLE_WEBSOCKET: enable_ws,
+                },
             )
 
-        current = (getattr(self._config_entry, "options", {}) or {}).get(
-            CONF_UPDATE_INTERVAL, DEFAULT_UPDATE_INTERVAL
-        )
+        options = getattr(self._config_entry, "options", {}) or {}
+        current_interval = options.get(CONF_UPDATE_INTERVAL, DEFAULT_UPDATE_INTERVAL)
+        current_ws = options.get(CONF_ENABLE_WEBSOCKET, DEFAULT_ENABLE_WEBSOCKET)
 
         schema = vol.Schema(
             {
-                vol.Optional(CONF_UPDATE_INTERVAL, default=current): vol.All(
+                vol.Optional(CONF_UPDATE_INTERVAL, default=current_interval): vol.All(
                     vol.Coerce(int),
                     vol.Clamp(min=MIN_UPDATE_INTERVAL, max=MAX_UPDATE_INTERVAL),
-                )
+                ),
+                vol.Optional(CONF_ENABLE_WEBSOCKET, default=current_ws): bool,
             }
         )
         return self.async_show_form(step_id="init", data_schema=schema)

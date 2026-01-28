@@ -34,7 +34,12 @@
         "title": "Atmeex Cloud Options",
         "description": "Configure integration settings.",
         "data": {
-          "update_interval": "Update interval (seconds)"
+          "update_interval": "Update interval (seconds)",
+          "enable_websocket": "Enable WebSocket (real-time updates)"
+        },
+        "data_description": {
+          "update_interval": "How often to poll the API (10-300 seconds). Lower values = more frequent updates but more API calls.",
+          "enable_websocket": "Use WebSocket for instant updates. Disable to use HTTP polling only (more reliable but slower)."
         }
       }
     }
@@ -96,11 +101,23 @@
     "binary_sensor": {
       "online": {
         "name": "Online"
+      },
+      "no_water": {
+        "name": "No water"
       }
     },
     "sensor": {
       "diagnostics": {
         "name": "Diagnostics"
+      },
+      "co2": {
+        "name": "CO2"
+      },
+      "inlet_temperature": {
+        "name": "Inlet temperature"
+      },
+      "humidity": {
+        "name": "Humidity"
       }
     }
   },

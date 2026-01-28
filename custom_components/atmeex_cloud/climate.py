@@ -34,7 +34,8 @@ from . import AtmeexRuntimeData
 _LOGGER = logging.getLogger(__name__)
 
 # Tolerance for pending command expiration (seconds)
-PENDING_COMMAND_TTL = 5.0
+# Increased to 8s because API condition updates are slow
+PENDING_COMMAND_TTL = 8.0
 
 # Доступные скорости вентилятора (строки — так их удобнее показывать в UI)
 FAN_MODES = ["1", "2", "3", "4", "5", "6", "7"]
@@ -158,7 +159,7 @@ class AtmeexClimateEntity(AtmeexEntityMixin, CoordinatorEntity, ClimateEntity):
     @property
     def available(self) -> bool:
         """Считать сущность доступной, если устройство online."""
-        return bool(self._device_state.get("online", True))
+        return bool(self._device_state.get("online", False))
 
     # ---------- поддерживаемые возможности ----------
 
@@ -178,17 +179,77 @@ class AtmeexClimateEntity(AtmeexEntityMixin, CoordinatorEntity, ClimateEntity):
 
     @property
     def hvac_mode(self) -> HVACMode:
-        """Возвращает текущий режим: FAN_ONLY или OFF."""
-        return HVACMode.FAN_ONLY if bool(self._device_state.get("pwr_on")) else HVACMode.OFF
+        """Возвращает текущий режим: FAN_ONLY или OFF.
+        
+        Uses pending command value if a recent command was sent and not yet
+        confirmed by the device, to prevent UI regression.
+        """
+        confirmed_pwr = self._device_state.get("pwr_on")
+        
+        # Check if there's a pending pwr_on command that should take precedence
+        if self._runtime is not None:
+            pending = self._runtime.get_pending(self._device_id, "pwr_on")
+            if pending is not None:
+                age = time.monotonic() - pending.timestamp
+                if age <= PENDING_COMMAND_TTL:
+                    # Use pending value if not expired and not yet confirmed
+                    if pending.value != confirmed_pwr:
+                        _LOGGER.debug(
+                            "Climate: Using pending pwr_on=%s instead of confirmed=%s (age=%.1fs)",
+                            pending.value, confirmed_pwr, age
+                        )
+                        return HVACMode.FAN_ONLY if pending.value else HVACMode.OFF
+                    else:
+                        # Device confirmed our value, clear pending
+                        self._runtime.clear_pending(self._device_id, "pwr_on")
+                else:
+                    # Pending expired, clear it
+                    self._runtime.clear_pending(self._device_id, "pwr_on")
+        
+        return HVACMode.FAN_ONLY if bool(confirmed_pwr) else HVACMode.OFF
 
     async def async_set_hvac_mode(self, hvac_mode: HVACMode) -> None:
-        """Включить/выключить устройство по смене режима HVAC."""
-        try:
-            await self.api.set_power(self._device_id, hvac_mode != HVACMode.OFF)
-        except ApiError as err:
-            _LOGGER.error("Failed to set HVAC mode for %s: %s", self._device_id, err)
-            raise HomeAssistantError("Failed to set HVAC mode") from err
-        await self._refresh()
+        """Включить/выключить устройство по смене режима HVAC.
+        
+        Uses device lock to serialize operations and tracks pending command
+        to prevent stale responses from overwriting newer state.
+        """
+        power_on = hvac_mode != HVACMode.OFF
+        
+        # Record pending command BEFORE acquiring lock
+        if self._runtime is not None:
+            self._runtime.set_pending(self._device_id, "pwr_on", power_on)
+        
+        _LOGGER.debug(
+            "Climate: Setting power: device=%s power_on=%s",
+            self._device_id, power_on
+        )
+        
+        # Use device lock to serialize set+refresh operations
+        lock = self._runtime.get_device_lock(self._device_id) if self._runtime else None
+        
+        async def _do_set_and_refresh():
+            try:
+                await self.api.set_power(self._device_id, power_on)
+            except ApiError as err:
+                _LOGGER.error("Failed to set HVAC mode for %s: %s", self._device_id, err)
+                # Clear pending on error
+                if self._runtime is not None:
+                    self._runtime.clear_pending(self._device_id, "pwr_on")
+                raise HomeAssistantError("Failed to set HVAC mode") from err
+            
+            await self._refresh()
+            
+            _LOGGER.debug(
+                "Climate: Power set complete: device=%s power_on=%s",
+                self._device_id, power_on
+            )
+        
+        if lock is not None:
+            async with lock:
+                await _do_set_and_refresh()
+        else:
+            await _do_set_and_refresh()
 
     # ---------- температура ----------
 
