@@ -16,7 +16,7 @@ Atmeex Cloud is a custom integration for [Home Assistant](https://www.home-assis
 - **Auto-discovery** of all devices linked to your Atmeex Cloud account
 - **Power on/off** control
 - **Fan speed** control (7 discrete levels, 1–7)
-- **Operation modes**: supply ventilation, recirculation, mixed mode, supply valve
+- **Operation modes**: `supply_ventilation`, `recirculation`, `mixed_mode`, `supply_valve`
 - **Target temperature** control (10–30°C)
 - **Humidifier** control (if supported by device) with 4 stages
 
@@ -78,6 +78,19 @@ Each device creates the following entities:
 | `binary_sensor` | `binary_sensor.bedroom_breezer_online` | Device connectivity status |
 | `sensor` | `sensor.atmeex_diagnostics` | API statistics and health |
 
+## Breezer Modes
+
+The breezer operation mode controls the damper position:
+
+| Mode Key | Display Name | Description |
+|----------|--------------|-------------|
+| `supply_ventilation` | Supply ventilation | Fresh air intake (damper fully open) |
+| `recirculation` | Recirculation | Room air recirculation (damper closed) |
+| `mixed_mode` | Mixed mode | Partial fresh air + recirculation |
+| `supply_valve` | Supply valve | Supply valve mode |
+
+**Important:** In automations, use the **mode key** (e.g., `supply_ventilation`), not the display name.
+
 ## Humidifier Control
 
 If your device supports a humidifier, use the humidity slider or select entity:
@@ -133,7 +146,7 @@ automation:
         target:
           entity_id: select.bedroom_breezer_breezer_mode
         data:
-          option: "рециркуляция"
+          option: "recirculation"
 
   - alias: "Ventilation: Morning Mode"
     description: "Increase ventilation in the morning"
@@ -150,7 +163,7 @@ automation:
         target:
           entity_id: select.bedroom_breezer_breezer_mode
         data:
-          option: "приточная вентиляция"
+          option: "supply_ventilation"
 ```
 
 ### 3. Temperature-Based Control
@@ -178,7 +191,7 @@ automation:
         target:
           entity_id: select.bedroom_breezer_breezer_mode
         data:
-          option: "приточная вентиляция"
+          option: "supply_ventilation"
 ```
 
 ### 4. Humidity Control
