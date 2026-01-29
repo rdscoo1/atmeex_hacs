@@ -88,7 +88,7 @@ Atmeex Cloud — это пользовательская интеграция д
 | `climate` | `climate.bedroom_breezer` | Основное управление: питание, температура, скорость вентилятора, режимы |
 | `fan` | `fan.bedroom_breezer_fan` | Скорость вентилятора в процентах (0–100%) |
 | `select` | `select.bedroom_breezer_humidification` | Выбор ступени увлажнителя |
-| `select` | `select.bedroom_breezer_breezer_mode` | Выбор режима работы |
+| `select` | `select.bedroom_breezer_mode` | Выбор режима работы |
 | `switch` | `switch.bedroom_breezer_auto_nanny` | Переключатель режима AutoNanny |
 | `switch` | `switch.bedroom_breezer_sleep_mode` | Переключатель ночного режима |
 | `binary_sensor` | `binary_sensor.bedroom_breezer_online` | Статус подключения устройства |
@@ -205,7 +205,7 @@ automation:
           fan_mode: "4"
       - service: select.select_option
         target:
-          entity_id: select.bedroom_breezer_breezer_mode
+          entity_id: select.bedroom_breezer_mode
         data:
           option: "supply_ventilation"
 ```
@@ -228,7 +228,7 @@ automation:
           fan_mode: "6"
       - service: select.select_option
         target:
-          entity_id: select.bedroom_breezer_breezer_mode
+          entity_id: select.bedroom_breezer_mode
         data:
           option: "supply_ventilation"
 ```

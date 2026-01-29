@@ -78,7 +78,7 @@ Each device creates the following entities:
 | `climate` | `climate.bedroom_breezer` | Main control: power, temperature, fan speed, modes |
 | `fan` | `fan.bedroom_breezer_fan` | Fan speed as percentage (0–100%) |
 | `select` | `select.bedroom_breezer_humidification` | Humidifier stage selector |
-| `select` | `select.bedroom_breezer_breezer_mode` | Operation mode selector |
+| `select` | `select.bedroom_breezer_mode` | Operation mode selector |
 | `switch` | `switch.bedroom_breezer_auto_nanny` | AutoNanny mode toggle |
 | `switch` | `switch.bedroom_breezer_sleep_mode` | Sleep mode toggle |
 | `binary_sensor` | `binary_sensor.bedroom_breezer_online` | Device connectivity status |
@@ -179,7 +179,7 @@ automation:
           fan_mode: "2"
       - service: select.select_option
         target:
-          entity_id: select.bedroom_breezer_breezer_mode
+          entity_id: select.bedroom_breezer_mode
         data:
           option: "recirculation"
 
@@ -196,7 +196,7 @@ automation:
           fan_mode: "4"
       - service: select.select_option
         target:
-          entity_id: select.bedroom_breezer_breezer_mode
+          entity_id: select.bedroom_breezer_mode
         data:
           option: "supply_ventilation"
 ```
@@ -224,7 +224,7 @@ automation:
           fan_mode: "6"
       - service: select.select_option
         target:
-          entity_id: select.bedroom_breezer_breezer_mode
+          entity_id: select.bedroom_breezer_mode
         data:
           option: "supply_ventilation"
 ```

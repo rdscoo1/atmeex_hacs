@@ -10,7 +10,7 @@ from custom_components.atmeex_cloud.climate import (
     AtmeexClimateEntity,
     quantize_humidity,
     HUM_ALLOWED,
-    BRIZER_SWING_MODES,
+    BREEZER_SWING_MODES,
 )
 from custom_components.atmeex_cloud.const import DOMAIN
 from custom_components.atmeex_cloud.api import AtmeexDevice
@@ -55,7 +55,7 @@ def _make_entity(overrides: dict[str, Any] | None = None):
         set_target_temperature=AsyncMock(),
         set_humid_stage=AsyncMock(),
         set_fan_speed=AsyncMock(),
-        set_brizer_mode=AsyncMock(),
+        set_breezer_mode=AsyncMock(),
     )
 
     # Минимальный raw для устройства
@@ -104,7 +104,7 @@ def test_climate_basic_properties():
     assert ent.target_humidity == HUM_ALLOWED[1]  # 33
 
     assert ent.fan_mode == "3"
-    assert ent.swing_mode == BRIZER_SWING_MODES[2]
+    assert ent.swing_mode == BREEZER_SWING_MODES[2]
 
     attrs = ent.extra_state_attributes
     assert attrs["room_temp_c"] == pytest.approx(21.5)
@@ -236,14 +236,14 @@ async def test_async_set_swing_mode_valid_and_invalid():
     ent, cond, api = _make_entity()
     ent._refresh = AsyncMock()
 
-    mode = BRIZER_SWING_MODES[1]
+    mode = BREEZER_SWING_MODES[1]
     await ent.async_set_swing_mode(mode)
-    api.set_brizer_mode.assert_awaited_once_with(1, 1)
+    api.set_breezer_mode.assert_awaited_once_with(1, 1)
     ent._refresh.assert_awaited_once()
 
-    api.set_brizer_mode.reset_mock()
+    api.set_breezer_mode.reset_mock()
     ent._refresh.reset_mock()
 
     await ent.async_set_swing_mode("неизвестный режим")
-    assert api.set_brizer_mode.await_count == 0
+    assert api.set_breezer_mode.await_count == 0
     ent._refresh.assert_not_awaited()

@@ -11,18 +11,17 @@ from homeassistant.helpers.update_coordinator import CoordinatorEntity
 from .api import AtmeexDevice
 from .entity_base import AtmeexEntityMixin
 
-from .const import DOMAIN, BRIZER_MODES, HUMIDIFICATION_OPTIONS
+from .const import DOMAIN, BREEZER_MODES, HUMIDIFICATION_OPTIONS
 from . import AtmeexRuntimeData
-from . import api
 
 _LOGGER = logging.getLogger(__name__)
 
 HUM_OPTIONS = HUMIDIFICATION_OPTIONS
-BRIZER_OPTIONS = BRIZER_MODES
+BREEZER_OPTIONS = BREEZER_MODES
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_entities):
-    """Set up Atmeex select entities (humidifier + brizer mode)."""
+    """Set up Atmeex select entities (humidifier + breezer mode)."""
     runtime: AtmeexRuntimeData = entry.runtime_data
     coordinator = runtime.coordinator
 
@@ -44,11 +43,11 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_e
             )
         )
         entities.append(
-            AtmeexBrizerSelect(
+            AtmeexBreezerSelect(
                 coordinator=coordinator,
-                api=api,
+                api=runtime.api,
                 device=dev,
-                name=f"{name} brizer mode",
+                name=f"{name} breezer mode",
                 refresh_device_cb=runtime.refresh_device,
             )
         )
@@ -112,8 +111,8 @@ class AtmeexHumidificationSelect(_BaseSelect):
         await self._refresh()
 
 
-class AtmeexBrizerSelect(_BaseSelect):
-    _attr_options = BRIZER_OPTIONS
+class AtmeexBreezerSelect(_BaseSelect):
+    _attr_options = BREEZER_OPTIONS
     _attr_translation_key = "breezer_mode"
 
     def __init__(
@@ -125,19 +124,19 @@ class AtmeexBrizerSelect(_BaseSelect):
         refresh_device_cb=None,
     ) -> None:
         super().__init__(coordinator, api, device, name, refresh_device_cb)
-        self._attr_unique_id = f"{device.id}_brizer_mode"
+        self._attr_unique_id = f"{device.id}_breezer_mode"
 
     @property
     def current_option(self) -> str | None:
         pos = self._device_state.get("damp_pos")
-        if isinstance(pos, int) and 0 <= pos < len(BRIZER_OPTIONS):
-            return BRIZER_OPTIONS[pos]
-        return getattr(self, "_attr_current_option", BRIZER_OPTIONS[0])
+        if isinstance(pos, int) and 0 <= pos < len(BREEZER_OPTIONS):
+            return BREEZER_OPTIONS[pos]
+        return getattr(self, "_attr_current_option", BREEZER_OPTIONS[0])
 
     async def async_select_option(self, option: str) -> None:
-        if option not in BRIZER_OPTIONS:
+        if option not in BREEZER_OPTIONS:
             return
-        pos = BRIZER_OPTIONS.index(option)
-        await self.api.set_brizer_mode(self._device_id, pos)
+        pos = BREEZER_OPTIONS.index(option)
+        await self.api.set_breezer_mode(self._device_id, pos)
         self._attr_current_option = option
         await self._refresh()

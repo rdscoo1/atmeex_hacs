@@ -29,7 +29,7 @@ from .const import (
     CONF_ENABLE_WEBSOCKET,
     DEFAULT_UPDATE_INTERVAL,
     DEFAULT_ENABLE_WEBSOCKET,
-    BRIZER_MODES,
+    BREEZER_MODES,
 )
 from .config_flow import AtmeexOptionsFlowHandler
 from .helpers import to_bool

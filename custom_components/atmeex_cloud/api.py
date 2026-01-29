@@ -426,7 +426,11 @@ class AtmeexApi:
     async def set_brizer_mode(self, device_id: int | str, damp_pos: int) -> None:
         """Установить режим бризера (положение заслонки) 0..3."""
         body = {"u_damp_pos": int(damp_pos)}
-        await self._put_params(device_id, body, "set_brizer_mode")
+        await self._put_params(device_id, body, "set_breezer_mode")
+
+    async def set_breezer_mode(self, device_id: int | str, damp_pos: int) -> None:
+        """Установить режим бризера (положение заслонки) 0..3. Alias for set_brizer_mode."""
+        await self.set_brizer_mode(device_id, damp_pos)
 
     async def set_humid_stage(self, device_id: int | str, stage: int) -> None:
         """Установить ступень работы увлажнителя 0..3."""

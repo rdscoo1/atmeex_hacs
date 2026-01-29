@@ -28,7 +28,7 @@ from homeassistant.helpers.update_coordinator import CoordinatorEntity
 from homeassistant.exceptions import HomeAssistantError
 from .api import ApiError, AtmeexDevice
 
-from .const import DOMAIN, BRIZER_MODES
+from .const import DOMAIN, BREEZER_MODES
 from . import AtmeexRuntimeData
 
 _LOGGER = logging.getLogger(__name__)
@@ -41,7 +41,7 @@ PENDING_COMMAND_TTL = 8.0
 FAN_MODES = ["1", "2", "3", "4", "5", "6", "7"]
 
 # Режимы заслонки / бризера
-BRIZER_SWING_MODES = BRIZER_MODES
+BREEZER_SWING_MODES = BREEZER_MODES
 
 
 async def async_setup_entry(
@@ -98,7 +98,7 @@ class AtmeexClimateEntity(AtmeexEntityMixin, CoordinatorEntity, ClimateEntity):
     _attr_min_temp = 10
     _attr_max_temp = 30
     _attr_fan_modes = FAN_MODES
-    _attr_swing_modes = BRIZER_SWING_MODES
+    _attr_swing_modes = BREEZER_SWING_MODES
     _attr_icon = "mdi:air-purifier"
     _attr_has_entity_name = True
     _attr_translation_key = "breezer"
@@ -432,17 +432,17 @@ class AtmeexClimateEntity(AtmeexEntityMixin, CoordinatorEntity, ClimateEntity):
         """Текущий режим заслонки / бризера."""
         pos = self._device_state.get("damp_pos")
         if isinstance(pos, int) and 0 <= pos <= 3:
-            return BRIZER_SWING_MODES[pos]
+            return BREEZER_SWING_MODES[pos]
         return None
 
     async def async_set_swing_mode(self, swing_mode: str) -> None:
         """Установить режим заслонки / бризера."""
-        if swing_mode not in BRIZER_SWING_MODES:
+        if swing_mode not in BREEZER_SWING_MODES:
             _LOGGER.warning("Unsupported swing_mode: %s", swing_mode)
             return
         try:
-            await self.api.set_brizer_mode(
-                self._device_id, BRIZER_SWING_MODES.index(swing_mode)
+            await self.api.set_breezer_mode(
+                self._device_id, BREEZER_SWING_MODES.index(swing_mode)
             )
         except ApiError as err:
             _LOGGER.error(
