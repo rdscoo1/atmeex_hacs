@@ -432,3 +432,13 @@ class AtmeexApi:
         """Установить ступень работы увлажнителя 0..3."""
         body = {"u_hum_stg": int(stage)}
         await self._put_params(device_id, body, "set_humid_stage")
+
+    async def set_auto_mode(self, device_id: int | str, enabled: bool) -> None:
+        """Включить/выключить режим AutoNanny."""
+        body = {"u_auto": bool(enabled)}
+        await self._put_params(device_id, body, "set_auto_mode")
+
+    async def set_sleep_mode(self, device_id: int | str, enabled: bool) -> None:
+        """Включить/выключить ночной режим (Sleep Mode)."""
+        body = {"u_night": bool(enabled)}
+        await self._put_params(device_id, body, "set_sleep_mode")

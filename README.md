@@ -1,159 +1,203 @@
-# Atmeex Cloud Integration for Home Assistant
+# Atmeex Cloud для Home Assistant
 
-[![HACS Validation](https://github.com/rdscoo1/atmeex_hacs/actions/workflows/validate.yml/badge.svg)](https://github.com/rdscoo1/atmeex_hacs/actions/workflows/validate.yml)
-[![GitHub Release](https://img.shields.io/github/v/release/rdscoo1/atmeex_hacs)](https://github.com/rdscoo1/atmeex_hacs/releases)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![hacs_badge](https://img.shields.io/badge/HACS-Custom-orange.svg)](https://github.com/custom-components/hacs)
+[![GitHub Release](https://img.shields.io/github/release/rdscoo1/atmeex_hacs.svg)](https://github.com/rdscoo1/atmeex_hacs/releases)
+[![License](https://img.shields.io/github/license/rdscoo1/atmeex_hacs.svg)](LICENSE)
 
-## Overview
+[🇬🇧 English version](README.en.md)
 
-Atmeex Cloud is a custom integration for [Home Assistant](https://www.home-assistant.io/) that connects your **Atmeex (AirNanny)** ventilation devices to the Home Assistant ecosystem. It uses the official Atmeex Cloud REST API to provide reliable control and monitoring of your brizers directly from Home Assistant dashboards and automations.
+Atmeex Cloud — это пользовательская интеграция для [Home Assistant](https://www.home-assistant.io/), которая подключает ваши приточные комплексы **Atmeex (AirNanny)** к экосистеме Home Assistant. Интеграция использует официальный REST API Atmeex Cloud для надёжного управления и мониторинга бризеров прямо из панелей управления и автоматизаций Home Assistant.
 
-> 🧩 Originally based on the open-source integration by [@anpavlov](https://github.com/anpavlov), extensively rewritten by [Sergei Polunovskii](https://github.com/pols1), and fully refactored to modern HA standards by [Roman Khodukin](https://github.com/rdscoo1) with race-condition protection, comprehensive diagnostics, and 73+ automated tests.
+> 🧩 Изначально основана на открытой интеграции [@anpavlov](https://github.com/anpavlov), значительно переработана [Sergei Polunovskii](https://github.com/pols1), и полностью рефакторена под современные стандарты HA [Романом Ходукиным](https://github.com/rdscoo1) с защитой от race condition, комплексной диагностикой и 73+ автоматическими тестами.
 
-## Features
+## Возможности
 
-### Device Control
-- **Auto-discovery** of all devices linked to your Atmeex Cloud account
-- **Power on/off** control
-- **Fan speed** control (7 discrete levels, 1–7)
-- **Operation modes**: `supply_ventilation`, `recirculation`, `mixed_mode`, `supply_valve`
-- **Target temperature** control (10–30°C)
-- **Humidifier** control (if supported by device) with 4 stages
+### Управление устройством
+- **Автоматическое обнаружение** всех устройств, привязанных к вашему аккаунту Atmeex Cloud
+- Управление **включением/выключением**
+- Управление **скоростью вентилятора** (7 дискретных уровней, 1–7)
+- **Режимы работы**: `supply_ventilation`, `recirculation`, `mixed_mode`, `supply_valve`
+- **Режим AutoNanny** (автоматическое управление на основе CO2 и влажности для моделей BabyCare/Forever)
+- **Ночной режим** (тихая работа на минимальной скорости)
+- Управление **целевой температурой** (10–30°C)
+- Управление **увлажнителем** (если поддерживается устройством) с 4 ступенями
 
-### Monitoring
-- **Room temperature** sensor
-- **Room humidity** sensor
-- **Online/offline status** as dedicated binary sensor
-- **Diagnostics** sensor with API statistics
+### Мониторинг
+- Датчик **температуры в комнате**
+- Датчик **влажности в комнате**
+- Датчик **CO2** (если поддерживается устройством)
+- Датчик **температуры приточного воздуха**
+- **Статус онлайн/офлайн** как отдельный бинарный сенсор
+- Датчик **диагностики** со статистикой API
 
-### Reliability
-- **Race condition protection** — rapid fan speed changes won't regress to stale values
-- **Re-authentication flow** — automatic prompt when credentials expire
-- **Configurable polling interval** (3–60 seconds)
-- **Robust error handling** with automatic retries
+### Надёжность
+- **WebSocket** для мгновенных обновлений в реальном времени
+- **HTTP-опрос** как резервный механизм
+- **Автоматическое переподключение** при разрыве соединения
+- **Экспоненциальная задержка** для повторных попыток
+- **Защита от race condition** для согласованности состояния
+- **Комплексное логирование** для отладки
 
-### Automation Support
-- Custom services: `set_breezer_mode`, `set_humidifier_stage`
-- Full entity state exposure for triggers and conditions
-- Works with scripts, automations, and voice assistants
+## Установка
 
-## Installation
+### Через HACS (рекомендуется)
 
-### Option 1 — via HACS (Recommended)
+1. Откройте HACS в Home Assistant
+2. Перейдите в раздел "Интеграции"
+3. Нажмите на три точки в правом верхнем углу
+4. Выберите "Пользовательские репозитории"
+5. Добавьте URL: `https://github.com/rdscoo1/atmeex_hacs`
+6. Выберите категорию: "Интеграция"
+7. Нажмите "Добавить"
+8. Найдите "Atmeex Cloud" в списке интеграций
+9. Нажмите "Установить"
+10. Перезапустите Home Assistant
 
-1. Open **HACS** → **Integrations** → **⋮** (menu) → **Custom repositories**
-2. Add repository URL: `https://github.com/rdscoo1/atmeex_hacs`
-3. Select **Integration** as the category
-4. Click **Add**, then find **Atmeex Cloud** and click **Install**
-5. Restart Home Assistant
+### Ручная установка
 
-### Option 2 — Manual Installation
+1. Скачайте последний релиз из [GitHub Releases](https://github.com/rdscoo1/atmeex_hacs/releases)
+2. Распакуйте архив
+3. Скопируйте папку `custom_components/atmeex_cloud` в папку `custom_components` вашей установки Home Assistant
+4. Перезапустите Home Assistant
 
-1. Download the latest release from [GitHub Releases](https://github.com/rdscoo1/atmeex_hacs/releases)
-2. Copy `custom_components/atmeex_cloud` to your `/config/custom_components/` directory
-3. Restart Home Assistant
+## Настройка
 
-## Configuration
+1. Перейдите в **Настройки** → **Устройства и службы**
+2. Нажмите **+ Добавить интеграцию**
+3. Найдите **Atmeex Cloud**
+4. Введите учётные данные вашего аккаунта Atmeex Cloud:
+   - Email
+   - Пароль
+5. Нажмите **Отправить**
 
-1. Go to **Settings** → **Devices & Services** → **Add Integration**
-2. Search for **Atmeex Cloud**
-3. Enter your Atmeex account credentials (email and password)
-4. All connected devices will appear automatically
+Интеграция автоматически обнаружит все ваши устройства Atmeex.
 
-### Options
+### Опции
 
-After setup, you can configure:
-- **Update interval** (3–60 seconds) — how often to poll the Atmeex Cloud API
+После настройки вы можете настроить дополнительные параметры:
 
-## Entities
+- **Интервал обновления** (10–300 секунд): Как часто опрашивать API. Меньшие значения = более частые обновления, но больше запросов к API.
+- **Включить WebSocket** (вкл/выкл): Использовать WebSocket для мгновенных обновлений. Отключите для использования только HTTP-опроса (более надёжно, но медленнее).
 
-Each device creates the following entities:
+## Сущности
 
-| Platform | Entity ID Example | Description |
-|----------|-------------------|-------------|
-| `climate` | `climate.bedroom_breezer` | Main control: power, temperature, fan speed, modes |
-| `fan` | `fan.bedroom_breezer_fan` | Fan speed as percentage (0–100%) |
-| `select` | `select.bedroom_breezer_humidification` | Humidifier stage selector |
-| `select` | `select.bedroom_breezer_breezer_mode` | Operation mode selector |
-| `binary_sensor` | `binary_sensor.bedroom_breezer_online` | Device connectivity status |
-| `sensor` | `sensor.atmeex_diagnostics` | API statistics and health |
+Каждое устройство создаёт следующие сущности:
 
-## Breezer Modes
+| Платформа | Пример ID сущности | Описание |
+|----------|-------------------|----------|
+| `climate` | `climate.bedroom_breezer` | Основное управление: питание, температура, скорость вентилятора, режимы |
+| `fan` | `fan.bedroom_breezer_fan` | Скорость вентилятора в процентах (0–100%) |
+| `select` | `select.bedroom_breezer_humidification` | Выбор ступени увлажнителя |
+| `select` | `select.bedroom_breezer_breezer_mode` | Выбор режима работы |
+| `switch` | `switch.bedroom_breezer_auto_nanny` | Переключатель режима AutoNanny |
+| `switch` | `switch.bedroom_breezer_sleep_mode` | Переключатель ночного режима |
+| `binary_sensor` | `binary_sensor.bedroom_breezer_online` | Статус подключения устройства |
+| `sensor` | `sensor.atmeex_diagnostics` | Статистика и состояние API |
 
-The breezer operation mode controls the damper position:
+## Режимы работы бризера
 
-| Mode Key | Display Name | Description |
-|----------|--------------|-------------|
-| `supply_ventilation` | Supply ventilation | Fresh air intake (damper fully open) |
-| `recirculation` | Recirculation | Room air recirculation (damper closed) |
-| `mixed_mode` | Mixed mode | Partial fresh air + recirculation |
-| `supply_valve` | Supply valve | Supply valve mode |
+### Ручные режимы
 
-**Important:** In automations, use the **mode key** (e.g., `supply_ventilation`), not the display name.
+Режим работы бризера управляет положением заслонки:
 
-## Humidifier Control
+| Ключ режима | Отображаемое имя | Описание |
+|----------|--------------|----------|
+| `supply_ventilation` | Приточная вентиляция | **Режим притока.** AIRNANNY подаёт очищенный и подогретый воздух с улицы. Заслонка открыта на 100%. Можно выбрать скорость подачи воздуха, уровень увлажнения и температуру нагрева (или отключить нагрев). |
+| `recirculation` | Рециркуляция | **Режим рециркуляции.** Устройство очищает и увлажняет воздух только внутри комнаты, без притока уличного воздуха. Заслонка закрыта, воздух забирается только через решётку внизу корпуса. |
+| `mixed_mode` | Смешанный режим | **Смешанный режим.** Приточный комплекс в равных долях забирает воздух с улицы и из комнаты. Подаваемый воздух наполовину состоит из уличного и наполовину — из комнатного воздуха. Очистка, нагрев и увлажнение работают так же, как в режиме притока. Заслонка открыта на 50%. **Работает только при уличной температуре выше 0°C.** |
+| `supply_valve` | Приточный клапан | **Режим приточного клапана.** Вентиляторы и нагреватель не работают, воздух попадает в комнату за счёт естественных факторов. Естественное проветривание с очисткой воздуха. **Работает только при уличной температуре выше 0°C.** |
 
-If your device supports a humidifier, use the humidity slider or select entity:
+**Важно:** В автоматизациях используйте **ключ режима** (например, `supply_ventilation`), а не отображаемое имя.
 
-| Stage | Description |
-|-------|-------------|
-| Off | Humidifier disabled |
-| Stage 1 | Low humidity output |
-| Stage 2 | Medium humidity output |
-| Stage 3 | Maximum humidity output |
+### Режим AutoNanny
 
-## Automation Examples
+**Доступен только в моделях BabyCare и Forever.** Устройство измеряет уровень углекислого газа и влажности в помещении и автоматически выбирает подходящую скорость и интенсивность увлажнения.
 
-### 1. Turn on Breezer When CO2 is High
+#### Регулировка скорости на основе CO2
+- **Ниже 600 ppm:** Смешанный режим (заслонка 50% открыта). Если температура уличного воздуха ниже 0°C, система переходит в режим рециркуляции.
+- **600 ppm и выше:** Режим притока (заслонка 100% открыта) с автоматической скоростью вентилятора:
+  - **Скорость 1:** 599 ppm и ниже
+  - **Скорость 2:** 600–849 ppm
+  - **Скорость 3:** 850–1199 ppm
+  - **Скорость 4:** 1200 ppm и выше
+  - В диапазоне 10:00–20:00: доступны скорости 1–4
+  - В диапазоне 20:00–10:00: доступны скорости 1–3 (более тихая работа)
+
+*Примечание: Калибровка датчика CO2 может занимать до 14 дней с момента первого включения или после длительного неиспользования устройства.*
+
+#### Регулировка увлажнителя на основе влажности
+- **Ступень 1:** 60% и выше
+- **Ступень 2:** 41–59%
+- **Ступень 3:** 40% и ниже
+
+Изменение температуры нагрева возможно без выключения режима AutoNanny.
+
+### Ночной режим (Sleep Mode)
+
+В этом режиме приточный воздухоочиститель работает на первой скорости подачи воздуха и первой ступени увлажнения. Ночной режим обеспечивает воздухом одного человека, поэтому если в комнате отдыхает пара, лучше вручную выбрать 3-ю скорость подачи воздуха.
+
+## Управление увлажнителем
+
+Если ваше устройство поддерживает увлажнитель, используйте слайдер влажности или сущность select:
+
+| Ступень | Описание |
+|---------|----------|
+| Выкл | Увлажнитель отключён |
+| Ступень 1 | Низкая интенсивность увлажнения |
+| Ступень 2 | Средняя интенсивность увлажнения |
+| Ступень 3 | Максимальная интенсивность увлажнения |
+
+## Примеры автоматизаций
+
+### 1. Включение бризера при высоком CO2
 
 ```yaml
 automation:
-  - alias: "Ventilation: High CO2"
-    description: "Turn on breezer at high speed when CO2 exceeds threshold"
+  - alias: "Вентиляция: Включить при высоком CO2"
+    description: "Включить бризер, когда уровень CO2 превышает 800 ppm"
     trigger:
       - platform: numeric_state
-        entity_id: sensor.living_room_co2
-        above: 1000
+        entity_id: sensor.bedroom_breezer_co2
+        above: 800
     action:
-      - service: climate.set_hvac_mode
+      - service: climate.turn_on
         target:
-          entity_id: climate.living_room_breezer
-        data:
-          hvac_mode: fan_only
-      - service: climate.set_fan_mode
-        target:
-          entity_id: climate.living_room_breezer
-        data:
-          fan_mode: "7"
-```
-
-### 2. Night Mode Schedule
-
-```yaml
-automation:
-  - alias: "Ventilation: Night Mode"
-    description: "Reduce fan speed and enable recirculation at night"
-    trigger:
-      - platform: time
-        at: "23:00:00"
-    action:
+          entity_id: climate.bedroom_breezer
       - service: climate.set_fan_mode
         target:
           entity_id: climate.bedroom_breezer
         data:
-          fan_mode: "2"
-      - service: select.select_option
-        target:
-          entity_id: select.bedroom_breezer_breezer_mode
-        data:
-          option: "recirculation"
+          fan_mode: "4"
+```
 
-  - alias: "Ventilation: Morning Mode"
-    description: "Increase ventilation in the morning"
+### 2. Ночной режим по расписанию
+
+```yaml
+automation:
+  - alias: "Вентиляция: Ночной режим"
+    description: "Включить ночной режим в 22:00"
+    trigger:
+      - platform: time
+        at: "22:00:00"
+    action:
+      - service: switch.turn_on
+        target:
+          entity_id: switch.bedroom_breezer_sleep_mode
+```
+
+### 3. Утренний режим
+
+```yaml
+automation:
+  - alias: "Вентиляция: Утренний режим"
+    description: "Увеличить вентиляцию утром"
     trigger:
       - platform: time
         at: "07:00:00"
     action:
+      - service: switch.turn_off
+        target:
+          entity_id: switch.bedroom_breezer_sleep_mode
       - service: climate.set_fan_mode
         target:
           entity_id: climate.bedroom_breezer
@@ -166,21 +210,16 @@ automation:
           option: "supply_ventilation"
 ```
 
-### 3. Temperature-Based Control
+### 4. Управление на основе температуры
 
 ```yaml
 automation:
-  - alias: "Ventilation: Cool Down Room"
-    description: "Increase ventilation when room is too warm"
+  - alias: "Вентиляция: Охлаждение комнаты"
+    description: "Увеличить вентиляцию, когда в комнате слишком тепло"
     trigger:
       - platform: numeric_state
-        entity_id: climate.bedroom_breezer
-        attribute: current_temperature
-        above: 26
-    condition:
-      - condition: numeric_state
-        entity_id: sensor.outdoor_temperature
-        below: 24
+        entity_id: sensor.bedroom_breezer_room_temperature
+        above: 24
     action:
       - service: climate.set_fan_mode
         target:
@@ -194,189 +233,125 @@ automation:
           option: "supply_ventilation"
 ```
 
-### 4. Humidity Control
+### 5. Управление влажностью
 
 ```yaml
 automation:
-  - alias: "Humidity: Enable Humidifier"
-    description: "Turn on humidifier when humidity drops"
+  - alias: "Влажность: Включить увлажнитель"
+    description: "Включить увлажнитель, когда влажность падает"
     trigger:
       - platform: numeric_state
-        entity_id: climate.bedroom_breezer
-        attribute: current_humidity
+        entity_id: sensor.bedroom_breezer_humidity
         below: 40
     action:
       - service: select.select_option
         target:
           entity_id: select.bedroom_breezer_humidification
         data:
-          option: "2"
-
-  - alias: "Humidity: Disable Humidifier"
-    description: "Turn off humidifier when humidity is sufficient"
-    trigger:
-      - platform: numeric_state
-        entity_id: climate.bedroom_breezer
-        attribute: current_humidity
-        above: 55
-    action:
-      - service: select.select_option
-        target:
-          entity_id: select.bedroom_breezer_humidification
-        data:
-          option: "off"
+          option: "3"
 ```
 
-### 5. Turn Off When Away
+### 6. Автоматический режим AutoNanny
 
 ```yaml
 automation:
-  - alias: "Ventilation: Away Mode"
-    description: "Turn off breezer when nobody is home"
+  - alias: "Вентиляция: Включить AutoNanny днём"
+    description: "Использовать автоматическое управление в течение дня"
     trigger:
-      - platform: state
-        entity_id: group.family
-        to: "not_home"
-        for:
-          minutes: 30
+      - platform: time
+        at: "08:00:00"
     action:
-      - service: climate.set_hvac_mode
+      - service: switch.turn_on
         target:
-          entity_id: 
-            - climate.bedroom_breezer
-            - climate.living_room_breezer
-        data:
-          hvac_mode: "off"
-
-  - alias: "Ventilation: Home Mode"
-    description: "Turn on breezer when someone arrives"
-    trigger:
-      - platform: state
-        entity_id: group.family
-        to: "home"
-    action:
-      - service: climate.set_hvac_mode
-        target:
-          entity_id:
-            - climate.bedroom_breezer
-            - climate.living_room_breezer
-        data:
-          hvac_mode: fan_only
-      - service: climate.set_fan_mode
-        target:
-          entity_id:
-            - climate.bedroom_breezer
-            - climate.living_room_breezer
-        data:
-          fan_mode: "3"
+          entity_id: switch.bedroom_breezer_auto_nanny
 ```
 
-### 6. Voice Assistant Script
+## Устранение неполадок
 
-```yaml
-script:
-  boost_ventilation:
-    alias: "Boost Ventilation"
-    description: "Maximize ventilation for 30 minutes"
-    sequence:
-      - service: climate.set_fan_mode
-        target:
-          entity_id: climate.living_room_breezer
-        data:
-          fan_mode: "7"
-      - delay:
-          minutes: 30
-      - service: climate.set_fan_mode
-        target:
-          entity_id: climate.living_room_breezer
-        data:
-          fan_mode: "3"
-```
+### Устройство показывает "Недоступно"
 
-## Troubleshooting
+1. Проверьте подключение к интернету
+2. Убедитесь, что ваше устройство Atmeex онлайн в мобильном приложении
+3. Проверьте учётные данные в настройках интеграции
+4. Проверьте логи Home Assistant на наличие ошибок
 
-| Problem | Cause | Solution |
-|---------|-------|----------|
-| Integration fails to load | Old or corrupted files | Reinstall from HACS |
-| Auth failed during setup | Wrong credentials | Verify your Atmeex Cloud email and password |
-| Temperature shows -100°C | API didn't return data | Wait for next update or restart HA |
-| Device shows unavailable | Device offline or API issue | Check device connectivity |
-| Fan speed reverts | Race condition (fixed in v0.5+) | Update to latest version |
+### Медленные обновления
 
-### Enable Debug Logging
+1. Включите WebSocket в опциях интеграции для мгновенных обновлений
+2. Уменьшите интервал обновления (но не слишком сильно, чтобы избежать ограничения скорости API)
 
-Add to `configuration.yaml`:
+### Ошибки аутентификации
 
-```yaml
-logger:
-  default: info
-  logs:
-    custom_components.atmeex_cloud: debug
-```
+1. Перейдите в **Настройки** → **Устройства и службы**
+2. Найдите интеграцию Atmeex Cloud
+3. Нажмите **Настроить**
+4. Введите свои учётные данные заново
 
-View logs at: **Settings** → **System** → **Logs** → filter by `atmeex_cloud`
+## Разработка
 
-## Development
-
-### Local Setup
+### Запуск тестов
 
 ```bash
-git clone https://github.com/rdscoo1/atmeex_hacs.git
-cd atmeex_hacs
-python3 -m venv .venv
-source .venv/bin/activate  # On Windows: .venv\Scripts\Activate.ps1
-pip install -r requirements-dev.txt
+# Установить зависимости для разработки
+pip install -r requirements_dev.txt
+
+# Запустить все тесты
+pytest tests/ -v
+
+# Запустить с покрытием кода
+pytest tests/ --cov=custom_components.atmeex_cloud --cov-report=html
 ```
 
-### Running Tests
+### Структура проекта
 
-```bash
-pytest              # Quick run
-pytest -vv          # Verbose output
-pytest --cov        # With coverage report
+```
+custom_components/atmeex_cloud/
+├── __init__.py          # Основная логика интеграции и координатор
+├── api.py               # Клиент Atmeex Cloud API
+├── binary_sensor.py     # Бинарные сенсоры (онлайн, нет воды)
+├── climate.py           # Климатическая сущность (основное управление)
+├── config_flow.py       # Поток настройки UI
+├── const.py             # Константы
+├── entity_base.py       # Базовый класс сущности
+├── fan.py               # Сущность вентилятора
+├── helpers.py           # Вспомогательные функции
+├── manifest.json        # Метаданные интеграции
+├── select.py            # Сущности выбора (режим, увлажнитель)
+├── sensor.py            # Сенсоры (CO2, температура, влажность)
+├── strings.json         # Переводы
+├── switch.py            # Переключатели (AutoNanny, ночной режим)
+└── websocket.py         # Клиент WebSocket
 ```
 
-### Test Coverage
+## Вклад в проект
 
-The test suite includes **73+ tests** covering:
+Вклад приветствуется! Пожалуйста:
 
-| Module | Coverage |
-|--------|----------|
-| `api.py` | API client, authentication, error handling |
-| `__init__.py` | Setup, coordinator, race protection |
-| `climate.py` | Climate entity, all HVAC operations |
-| `fan.py` | Fan entity, speed control |
-| `select.py` | Select entities for modes |
-| `config_flow.py` | Config and options flow |
-| `binary_sensor.py` | Online status sensor |
+1. Форкните репозиторий
+2. Создайте ветку для функции (`git checkout -b feature/amazing-feature`)
+3. Закоммитьте изменения (`git commit -m 'Add amazing feature'`)
+4. Запушьте в ветку (`git push origin feature/amazing-feature`)
+5. Откройте Pull Request
 
-### CI/CD
+## Лицензия
 
-This repository uses GitHub Actions for:
-- **pytest** — automated testing on Python 3.11 and 3.12
-- **HACS validation** — ensures HACS compatibility
-- **hassfest** — validates Home Assistant manifest
+Этот проект лицензирован под лицензией MIT — см. файл [LICENSE](LICENSE) для подробностей.
 
-### Releasing
+## Благодарности
 
-1. Update `version` in `manifest.json`
-2. Commit and push changes
-3. Create a tag:
-   ```bash
-   git tag -a v0.6.0 -m "Release 0.6.0"
-   git push --tags
-   ```
-4. Create a GitHub Release
+- [@anpavlov](https://github.com/anpavlov) за оригинальную интеграцию
+- [Sergei Polunovskii](https://github.com/pols1) за значительные улучшения
+- Команде Atmeex за API
+- Сообществу Home Assistant за отличную платформу
 
-## Credits
+## Поддержка
 
-| Role | Contributor |
-|------|-------------|
-| Lead Developer | [Roman Khodukin](https://github.com/rdscoo1) |
-| Original Integration | [@anpavlov](https://github.com/anpavlov) |
-| Major Rewrite | [Sergei Polunovskii](https://github.com/pols1) |
-| API Platform | [Atmeex / AirNanny](https://atmeex.com/) |
+Если вы столкнулись с проблемами или у вас есть вопросы:
 
-## License
+- Откройте [issue на GitHub](https://github.com/rdscoo1/atmeex_hacs/issues)
+- Проверьте [существующие issues](https://github.com/rdscoo1/atmeex_hacs/issues) на наличие похожих проблем
+- Предоставьте логи и подробное описание проблемы
 
-This project is licensed under the [MIT License](LICENSE).
+---
+
+**Отказ от ответственности:** Этот проект не связан с Atmeex или AirNanny. Это независимая интеграция, созданная сообществом.
