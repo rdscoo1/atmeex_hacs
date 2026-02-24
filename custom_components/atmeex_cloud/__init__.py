@@ -32,7 +32,7 @@ from .const import (
     MAX_UPDATE_INTERVAL,
 )
 from .config_flow import AtmeexOptionsFlowHandler
-from .helpers import _normalize_device_state as _normalize_device_state_helper, api_to_fan_speed, to_bool
+from .helpers import api_to_fan_speed, to_bool
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -162,11 +162,6 @@ __all__ = [
 ]
 
 
-def _normalize_device_state(item: dict[str, Any]) -> dict[str, Any]:
-    """Backward-compatible wrapper around shared state normalization helper."""
-    return _normalize_device_state_helper(item)
-
-
 def _resolve_update_interval_seconds(options: dict[str, Any]) -> int:
     """Normalize update interval from options with a safe bounded range."""
     try:
@@ -212,6 +207,22 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         if bus is None or not hasattr(bus, "async_fire"):
             return
         bus.async_fire(event_type, data)
+
+    # Throttle API-error logbook events to avoid flooding during outages.
+    _api_error_last_ts: float = float("-inf")
+    _api_error_suppressed: int = 0
+
+    def _fire_api_error_event(data: dict[str, Any]) -> None:
+        nonlocal _api_error_last_ts, _api_error_suppressed
+        now = time.monotonic()
+        if now - _api_error_last_ts < WS_LOGBOOK_MIN_INTERVAL_SEC:
+            _api_error_suppressed += 1
+            return
+        if _api_error_suppressed:
+            data = {**data, "suppressed_errors": _api_error_suppressed}
+            _api_error_suppressed = 0
+        _fire_logbook_event(EVENT_API_ERROR, data)
+        _api_error_last_ts = now
 
     coordinator: DataUpdateCoordinator[AtmeexCoordinatorData]
 
@@ -291,13 +302,12 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         except ApiError as err:
             setattr(coordinator, "last_api_error", err)
             status = getattr(err, "status", None)
-            _fire_logbook_event(
-                EVENT_API_ERROR,
+            _fire_api_error_event(
                 {
                     "message": str(err),
                     "status": status,
                     "source": "coordinator_update",
-                },
+                }
             )
             if status in (401, 403):
                 # токен протух / креды поменяли → re-auth
@@ -309,9 +319,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             ) from err
         except Exception as err:
             setattr(coordinator, "last_api_error", None)
-            _fire_logbook_event(
-                EVENT_API_ERROR,
-                {"message": str(err), "source": "coordinator_update"},
+            _fire_api_error_event(
+                {"message": str(err), "source": "coordinator_update"}
             )
             raise UpdateFailed(
                 f"Unexpected error while updating Atmeex data: {err}"
@@ -393,21 +402,20 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     await coordinator.async_config_entry_first_refresh()
 
-     # ВАЖНО: если пользователь поменял options — перезагрузить entry
+    # ВАЖНО: если пользователь поменял options — перезагрузить entry
     entry.async_on_unload(entry.add_update_listener(_update_listener))
 
     refresh_tasks: dict[str, asyncio.Task[None]] = {}
     state_update_lock = asyncio.Lock()
     websocket_message_queue: deque[dict[str, Any]] = deque()
-    websocket_message_task: asyncio.Task[None] | None = None
+    # Mutable container avoids nonlocal and keeps runtime_data in sync automatically.
+    _ws_task_ref: dict[str, asyncio.Task[None] | None] = {"task": None}
     ws_logbook_last_event_ts: float = float("-inf")
     ws_logbook_suppressed_updates = 0
 
-    def _create_background_task(coro: Awaitable[None]) -> asyncio.Task[None] | None:
-        """Create background task using HA scheduler when available."""
-        create_task = getattr(hass, "async_create_task", asyncio.create_task)
-        task = create_task(coro)
-        return task if isinstance(task, asyncio.Task) else None
+    def _create_background_task(coro: Awaitable[None]) -> asyncio.Task[None]:
+        """Create background task via HA scheduler."""
+        return hass.async_create_task(coro)
 
     def _fire_websocket_device_updated(
         changed_device_ids: list[str],
@@ -424,8 +432,15 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             ws_logbook_suppressed_updates += len(changed_device_ids)
             return
 
+        cur_map = (coordinator.data or {}).get("device_map", {})
+        device_names = [
+            cur_map[did].name
+            for did in changed_device_ids
+            if did in cur_map and hasattr(cur_map[did], "name")
+        ]
         payload: dict[str, Any] = {
             "device_ids": changed_device_ids,
+            "device_names": device_names or None,
             "source": "websocket",
             "message_type": msg_type,
         }
@@ -442,26 +457,24 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             full: AtmeexDevice = await api.get_device(device_id)
         except ApiError as e:
             _LOGGER.warning("Failed to refresh device %s: %s", device_id, e)
-            _fire_logbook_event(
-                EVENT_API_ERROR,
+            _fire_api_error_event(
                 {
                     "message": str(e),
                     "status": getattr(e, "status", None),
                     "source": "refresh_device",
                     "device_id": str(device_id),
-                },
+                }
             )
             return
         except Exception as e:  # noqa: BLE001
             _LOGGER.warning(
                 "Unexpected error in refresh_device(%s): %s", device_id, e)
-            _fire_logbook_event(
-                EVENT_API_ERROR,
+            _fire_api_error_event(
                 {
                     "message": str(e),
                     "source": "refresh_device",
                     "device_id": str(device_id),
-                },
+                }
             )
             return
 
@@ -518,9 +531,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                     "request_retries": cur.get("request_retries", 0),
                 }
             )
+            device_name = full.name if hasattr(full, "name") else None
             _fire_logbook_event(
                 EVENT_DEVICE_UPDATED,
-                {"device_id": key, "source": "refresh_device"},
+                {"device_id": key, "device_name": device_name, "source": "refresh_device"},
             )
 
     async def refresh_device(device_id: int | str) -> None:
@@ -586,14 +600,16 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     ) -> dict[str, Any]:
         updated = dict(state)
 
+        if "u_pwr_on" in settings_data:
+            updated["pwr_on"] = to_bool(settings_data["u_pwr_on"])
+
         if "u_fan_speed" in settings_data:
             normalized_speed = api_to_fan_speed(settings_data["u_fan_speed"])
             updated["u_fan_speed"] = normalized_speed
-            # Keep normalized fan_speed in sync so fan/climate UI updates immediately.
-            updated["fan_speed"] = normalized_speed
-
-        if "u_pwr_on" in settings_data:
-            updated["pwr_on"] = to_bool(settings_data["u_pwr_on"])
+            # Sync fan_speed (condition) only when device is on to avoid reporting
+            # a non-zero speed while the device is actually off.
+            if updated.get("pwr_on"):
+                updated["fan_speed"] = normalized_speed
 
         if "u_temp_room" in settings_data:
             parsed = _to_int(settings_data["u_temp_room"])
@@ -694,7 +710,6 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
             async def _drain_websocket_messages() -> None:
                 """Process queued websocket messages in order using one task."""
-                nonlocal websocket_message_task
                 try:
                     while websocket_message_queue:
                         message = websocket_message_queue.popleft()
@@ -703,31 +718,61 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                         except Exception as err:  # noqa: BLE001
                             _LOGGER.error("Error processing WebSocket message: %s", err)
                 finally:
-                    websocket_message_task = None
+                    _ws_task_ref["task"] = None
                     if runtime_data is not None:
                         runtime_data.websocket_message_task = None
 
             def on_websocket_message(message: dict[str, Any]) -> None:
                 """Queue websocket message for serialized coordinator updates."""
-                nonlocal websocket_message_task
                 websocket_message_queue.append(message)
-                if websocket_message_task and not websocket_message_task.done():
+                task = _ws_task_ref["task"]
+                if task and not task.done():
                     return
-                websocket_message_task = _create_background_task(_drain_websocket_messages())
+                new_task = _create_background_task(_drain_websocket_messages())
+                _ws_task_ref["task"] = new_task
                 if runtime_data is not None:
-                    runtime_data.websocket_message_task = websocket_message_task
+                    runtime_data.websocket_message_task = new_task
+
+            ws_reauth_started = False
+
+            def _on_ws_auth_failure() -> None:
+                """Start config-entry reauth when WS token becomes invalid."""
+                nonlocal ws_reauth_started
+                if ws_reauth_started:
+                    return
+                ws_reauth_started = True
+
+                _LOGGER.warning(
+                    "WebSocket auth rejected; starting config-entry reauth flow"
+                )
+
+                start_reauth = getattr(entry, "async_start_reauth", None)
+                if not callable(start_reauth):
+                    _LOGGER.error(
+                        "Config entry has no async_start_reauth; WS auth failure cannot trigger reauth"
+                    )
+                    return
+
+                try:
+                    start_reauth(hass)
+                except Exception as err:  # noqa: BLE001
+                    _LOGGER.error(
+                        "Failed to start reauth after WebSocket auth failure: %s",
+                        err,
+                    )
 
             if not hasattr(session, "ws_connect"):
                 _LOGGER.warning("WebSocket skipped: HTTP session has no ws_connect()")
                 websocket_manager = None
-            elif not getattr(api, "_token", None):
+            elif not api.token:
                 _LOGGER.warning("WebSocket skipped: API token is unavailable")
                 websocket_manager = None
             else:
                 websocket_manager = WebSocketManager(
                     session=session,
-                    token_getter=lambda: api._token or "",
+                    token_getter=lambda: api.token,
                     on_message=on_websocket_message,
+                    on_auth_failure=_on_ws_auth_failure,
                 )
 
                 async def _start_websocket() -> None:
@@ -760,7 +805,6 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         refresh_device=refresh_device,
         websocket_manager=websocket_manager,
         websocket_start_task=websocket_start_task,
-        websocket_message_task=websocket_message_task,
     )
     entry.runtime_data = runtime_data
 

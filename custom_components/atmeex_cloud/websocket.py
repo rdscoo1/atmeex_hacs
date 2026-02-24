@@ -65,15 +65,19 @@ class WebSocketManager:
         token_getter: Callable[[], str] | str,
         on_message: Callable[[dict[str, Any]], None],
         config: Optional[WebSocketConfig] = None,
+        on_auth_failure: Optional[Callable[[], None]] = None,
     ) -> None:
         """Initialize WebSocket manager.
-        
+
         Args:
             session: aiohttp ClientSession for WebSocket connection
             token_getter: Callable returning current auth token, or static token string.
                 Use a callable so reconnects pick up refreshed tokens.
             on_message: Callback function for received messages
             config: Optional WebSocket configuration
+            on_auth_failure: Optional callback invoked when the server rejects the token
+                with HTTP 401 or 403.  After calling this callback the manager stops
+                all reconnect attempts so the caller can start a reauth flow.
         """
         self._session = session
         if callable(token_getter):
@@ -82,6 +86,7 @@ class WebSocketManager:
             static_token = token_getter
             self._token_getter = lambda: static_token
         self._on_message = on_message
+        self._on_auth_failure = on_auth_failure
         self._config = config or WebSocketConfig()
         
         self._ws: Optional[ClientWebSocketResponse] = None
@@ -116,6 +121,20 @@ class WebSocketManager:
                 heartbeat=self._config.ping_interval,
                 timeout=self._config.ping_timeout,
             )
+        except aiohttp.WSServerHandshakeError as err:
+            if err.status in (401, 403):
+                _LOGGER.warning(
+                    "WebSocket authentication failed (HTTP %s) — stopping reconnect",
+                    err.status,
+                )
+                # Permanently stop reconnect; let the caller trigger a reauth flow.
+                self._running = False
+                if self._on_auth_failure is not None:
+                    self._on_auth_failure()
+            else:
+                _LOGGER.warning("WebSocket handshake error: %s", err)
+            self._ws = None
+            return False
         except Exception as err:  # noqa: BLE001
             _LOGGER.warning("Failed to connect to WebSocket: %s", err)
             self._ws = None

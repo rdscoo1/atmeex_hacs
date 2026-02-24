@@ -4,7 +4,7 @@ from unittest.mock import AsyncMock, MagicMock
 from types import SimpleNamespace
 
 import custom_components.atmeex_cloud as atmeex_init
-from custom_components.atmeex_cloud.helpers import to_bool
+from custom_components.atmeex_cloud.helpers import to_bool, _normalize_device_state
 from custom_components.atmeex_cloud.const import (
     CONF_UPDATE_INTERVAL,
     DEFAULT_UPDATE_INTERVAL,
@@ -51,7 +51,7 @@ def test_normalize_device_state_basic():
         },
         "online": False,
     }
-    out = atmeex_init._normalize_device_state(item)
+    out = _normalize_device_state(item)
     assert out["pwr_on"] is True
     assert out["fan_speed"] == 4  # API 3 → HA 4
     assert out["damp_pos"] == 2
@@ -82,7 +82,7 @@ def test_normalize_device_state_uses_settings_and_fan_fallback():
             "u_hum_stg": "2",
         },
     }
-    out = atmeex_init._normalize_device_state(item)
+    out = _normalize_device_state(item)
     assert out["pwr_on"] is True
     assert out["fan_speed"] == 5  # API 4 → HA 5
     assert out["damp_pos"] == 1
@@ -376,10 +376,11 @@ async def test_websocket_batch_message_updates_coordinator_once(monkeypatch):
     created_ws_managers = []
 
     class FakeWebSocketManager:
-        def __init__(self, session, token_getter, on_message):
+        def __init__(self, session, token_getter, on_message, on_auth_failure=None):
             self.session = session
             self.token_getter = token_getter
             self.on_message = on_message
+            self.on_auth_failure = on_auth_failure
             created_callbacks.append(on_message)
             created_ws_managers.append(self)
 
@@ -432,6 +433,10 @@ async def test_websocket_batch_message_updates_coordinator_once(monkeypatch):
                 raise ValueError("unknown device")
 
             self.get_device = AsyncMock(side_effect=_get_device)
+
+        @property
+        def token(self):
+            return self._token or ""
 
     monkeypatch.setattr(atmeex_init, "AtmeexApi", FakeApi)
     monkeypatch.setattr(atmeex_init, "async_get_clientsession", lambda hass: FakeSession())
@@ -851,14 +856,101 @@ async def test_setup_entry_websocket_skipped_without_token(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_setup_entry_websocket_auth_failure_starts_reauth(monkeypatch):
+    import custom_components.atmeex_cloud.websocket as websocket_mod
+
+    class FakeWebSocketManager:
+        def __init__(self, session, token_getter, on_message, on_auth_failure=None):
+            self.on_auth_failure = on_auth_failure
+
+        async def connect(self):
+            assert self.on_auth_failure is not None
+            self.on_auth_failure()
+            return False
+
+        async def disconnect(self):
+            return None
+
+    monkeypatch.setattr(websocket_mod, "WebSocketManager", FakeWebSocketManager)
+
+    class FakeSession:
+        async def ws_connect(self, *args, **kwargs):
+            raise AssertionError("ws_connect should not be called")
+
+    class FakeApi:
+        def __init__(self, _session):
+            self.async_init = AsyncMock()
+            self.login = AsyncMock()
+            self._token = "token"
+            dev = AtmeexDevice.from_raw(
+                {
+                    "id": 1,
+                    "name": "Dev1",
+                    "model": "m",
+                    "online": True,
+                    "condition": {"pwr_on": 1, "fan_speed": 2},
+                    "settings": {},
+                }
+            )
+            self.get_devices = AsyncMock(return_value=[dev])
+            self.get_device = AsyncMock(return_value=dev)
+
+        @property
+        def token(self):
+            return self._token or ""
+
+    monkeypatch.setattr(atmeex_init, "AtmeexApi", FakeApi)
+    monkeypatch.setattr(atmeex_init, "async_get_clientsession", lambda _hass: FakeSession())
+
+    class DummyCoordinator:
+        def __init__(self, hass, logger, name, update_method, update_interval):
+            self.data = None
+            self.last_update_success = True
+            self.update_method = update_method
+
+        async def async_config_entry_first_refresh(self):
+            self.data = await self.update_method()
+
+        def async_set_updated_data(self, data):
+            self.data = data
+
+    monkeypatch.setattr(atmeex_init, "DataUpdateCoordinator", DummyCoordinator)
+
+    hass = SimpleNamespace(
+        data={},
+        async_create_task=asyncio.create_task,
+        config_entries=SimpleNamespace(
+            async_forward_entry_setups=AsyncMock(),
+            async_unload_platforms=AsyncMock(return_value=True),
+        ),
+    )
+    entry = SimpleNamespace(
+        data={"email": "user@example.com", "password": "pwd"},
+        options={"enable_websocket": True},
+        entry_id="entry1",
+        add_update_listener=lambda _listener: (lambda: None),
+        async_on_unload=lambda _cb: None,
+        async_start_reauth=MagicMock(),
+    )
+
+    assert await atmeex_init.async_setup_entry(hass, entry) is True
+    runtime = entry.runtime_data
+    if runtime.websocket_start_task:
+        await runtime.websocket_start_task
+
+    entry.async_start_reauth.assert_called_once_with(hass)
+
+
+@pytest.mark.asyncio
 async def test_websocket_settings_message_updates_state(monkeypatch):
     import custom_components.atmeex_cloud.websocket as websocket_mod
 
     callbacks = []
 
     class FakeWebSocketManager:
-        def __init__(self, session, token_getter, on_message):
+        def __init__(self, session, token_getter, on_message, on_auth_failure=None):
             self.on_message = on_message
+            self.on_auth_failure = on_auth_failure
             callbacks.append(on_message)
 
         async def connect(self):
@@ -890,6 +982,10 @@ async def test_websocket_settings_message_updates_state(monkeypatch):
             )
             self.get_devices = AsyncMock(return_value=[dev])
             self.get_device = AsyncMock(return_value=dev)
+
+        @property
+        def token(self):
+            return self._token or ""
 
     monkeypatch.setattr(atmeex_init, "AtmeexApi", FakeApi)
     monkeypatch.setattr(atmeex_init, "async_get_clientsession", lambda _hass: FakeSession())
@@ -972,8 +1068,9 @@ async def test_websocket_logbook_device_events_are_throttled(monkeypatch):
     callbacks = []
 
     class FakeWebSocketManager:
-        def __init__(self, session, token_getter, on_message):
+        def __init__(self, session, token_getter, on_message, on_auth_failure=None):
             self.on_message = on_message
+            self.on_auth_failure = on_auth_failure
             callbacks.append(on_message)
 
         async def connect(self):
@@ -1008,6 +1105,10 @@ async def test_websocket_logbook_device_events_are_throttled(monkeypatch):
             )
             self.get_devices = AsyncMock(return_value=[dev])
             self.get_device = AsyncMock(return_value=dev)
+
+        @property
+        def token(self):
+            return self._token or ""
 
     monkeypatch.setattr(atmeex_init, "AtmeexApi", FakeApi)
     monkeypatch.setattr(atmeex_init, "async_get_clientsession", lambda _hass: FakeSession())
@@ -1077,3 +1178,255 @@ async def test_websocket_logbook_device_events_are_throttled(monkeypatch):
     assert len(device_events) == 2
     assert device_events[0]["source"] == "websocket"
     assert device_events[1]["suppressed_updates"] == 1
+
+
+# ---------------------------------------------------------------------------
+# Helper for _apply_condition_update / _apply_settings_update tests
+# ---------------------------------------------------------------------------
+
+async def _build_ws_runtime(monkeypatch, *, initial_condition=None):
+    """Build a WS-enabled runtime with one device and return (runtime, ws_callback, hass).
+
+    Patches AtmeexApi, DataUpdateCoordinator, and WebSocketManager so that
+    actual network calls are never made.
+    """
+    import custom_components.atmeex_cloud.websocket as websocket_mod
+
+    _callbacks: list = []
+
+    class _FakeWS:
+        def __init__(self, session, token_getter, on_message, on_auth_failure=None):
+            _callbacks.append(on_message)
+
+        async def connect(self):
+            return True
+
+        async def disconnect(self):
+            return None
+
+    monkeypatch.setattr(websocket_mod, "WebSocketManager", _FakeWS)
+
+    cond = {"pwr_on": 1, "fan_speed": 2, "damp_pos": 0, "hum_stg": 0}
+    if initial_condition:
+        cond.update(initial_condition)
+
+    dev = AtmeexDevice.from_raw(
+        {"id": 1, "name": "Dev1", "model": "m", "online": True, "condition": cond, "settings": {}}
+    )
+
+    class _FakeApi:
+        def __init__(self, _s):
+            self.async_init = AsyncMock()
+            self.login = AsyncMock()
+            self._token = "tok"
+            self.get_devices = AsyncMock(return_value=[dev])
+            self.get_device = AsyncMock(return_value=dev)
+
+        @property
+        def token(self):
+            return self._token or ""
+
+    monkeypatch.setattr(atmeex_init, "AtmeexApi", _FakeApi)
+
+    class _FakeSession:
+        async def ws_connect(self, *a, **kw):  # pragma: no cover
+            raise AssertionError("must not be called")
+
+    monkeypatch.setattr(atmeex_init, "async_get_clientsession", lambda _h: _FakeSession())
+
+    class _Coord:
+        def __init__(self, hass, logger, name, update_method, update_interval):
+            self.data = None
+            self.update_method = update_method
+
+        async def async_config_entry_first_refresh(self):
+            self.data = await self.update_method()
+
+        def async_set_updated_data(self, data):
+            self.data = data
+
+    monkeypatch.setattr(atmeex_init, "DataUpdateCoordinator", _Coord)
+
+    hass = SimpleNamespace(
+        data={},
+        bus=SimpleNamespace(async_fire=MagicMock()),
+        async_create_task=asyncio.create_task,
+        config_entries=SimpleNamespace(
+            async_forward_entry_setups=AsyncMock(),
+            async_unload_platforms=AsyncMock(return_value=True),
+        ),
+    )
+    entry = SimpleNamespace(
+        data={"email": "u@e.com", "password": "p"},
+        options={"update_interval": 30, "enable_websocket": True},
+        entry_id="e1",
+        add_update_listener=lambda _l: (lambda: None),
+        async_on_unload=lambda _c: None,
+    )
+
+    assert await atmeex_init.async_setup_entry(hass, entry) is True
+    runtime = entry.runtime_data
+    if runtime.websocket_start_task:
+        await runtime.websocket_start_task
+
+    return runtime, _callbacks[0], hass
+
+
+async def _fire_and_drain(runtime, callback, message):
+    """Fire a WS message and wait for the drain task to finish."""
+    callback(message)
+    if runtime.websocket_message_task:
+        await runtime.websocket_message_task
+
+
+# ---------------------------------------------------------------------------
+# _apply_condition_update tests (via WS "condition" messages)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_apply_condition_update_sets_online_always_true(monkeypatch):
+    """A WS condition message always marks the device as online, even without a time field."""
+    runtime, cb, _hass = await _build_ws_runtime(
+        monkeypatch, initial_condition={"online": False}
+    )
+    await _fire_and_drain(
+        runtime, cb,
+        {"type": "condition", "data": [{"id": 1, "condition": {"pwr_on": 0}}]},
+    )
+    assert runtime.coordinator.data["states"]["1"]["online"] is True
+
+
+@pytest.mark.asyncio
+async def test_apply_condition_update_no_water_field(monkeypatch):
+    """no_water is correctly extracted from a condition message."""
+    runtime, cb, _hass = await _build_ws_runtime(monkeypatch)
+    await _fire_and_drain(
+        runtime, cb,
+        {"type": "condition", "data": [{"id": 1, "condition": {"no_water": 1}}]},
+    )
+    assert runtime.coordinator.data["states"]["1"]["no_water"] is True
+
+
+@pytest.mark.asyncio
+async def test_apply_condition_update_only_present_fields_changed(monkeypatch):
+    """Fields absent from the condition payload are NOT overwritten."""
+    runtime, cb, _hass = await _build_ws_runtime(
+        monkeypatch, initial_condition={"fan_speed": 5, "damp_pos": 3}
+    )
+    # Send a message that only changes pwr_on — fan_speed and damp_pos must stay
+    await _fire_and_drain(
+        runtime, cb,
+        {"type": "condition", "data": [{"id": 1, "condition": {"pwr_on": 0}}]},
+    )
+    state = runtime.coordinator.data["states"]["1"]
+    assert state["pwr_on"] is False
+    assert state["fan_speed"] == 6   # API 5 → HA 6 (unchanged)
+    assert state["damp_pos"] == 3    # unchanged
+
+
+@pytest.mark.asyncio
+async def test_apply_condition_update_time_field_propagated(monkeypatch):
+    """The 'time' field from a condition message is stored as-is."""
+    runtime, cb, _hass = await _build_ws_runtime(monkeypatch)
+    ts = "2026-01-27 21:24:15"
+    await _fire_and_drain(
+        runtime, cb,
+        {"type": "condition", "data": [{"id": 1, "condition": {"time": ts}}]},
+    )
+    assert runtime.coordinator.data["states"]["1"]["time"] == ts
+
+
+# ---------------------------------------------------------------------------
+# _apply_settings_update tests (via WS "settings" messages)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_apply_settings_update_fan_speed_synced_when_pwr_on(monkeypatch):
+    """fan_speed in state is synced from u_fan_speed when the device is on."""
+    runtime, cb, _hass = await _build_ws_runtime(
+        monkeypatch, initial_condition={"pwr_on": 1, "fan_speed": 2}
+    )
+    await _fire_and_drain(
+        runtime, cb,
+        {"type": "settings", "data": [{"id": 1, "settings": {"u_fan_speed": 4}}]},
+    )
+    state = runtime.coordinator.data["states"]["1"]
+    assert state["u_fan_speed"] == 5   # API 4 → HA 5
+    assert state["fan_speed"] == 5     # synced because pwr_on=True
+
+
+@pytest.mark.asyncio
+async def test_apply_settings_update_fan_speed_not_synced_when_pwr_off(monkeypatch):
+    """fan_speed in state is NOT touched when the device is off."""
+    runtime, cb, _hass = await _build_ws_runtime(
+        monkeypatch, initial_condition={"pwr_on": 0, "fan_speed": 3}
+    )
+    await _fire_and_drain(
+        runtime, cb,
+        {"type": "settings", "data": [{"id": 1, "settings": {"u_fan_speed": 4}}]},
+    )
+    state = runtime.coordinator.data["states"]["1"]
+    assert state["u_fan_speed"] == 5   # u_fan_speed updated
+    assert state["fan_speed"] == 4     # API 3 → HA 4 (NOT overwritten by u_fan_speed)
+
+
+@pytest.mark.asyncio
+async def test_apply_settings_update_power_and_speed_in_single_payload(monkeypatch):
+    """When payload contains u_pwr_on and u_fan_speed, fan_speed follows new power state."""
+    runtime, cb, _hass = await _build_ws_runtime(
+        monkeypatch, initial_condition={"pwr_on": 0, "fan_speed": 2}
+    )
+    await _fire_and_drain(
+        runtime,
+        cb,
+        {
+            "type": "settings",
+            "data": [{"id": 1, "settings": {"u_pwr_on": 1, "u_fan_speed": 4}}],
+        },
+    )
+    state = runtime.coordinator.data["states"]["1"]
+    assert state["pwr_on"] is True
+    assert state["u_fan_speed"] == 5
+    assert state["fan_speed"] == 5
+
+
+@pytest.mark.asyncio
+async def test_apply_settings_update_all_fields(monkeypatch):
+    """All settings fields (u_temp_room, u_hum_stg, u_damp_pos, u_pwr_on) are applied."""
+    runtime, cb, _hass = await _build_ws_runtime(monkeypatch)
+    await _fire_and_drain(
+        runtime, cb,
+        {
+            "type": "settings",
+            "data": [
+                {
+                    "id": 1,
+                    "settings": {
+                        "u_pwr_on": 0,
+                        "u_temp_room": "215",
+                        "u_hum_stg": 3,
+                        "u_damp_pos": 2,
+                    },
+                }
+            ],
+        },
+    )
+    state = runtime.coordinator.data["states"]["1"]
+    assert state["pwr_on"] is False
+    assert state["u_temp_room"] == 215
+    assert state["hum_stg"] == 3
+    assert state["damp_pos"] == 2
+    assert state["online"] is True
+
+
+@pytest.mark.asyncio
+async def test_apply_settings_update_sets_online_true(monkeypatch):
+    """A settings update always marks the device as online."""
+    runtime, cb, _hass = await _build_ws_runtime(
+        monkeypatch, initial_condition={"online": False}
+    )
+    await _fire_and_drain(
+        runtime, cb,
+        {"type": "settings", "data": [{"id": 1, "settings": {"u_pwr_on": 1}}]},
+    )
+    assert runtime.coordinator.data["states"]["1"]["online"] is True

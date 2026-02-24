@@ -39,6 +39,22 @@ class _FlakySession:
         return _FakeWebSocket()
 
 
+class _HandshakeFailureSession:
+    def __init__(self, status: int) -> None:
+        self.status = status
+        self.calls = 0
+
+    async def ws_connect(self, *args, **kwargs):
+        self.calls += 1
+        raise aiohttp.WSServerHandshakeError(
+            None,
+            tuple(),
+            status=self.status,
+            message="auth failed",
+            headers=None,
+        )
+
+
 class _ScriptedWebSocket:
     def __init__(self, messages):
         self._messages = list(messages)
@@ -173,6 +189,29 @@ async def test_reconnect_uses_fresh_token_from_getter(monkeypatch):
     assert session.headers[1]["Authorization"] == "Bearer fresh"
 
     await manager.disconnect()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", [401, 403])
+async def test_handshake_auth_error_triggers_callback_and_stops_reconnect(status):
+    callback = MagicMock()
+    session = _HandshakeFailureSession(status=status)
+    manager = WebSocketManager(
+        session=session,
+        token_getter="token",
+        on_message=lambda _msg: None,
+        on_auth_failure=callback,
+        config=WebSocketConfig(
+            reconnect_delay_min=0.5,
+            reconnect_delay_max=2.0,
+        ),
+    )
+
+    assert await manager.connect() is False
+    callback.assert_called_once()
+    assert manager._running is False
+    assert manager._reconnect_task is None
+    assert session.calls == 1
 
 
 @pytest.mark.asyncio

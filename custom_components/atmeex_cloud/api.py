@@ -133,6 +133,11 @@ class AtmeexApi:
 
     # ---------- helpers ----------
 
+    @property
+    def token(self) -> str:
+        """Return the current auth token (empty string if not set)."""
+        return self._token or ""
+
     def _token_is_valid(self) -> bool:
         """Проверить, что токен ещё жив и не протухнет прямо сейчас."""
         if not self._token:

@@ -35,11 +35,15 @@ def test_logbook_describers_format_messages() -> None:
                 "message": "Timeout while calling API",
                 "source": "coordinator_update",
                 "status": 504,
+                "suppressed_errors": 2,
             }
         )
     )
     assert api_result["name"] == "Atmeex Cloud"
-    assert api_result["message"] == "[coordinator_update] Timeout while calling API (status=504)"
+    assert (
+        api_result["message"]
+        == "[coordinator_update] Timeout while calling API (status=504) (+2 suppressed)"
+    )
 
     device_result = describers[EVENT_DEVICE_UPDATED](
         SimpleNamespace(

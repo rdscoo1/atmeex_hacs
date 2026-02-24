@@ -17,7 +17,7 @@ from custom_components.atmeex_cloud.climate import (
     HUM_ALLOWED,
     BREEZER_SWING_MODES,
 )
-from custom_components.atmeex_cloud.const import DOMAIN
+from custom_components.atmeex_cloud.const import DOMAIN, BREEZER_MODES
 from custom_components.atmeex_cloud.api import AtmeexDevice
 
 
@@ -382,3 +382,74 @@ async def test_preset_boost_then_restore_previous_fan_mode():
     assert ent._is_boost is False
     assert ent._saved_fan_mode is None
     api.set_fan_speed.assert_awaited_once_with(1, 3)
+
+
+# ---------------------------------------------------------------------------
+# Service: set_breezer_mode
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_service_set_breezer_mode_calls_api():
+    """set_breezer_mode delegates to async_set_swing_mode → api.set_breezer_mode."""
+    ent, _cond, api = _make_entity()
+    mode = BREEZER_MODES[1]  # "recirculation"
+    await ent.async_set_breezer_mode(mode)
+    api.set_breezer_mode.assert_awaited_once_with(1, 1)
+
+
+@pytest.mark.asyncio
+async def test_service_set_breezer_mode_all_valid_modes():
+    """Every entry in BREEZER_MODES maps to the correct API index."""
+    for idx, mode in enumerate(BREEZER_MODES):
+        ent, _cond, api = _make_entity()
+        await ent.async_set_breezer_mode(mode)
+        api.set_breezer_mode.assert_awaited_once_with(1, idx)
+
+
+@pytest.mark.asyncio
+async def test_service_set_breezer_mode_raises_on_api_error():
+    """ApiError from set_breezer_mode is re-raised as HomeAssistantError."""
+    ent, _cond, api = _make_entity()
+    api.set_breezer_mode.side_effect = ApiError("network", status=503)
+    with pytest.raises(HomeAssistantError):
+        await ent.async_set_breezer_mode(BREEZER_MODES[0])
+
+
+# ---------------------------------------------------------------------------
+# Service: set_humidifier_stage
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_service_set_humidifier_stage_calls_api():
+    """set_humidifier_stage calls api.set_humid_stage with the requested stage."""
+    ent, _cond, api = _make_entity({"hum_stg": 0})
+    await ent.async_set_humidifier_stage(2)
+    api.set_humid_stage.assert_awaited_once_with(1, 2)
+
+
+@pytest.mark.asyncio
+async def test_service_set_humidifier_stage_no_humidifier_is_noop():
+    """When the device has no humidifier, the API is never called."""
+    # Remove hum_stg from state so _has_humidifier() returns False
+    ent, _cond, api = _make_entity({})
+    del ent.coordinator.data["states"]["1"]["hum_stg"]
+    await ent.async_set_humidifier_stage(1)
+    api.set_humid_stage.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stage,expected", [(-1, 0), (0, 0), (3, 3), (4, 3)])
+async def test_service_set_humidifier_stage_clamps_value(stage, expected):
+    """Stage is clamped to 0–3 before being sent to the API."""
+    ent, _cond, api = _make_entity({"hum_stg": 1})
+    await ent.async_set_humidifier_stage(stage)
+    api.set_humid_stage.assert_awaited_once_with(1, expected)
+
+
+@pytest.mark.asyncio
+async def test_service_set_humidifier_stage_raises_on_api_error():
+    """ApiError from set_humid_stage is re-raised as HomeAssistantError."""
+    ent, _cond, api = _make_entity({"hum_stg": 1})
+    api.set_humid_stage.side_effect = ApiError("timeout", status=None)
+    with pytest.raises(HomeAssistantError):
+        await ent.async_set_humidifier_stage(1)

@@ -21,13 +21,15 @@ from homeassistant.components.climate.const import (
     PRESET_BOOST,
     PRESET_SLEEP,
 )
+import voluptuous as vol
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
+from homeassistant.helpers.entity_platform import async_get_current_platform
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 from homeassistant.exceptions import HomeAssistantError
 from .api import ApiError, AtmeexDevice
 
-from .const import DOMAIN, BREEZER_MODES
+from .const import BREEZER_MODES
 from . import AtmeexRuntimeData
 
 _LOGGER = logging.getLogger(__name__)
@@ -71,6 +73,18 @@ async def async_setup_entry(
 
     if entities:
         async_add_entities(entities)
+
+    platform = async_get_current_platform()
+    platform.async_register_entity_service(
+        "set_breezer_mode",
+        {vol.Required("mode"): vol.In(BREEZER_MODES)},
+        "async_set_breezer_mode",
+    )
+    platform.async_register_entity_service(
+        "set_humidifier_stage",
+        {vol.Required("stage"): vol.All(vol.Coerce(int), vol.Range(min=0, max=3))},
+        "async_set_humidifier_stage",
+    )
 
 
 class AtmeexClimateEntity(AtmeexEntityMixin, CoordinatorEntity, ClimateEntity):
@@ -404,6 +418,21 @@ class AtmeexClimateEntity(AtmeexEntityMixin, CoordinatorEntity, ClimateEntity):
                 "Failed to set swing mode for %s: %s", self._device_id, err
             )
             raise HomeAssistantError("Failed to set swing mode") from err
+        await self._refresh()
+
+    async def async_set_breezer_mode(self, mode: str) -> None:
+        """Service handler: set damper/breezer mode by name."""
+        await self.async_set_swing_mode(mode)
+
+    async def async_set_humidifier_stage(self, stage: int) -> None:
+        """Service handler: set humidifier stage directly (0=off, 1-3)."""
+        if not self._has_humidifier():
+            return
+        stage = max(0, min(3, int(stage)))
+        try:
+            await self.api.set_humid_stage(self._device_id, stage)
+        except ApiError as err:
+            raise HomeAssistantError("Failed to set humidifier stage") from err
         await self._refresh()
 
     # ---------- установка пресетов ----------
