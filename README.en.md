@@ -8,7 +8,7 @@
 
 ## Overview
 
-Atmeex Cloud is a custom integration for [Home Assistant](https://www.home-assistant.io/) that connects your **Atmeex (AirNanny)** ventilation devices to the Home Assistant ecosystem. It uses the official Atmeex Cloud REST API to provide reliable control and monitoring of your brizers directly from Home Assistant dashboards and automations.
+Atmeex Cloud is a custom integration for [Home Assistant](https://www.home-assistant.io/) that connects your **Atmeex (AirNanny)** ventilation devices to the Home Assistant ecosystem. It uses the official Atmeex Cloud REST API to provide reliable control and monitoring of your breezers directly from Home Assistant dashboards and automations.
 
 > 🧩 Originally based on the open-source integration by [@anpavlov](https://github.com/anpavlov), extensively rewritten by [Sergei Polunovskii](https://github.com/pols1), and fully refactored to modern HA standards by [Roman Khodukin](https://github.com/rdscoo1) with race-condition protection, comprehensive diagnostics, and 73+ automated tests.
 

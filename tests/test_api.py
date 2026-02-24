@@ -125,6 +125,24 @@ async def test_get_devices_error_no_fallback():
 
 
 @pytest.mark.asyncio
+async def test_get_devices_500_does_not_trigger_relogin():
+    session = FakeSession()
+    session.queue_response(FakeResponse(500, text_data="server error"))
+
+    api = AtmeexApi(session)
+    api._token = "t"
+    api._email = "user@example.com"
+    api._password = "pwd"
+
+    with pytest.raises(ApiError) as exc:
+        await api.get_devices()
+
+    assert "get_devices 500" in str(exc.value)
+    assert len(session.requests) == 1
+    assert session.requests[0][0] == "GET"
+
+
+@pytest.mark.asyncio
 async def test_get_devices_error_with_fallback_returns_empty_list():
     session = FakeSession()
     session.queue_response(FakeResponse(500, text_data="error"))
@@ -176,7 +194,7 @@ async def test_get_device_error_raises():
         ("set_power", True, {"u_pwr_on": True}),
         ("set_target_temperature", 21.5, {"u_temp_room": 215}),
         ("set_fan_speed", 3, {"u_fan_speed": 2}),  # HA speed 3 → API speed 2
-        ("set_brizer_mode", 2, {"u_damp_pos": 2}),
+        ("set_breezer_mode", 2, {"u_damp_pos": 2}),
         ("set_humid_stage", 1, {"u_hum_stg": 1}),
     ],
 )

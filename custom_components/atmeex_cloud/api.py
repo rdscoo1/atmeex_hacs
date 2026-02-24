@@ -277,15 +277,15 @@ class AtmeexApi:
         await self._with_retries(_do_login, "login")
     
     async def _request(
-    self,
-    method: str,
-    path: str,
-    *,
-    timeout: int = 20,
-    json: Any | None = None,
-    headers: Dict[str, str] | None = None,
-) -> tuple[int, Any]:
-        """Запрос с токеном + 1 auto-relogin по 401/403/500.
+        self,
+        method: str,
+        path: str,
+        *,
+        timeout: int = 20,
+        json: Any | None = None,
+        headers: Dict[str, str] | None = None,
+    ) -> tuple[int, Any]:
+        """Запрос с токеном + 1 auto-relogin по 401/403.
         Возвращает (status, payload), где payload = json (если <400) иначе text.
         """
         await self._ensure_token()
@@ -299,7 +299,7 @@ class AtmeexApi:
             async with self._session.request(
                 method, url, json=json, headers=req_headers, timeout=timeout
             ) as resp:
-                if resp.status in (401, 403, 500) and retry_auth and self._email and self._password:
+                if resp.status in (401, 403) and retry_auth and self._email and self._password:
                     self._token_expires_at = None
                     await self._sign_in()
                     return await _do(retry_auth=False)
@@ -423,14 +423,10 @@ class AtmeexApi:
         body = {"u_fan_speed": api_speed}
         await self._put_params(device_id, body, "set_fan_speed")
 
-    async def set_brizer_mode(self, device_id: int | str, damp_pos: int) -> None:
+    async def set_breezer_mode(self, device_id: int | str, damp_pos: int) -> None:
         """Установить режим бризера (положение заслонки) 0..3."""
         body = {"u_damp_pos": int(damp_pos)}
         await self._put_params(device_id, body, "set_breezer_mode")
-
-    async def set_breezer_mode(self, device_id: int | str, damp_pos: int) -> None:
-        """Установить режим бризера (положение заслонки) 0..3. Alias for set_brizer_mode."""
-        await self.set_brizer_mode(device_id, damp_pos)
 
     async def set_humid_stage(self, device_id: int | str, stage: int) -> None:
         """Установить ступень работы увлажнителя 0..3."""

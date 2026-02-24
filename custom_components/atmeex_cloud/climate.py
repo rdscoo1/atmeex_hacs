@@ -80,7 +80,7 @@ class AtmeexClimateEntity(AtmeexEntityMixin, CoordinatorEntity, ClimateEntity):
     Управляет:
     * целевой температурой;
     * скоростью вентилятора (1..7);
-    * режимом заслонки (swing / brizer mode);
+    * режимом заслонки (swing / breezer mode);
     * целевой влажностью (если есть увлажнитель).
     """
 
