@@ -3,17 +3,16 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from collections import deque
 from dataclasses import dataclass, field
 from datetime import timedelta
 from typing import Any, TypedDict, Callable, Awaitable
 
 import aiohttp
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.core import HomeAssistant, ServiceCall, callback
+from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import ConfigEntryNotReady, ConfigEntryAuthFailed
 from homeassistant.helpers.device_registry import DeviceEntry
-import voluptuous as vol
-from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.update_coordinator import (
     DataUpdateCoordinator,
@@ -25,20 +24,22 @@ from .api import AtmeexApi, ApiError, AtmeexDevice, AtmeexState
 from .const import (
     DOMAIN,
     PLATFORMS,
-    CONF_UPDATE_INTERVAL,
     CONF_ENABLE_WEBSOCKET,
-    DEFAULT_UPDATE_INTERVAL,
     DEFAULT_ENABLE_WEBSOCKET,
-    BREEZER_MODES,
+    CONF_UPDATE_INTERVAL,
+    DEFAULT_UPDATE_INTERVAL,
+    MIN_UPDATE_INTERVAL,
+    MAX_UPDATE_INTERVAL,
 )
 from .config_flow import AtmeexOptionsFlowHandler
-from .helpers import to_bool
+from .helpers import api_to_fan_speed, to_bool
 
 _LOGGER = logging.getLogger(__name__)
 
 # События, которые будут попадать в Logbook
 EVENT_API_ERROR = "atmeex_cloud_api_error"
 EVENT_DEVICE_UPDATED = "atmeex_cloud_device_updated"
+WS_LOGBOOK_MIN_INTERVAL_SEC = 5.0
 
 
 class AtmeexCoordinatorData(TypedDict, total=False):
@@ -72,6 +73,10 @@ class AtmeexRuntimeData:
     pending_commands: dict[str, dict[str, PendingCommand]] = field(default_factory=dict)
     # WebSocket manager for real-time updates (optional, can be None for HTTP-only mode)
     websocket_manager: Any = None  # WebSocketManager | None
+    # Task that performs initial WebSocket startup/retry bootstrap.
+    websocket_start_task: asyncio.Task[None] | None = None
+    # Serialized task for queued websocket state updates.
+    websocket_message_task: asyncio.Task[None] | None = None
 
     def get_device_lock(self, device_id: int | str) -> asyncio.Lock:
         """Get or create a lock for the given device."""
@@ -157,116 +162,13 @@ __all__ = [
 ]
 
 
-def _normalize_device_state(item: dict[str, Any]) -> dict[str, Any]:
-    """Склеить condition + settings → нормализованное состояние (+ online)"""
-    cond = dict(item.get("condition") or {})
-    st = dict(item.get("settings") or {})
-
-    # Питание
-    pwr_cond = cond.get("pwr_on")
-    pwr_settings = st.get("u_pwr_on")
-    
-    # Prefer condition.pwr_on if available, fallback to settings.u_pwr_on
-    if pwr_cond is not None:
-        pwr = to_bool(pwr_cond)
-    elif pwr_settings is not None:
-        pwr = to_bool(pwr_settings)
-    else:
-        pwr = False  # Default to off if no data available
-    
-    _LOGGER.debug(
-        "Normalize pwr_on: condition=%s, settings=%s, result=%s",
-        pwr_cond, pwr_settings, pwr
-    )
-
-    # Скорость вентилятора
-    # API uses 0-6, we need to convert to HA 1-7
-    from .helpers import api_to_fan_speed
-    
-    fan_raw = cond.get("fan_speed")
-    u_fan_raw = st.get("u_fan_speed")
-    
-    _LOGGER.debug(
-        "Normalize fan_speed: condition.fan_speed=%s, settings.u_fan_speed=%s, pwr=%s",
-        fan_raw, u_fan_raw, pwr
-    )
-    
-    # Prefer settings.u_fan_speed if condition.fan_speed is missing/None or 0 when device is on
-    # This handles cases where condition data is stale but settings has the target speed
-    if (
-        (fan_raw is None or (fan_raw == 0 and pwr))
-        and u_fan_raw is not None
-        and pwr
-    ):
-        # Use settings speed
-        fan = api_to_fan_speed(u_fan_raw)
-    else:
-        # Use condition speed (or None if missing)
-        fan = api_to_fan_speed(fan_raw) if fan_raw is not None else None
-
-    # Заслонка
-    damp = cond.get("damp_pos")
-    if damp is None and "u_damp_pos" in st:
-        damp = st.get("u_damp_pos")
-
-    # Цель температуры (деци-°C)
-    u_temp = cond.get("u_temp_room")
-    if u_temp is None and "u_temp_room" in st:
-        u_temp = st.get("u_temp_room")
-
-    # Увлажнение (ступень)
-    hum_stg = cond.get("hum_stg")
-    if hum_stg is None and "u_hum_stg" in st:
-        hum_stg = st.get("u_hum_stg")
-
-    # Текущие показания
-    hum_room = cond.get("hum_room")
-    temp_room = cond.get("temp_room")
-
-    out = dict(cond) if cond else {}
-    if pwr is not None:
-        out["pwr_on"] = bool(pwr)
-    if fan is not None:
-        try:
-            out["fan_speed"] = int(fan)
-        except (TypeError, ValueError):
-            pass
-
-    if damp is not None:
-        try:
-            out["damp_pos"] = int(damp)
-        except (TypeError, ValueError):
-            pass
-
-    if hum_stg is not None:
-        try:
-            out["hum_stg"] = int(hum_stg)
-        except (TypeError, ValueError):
-            pass
-
-    if u_temp is not None:
-        try:
-            out["u_temp_room"] = int(u_temp)
-        except (TypeError, ValueError):
-            pass
-
-    if isinstance(hum_room, (int, float)):
-        out["hum_room"] = int(hum_room)
-    if isinstance(temp_room, (int, float)):
-        out["temp_room"] = int(temp_room)
-
-    # meta - если API не вернул online, считаем что устройство оффлайн
-    # это важно для корректного отображения состояния при физическом включении
-    online = item.get("online")
-    if online is not None:
-        out["online"] = bool(online)
-    else:
-        # Если поле отсутствует, проверяем наличие свежих данных condition
-        # Если condition есть и свежий - устройство онлайн
-        has_condition = bool(cond and cond.get("time"))
-        out["online"] = has_condition
-    
-    return out
+def _resolve_update_interval_seconds(options: dict[str, Any]) -> int:
+    """Normalize update interval from options with a safe bounded range."""
+    try:
+        raw_interval = int(options.get(CONF_UPDATE_INTERVAL, DEFAULT_UPDATE_INTERVAL))
+    except (TypeError, ValueError):
+        raw_interval = DEFAULT_UPDATE_INTERVAL
+    return max(MIN_UPDATE_INTERVAL, min(MAX_UPDATE_INTERVAL, raw_interval))
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
@@ -296,8 +198,31 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         ) from err
 
     options = getattr(entry, "options", {}) or {}
-    raw_interval = int(options.get("update_interval", 30))
-    update_interval_seconds = max(10, min(300, raw_interval))
+    update_interval_seconds = _resolve_update_interval_seconds(options)
+    runtime_data: AtmeexRuntimeData | None = None
+
+    def _fire_logbook_event(event_type: str, data: dict[str, Any]) -> None:
+        """Fire integration event for logbook if HA bus is available."""
+        bus = getattr(hass, "bus", None)
+        if bus is None or not hasattr(bus, "async_fire"):
+            return
+        bus.async_fire(event_type, data)
+
+    # Throttle API-error logbook events to avoid flooding during outages.
+    _api_error_last_ts: float = float("-inf")
+    _api_error_suppressed: int = 0
+
+    def _fire_api_error_event(data: dict[str, Any]) -> None:
+        nonlocal _api_error_last_ts, _api_error_suppressed
+        now = time.monotonic()
+        if now - _api_error_last_ts < WS_LOGBOOK_MIN_INTERVAL_SEC:
+            _api_error_suppressed += 1
+            return
+        if _api_error_suppressed:
+            data = {**data, "suppressed_errors": _api_error_suppressed}
+            _api_error_suppressed = 0
+        _fire_logbook_event(EVENT_API_ERROR, data)
+        _api_error_last_ts = now
 
     coordinator: DataUpdateCoordinator[AtmeexCoordinatorData]
 
@@ -377,6 +302,13 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         except ApiError as err:
             setattr(coordinator, "last_api_error", err)
             status = getattr(err, "status", None)
+            _fire_api_error_event(
+                {
+                    "message": str(err),
+                    "status": status,
+                    "source": "coordinator_update",
+                }
+            )
             if status in (401, 403):
                 # токен протух / креды поменяли → re-auth
                 raise ConfigEntryAuthFailed(
@@ -387,6 +319,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             ) from err
         except Exception as err:
             setattr(coordinator, "last_api_error", None)
+            _fire_api_error_event(
+                {"message": str(err), "source": "coordinator_update"}
+            )
             raise UpdateFailed(
                 f"Unexpected error while updating Atmeex data: {err}"
             ) from err
@@ -454,9 +389,6 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         # успешный апдейт — обнуляем last error
         return data
 
-    options = getattr(entry, "options", {}) or {}
-    update_interval_seconds = int(options.get("update_interval", 30))
-
     coordinator = DataUpdateCoordinator(
         hass,
         _LOGGER,
@@ -470,262 +402,399 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     await coordinator.async_config_entry_first_refresh()
 
-     # ВАЖНО: если пользователь поменял options — перезагрузить entry
+    # ВАЖНО: если пользователь поменял options — перезагрузить entry
     entry.async_on_unload(entry.add_update_listener(_update_listener))
 
-    async def refresh_device(device_id: int | str) -> None:
-        """Дочитать одно устройство и обновить координатор (device_map + devices + states)."""
+    refresh_tasks: dict[str, asyncio.Task[None]] = {}
+    state_update_lock = asyncio.Lock()
+    websocket_message_queue: deque[dict[str, Any]] = deque()
+    # Mutable container avoids nonlocal and keeps runtime_data in sync automatically.
+    _ws_task_ref: dict[str, asyncio.Task[None] | None] = {"task": None}
+    ws_logbook_last_event_ts: float = float("-inf")
+    ws_logbook_suppressed_updates = 0
+
+    def _create_background_task(coro: Awaitable[None]) -> asyncio.Task[None]:
+        """Create background task via HA scheduler."""
+        return hass.async_create_task(coro)
+
+    def _fire_websocket_device_updated(
+        changed_device_ids: list[str],
+        msg_type: Any,
+    ) -> None:
+        """Fire throttled websocket device-updated event for logbook."""
+        nonlocal ws_logbook_last_event_ts, ws_logbook_suppressed_updates
+
+        if not changed_device_ids:
+            return
+
+        now = time.monotonic()
+        if now - ws_logbook_last_event_ts < WS_LOGBOOK_MIN_INTERVAL_SEC:
+            ws_logbook_suppressed_updates += len(changed_device_ids)
+            return
+
+        cur_map = (coordinator.data or {}).get("device_map", {})
+        device_names = [
+            cur_map[did].name
+            for did in changed_device_ids
+            if did in cur_map and hasattr(cur_map[did], "name")
+        ]
+        payload: dict[str, Any] = {
+            "device_ids": changed_device_ids,
+            "device_names": device_names or None,
+            "source": "websocket",
+            "message_type": msg_type,
+        }
+        if ws_logbook_suppressed_updates:
+            payload["suppressed_updates"] = ws_logbook_suppressed_updates
+            ws_logbook_suppressed_updates = 0
+
+        _fire_logbook_event(EVENT_DEVICE_UPDATED, payload)
+        ws_logbook_last_event_ts = now
+
+    async def _refresh_device_once(device_id: int | str) -> None:
+        """Fetch one device and merge it into coordinator state."""
         try:
             full: AtmeexDevice = await api.get_device(device_id)
         except ApiError as e:
             _LOGGER.warning("Failed to refresh device %s: %s", device_id, e)
+            _fire_api_error_event(
+                {
+                    "message": str(e),
+                    "status": getattr(e, "status", None),
+                    "source": "refresh_device",
+                    "device_id": str(device_id),
+                }
+            )
             return
         except Exception as e:  # noqa: BLE001
             _LOGGER.warning(
                 "Unexpected error in refresh_device(%s): %s", device_id, e)
+            _fire_api_error_event(
+                {
+                    "message": str(e),
+                    "source": "refresh_device",
+                    "device_id": str(device_id),
+                }
+            )
             return
-
-        # Текущее состояние координатора (fallback на пустую структуру)
-        cur: AtmeexCoordinatorData = coordinator.data or {
-            "devices": [],
-            "device_map": {},
-            "states": {},
-            "last_success_ts": None,
-            "avg_latency_ms": None,
-            "request_retries": 0,
-        }
-
-        devices_raw: list[dict[str, Any]] = list(cur.get("devices", []))
-        device_map: dict[str, AtmeexDevice] = dict(cur.get("device_map", {}))
-        states: dict[str, dict[str, Any]] = dict(cur.get("states", {}))
 
         # Ключ по id устройства
         key = str(full.id)
         payload = full.to_ha_dict()
 
-        # Обновляем device_map
-        device_map[key] = full
-
-        # Обновляем/добавляем запись в devices_raw (для обратной совместимости/диагностики)
-        for idx, d in enumerate(devices_raw):
-            if d.get("id") == full.id:
-                devices_raw[idx] = payload
-                break
-        else:
-            devices_raw.append(payload)
-
         # Пересчитываем нормализованное состояние
+        normalized_state: dict[str, Any] | None = None
         try:
             st = AtmeexState.from_device_dict(payload)
-            states[key] = st.to_ha_dict()
+            normalized_state = st.to_ha_dict()
         except Exception as e:  # noqa: BLE001
             _LOGGER.warning("Failed to normalize refreshed state for %s: %s", device_id, e)
 
-        # Применяем обновление к координатору, диагностические поля не трогаем
-        coordinator.async_set_updated_data(
-            {
-                "devices": devices_raw,
-                "device_map": device_map,
-                "states": states,
-                "last_success_ts": cur.get("last_success_ts"),
-                "avg_latency_ms": cur.get("avg_latency_ms"),
-                "request_retries": cur.get("request_retries", 0),
+        # Serialize coordinator writes to avoid lost updates vs websocket updates.
+        async with state_update_lock:
+            # Текущее состояние координатора (fallback на пустую структуру)
+            cur: AtmeexCoordinatorData = coordinator.data or {
+                "devices": [],
+                "device_map": {},
+                "states": {},
+                "last_success_ts": None,
+                "avg_latency_ms": None,
+                "request_retries": 0,
             }
-        )
 
-    # Initialize WebSocket manager if enabled
-    websocket_manager = None
-    enable_websocket = options.get(CONF_ENABLE_WEBSOCKET, DEFAULT_ENABLE_WEBSOCKET)
-    
-    # Function to update coordinator directly from WebSocket data (no HTTP request)
-    def update_device_from_websocket(device_id: int | str, condition_data: dict[str, Any]) -> None:
-        """Update coordinator directly from WebSocket condition data.
-        
-        This avoids the race condition where HTTP refresh returns stale data.
-        """
-        key = str(device_id)
-        
-        # Get current coordinator data
-        cur: AtmeexCoordinatorData = coordinator.data or {
-            "devices": [],
-            "device_map": {},
-            "states": {},
-            "last_success_ts": None,
-            "avg_latency_ms": None,
-            "request_retries": 0,
-        }
-        
-        device_map: dict[str, AtmeexDevice] = dict(cur.get("device_map", {}))
-        states: dict[str, dict[str, Any]] = dict(cur.get("states", {}))
-        
-        # Get existing device from map
-        existing_device = device_map.get(key)
-        if not existing_device:
-            _LOGGER.debug("WebSocket: Device %s not in device_map, skipping direct update", device_id)
-            return
-        
-        # Get existing state
-        existing_state = states.get(key, {})
-        
-        # Merge WebSocket condition data with existing state
-        # WebSocket sends condition data, we need to update the state
-        merged_state = dict(existing_state)
-        
-        # Update fields from WebSocket condition
-        for field in ["pwr_on", "fan_speed", "temp_room", "temp_in", "hum_room", 
-                      "co2_ppm", "no_water", "damp_pos", "hum_stg", "time"]:
-            if field in condition_data:
-                merged_state[field] = condition_data[field]
-        
-        # Convert condition.fan_speed from API (0-6) to HA (1-7) directly
-        # Don't use _normalize_device_state as it expects raw API values in settings
-        from .helpers import api_to_fan_speed
-        
-        normalized = dict(existing_state)
-        
-        # Update pwr_on from condition
-        if "pwr_on" in condition_data:
-            normalized["pwr_on"] = to_bool(condition_data["pwr_on"])
-        
-        # Update fan_speed - convert from API (0-6) to HA (1-7)
-        if "fan_speed" in condition_data:
-            api_fan = condition_data["fan_speed"]
-            ha_fan = api_to_fan_speed(api_fan)
-            normalized["fan_speed"] = ha_fan
-            _LOGGER.debug(
-                "WebSocket fan_speed conversion: API=%s -> HA=%s",
-                api_fan, ha_fan
+            devices_raw: list[dict[str, Any]] = list(cur.get("devices", []))
+            device_map: dict[str, AtmeexDevice] = dict(cur.get("device_map", {}))
+            states: dict[str, dict[str, Any]] = dict(cur.get("states", {}))
+
+            # Обновляем device_map
+            device_map[key] = full
+
+            # Обновляем/добавляем запись в devices_raw (для обратной совместимости/диагностики)
+            for idx, d in enumerate(devices_raw):
+                if d.get("id") == full.id:
+                    devices_raw[idx] = payload
+                    break
+            else:
+                devices_raw.append(payload)
+
+            if normalized_state is not None:
+                states[key] = normalized_state
+
+            # Применяем обновление к координатору, диагностические поля не трогаем
+            coordinator.async_set_updated_data(
+                {
+                    "devices": devices_raw,
+                    "device_map": device_map,
+                    "states": states,
+                    "last_success_ts": cur.get("last_success_ts"),
+                    "avg_latency_ms": cur.get("avg_latency_ms"),
+                    "request_retries": cur.get("request_retries", 0),
+                }
             )
-        
-        # Update other fields directly (no conversion needed)
-        for field in ["temp_room", "temp_in", "hum_room", "co2_ppm", 
-                      "no_water", "damp_pos", "hum_stg", "time"]:
+            device_name = full.name if hasattr(full, "name") else None
+            _fire_logbook_event(
+                EVENT_DEVICE_UPDATED,
+                {"device_id": key, "device_name": device_name, "source": "refresh_device"},
+            )
+
+    async def refresh_device(device_id: int | str) -> None:
+        """Refresh one device with per-device request coalescing."""
+        key = str(device_id)
+
+        in_flight = refresh_tasks.get(key)
+        if in_flight and not in_flight.done():
+            _LOGGER.debug(
+                "Refresh for device %s is already running; awaiting existing task",
+                device_id,
+            )
+            await in_flight
+            return
+
+        task = asyncio.create_task(_refresh_device_once(device_id))
+        refresh_tasks[key] = task
+        try:
+            await task
+        finally:
+            if refresh_tasks.get(key) is task:
+                refresh_tasks.pop(key, None)
+
+    websocket_manager = None
+    websocket_start_task: asyncio.Task[None] | None = None
+    enable_websocket = bool(options.get(CONF_ENABLE_WEBSOCKET, DEFAULT_ENABLE_WEBSOCKET))
+
+    def _to_int(value: Any) -> int | None:
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return None
+
+    def _apply_condition_update(
+        state: dict[str, Any], condition_data: dict[str, Any]
+    ) -> dict[str, Any]:
+        updated = dict(state)
+
+        if "pwr_on" in condition_data:
+            updated["pwr_on"] = to_bool(condition_data["pwr_on"])
+
+        if "fan_speed" in condition_data:
+            updated["fan_speed"] = api_to_fan_speed(condition_data["fan_speed"])
+
+        for field in ("temp_room", "temp_in", "hum_room", "co2_ppm", "damp_pos", "hum_stg"):
             if field in condition_data:
-                normalized[field] = condition_data[field]
-        
-        # Preserve fields not in condition
-        for field in ["u_temp_room", "u_fan_speed"]:
-            if field in existing_state and field not in normalized:
-                normalized[field] = existing_state[field]
-        
-        # Update online status - if we received condition data via WebSocket, device is online
-        normalized["online"] = bool(condition_data.get("time"))
-        
-        # Update states
-        states[key] = normalized
-        
-        _LOGGER.debug(
-            "WebSocket direct update for device %s: fan_speed=%s, pwr_on=%s",
-            device_id, normalized.get("fan_speed"), normalized.get("pwr_on")
-        )
-        
-        # Apply update to coordinator
-        coordinator.async_set_updated_data(
-            {
-                "devices": cur.get("devices", []),
-                "device_map": device_map,
-                "states": states,
-                "last_success_ts": cur.get("last_success_ts"),
-                "avg_latency_ms": cur.get("avg_latency_ms"),
-                "request_retries": cur.get("request_retries", 0),
+                parsed = _to_int(condition_data[field])
+                if parsed is not None:
+                    updated[field] = parsed
+
+        if "no_water" in condition_data:
+            updated["no_water"] = to_bool(condition_data["no_water"])
+
+        if "time" in condition_data:
+            updated["time"] = condition_data["time"]
+
+        # Any received WS condition means device connection is alive right now.
+        updated["online"] = True
+        return updated
+
+    def _apply_settings_update(
+        state: dict[str, Any], settings_data: dict[str, Any]
+    ) -> dict[str, Any]:
+        updated = dict(state)
+
+        if "u_pwr_on" in settings_data:
+            updated["pwr_on"] = to_bool(settings_data["u_pwr_on"])
+
+        if "u_fan_speed" in settings_data:
+            normalized_speed = api_to_fan_speed(settings_data["u_fan_speed"])
+            updated["u_fan_speed"] = normalized_speed
+            # Sync fan_speed (condition) only when device is on to avoid reporting
+            # a non-zero speed while the device is actually off.
+            if updated.get("pwr_on"):
+                updated["fan_speed"] = normalized_speed
+
+        if "u_temp_room" in settings_data:
+            parsed = _to_int(settings_data["u_temp_room"])
+            if parsed is not None:
+                updated["u_temp_room"] = parsed
+
+        if "u_hum_stg" in settings_data:
+            parsed = _to_int(settings_data["u_hum_stg"])
+            if parsed is not None:
+                updated["hum_stg"] = parsed
+
+        if "u_damp_pos" in settings_data:
+            parsed = _to_int(settings_data["u_damp_pos"])
+            if parsed is not None:
+                updated["damp_pos"] = parsed
+
+        updated["online"] = True
+        return updated
+
+    async def _apply_websocket_message(message: dict[str, Any]) -> None:
+        msg_type = message.get("type")
+        if msg_type not in ("condition", "settings"):
+            _LOGGER.debug("WebSocket message type '%s' ignored", msg_type)
+            return
+
+        payload = message.get("data")
+        if not isinstance(payload, list):
+            _LOGGER.warning("WebSocket message has unexpected data format: %s", payload)
+            return
+
+        async with state_update_lock:
+            cur: AtmeexCoordinatorData = coordinator.data or {
+                "devices": [],
+                "device_map": {},
+                "states": {},
+                "last_success_ts": None,
+                "avg_latency_ms": None,
+                "request_retries": 0,
             }
-        )
-    
+            device_map = cur.get("device_map", {}) or {}
+            if not device_map:
+                return
+
+            states: dict[str, dict[str, Any]] = dict(cur.get("states", {}))
+            changed = False
+            changed_device_ids: list[str] = []
+
+            for device_data in payload:
+                if not isinstance(device_data, dict):
+                    continue
+
+                device_id = device_data.get("id")
+                if device_id is None:
+                    continue
+
+                key = str(device_id)
+                if key not in device_map:
+                    _LOGGER.debug(
+                        "WebSocket: device %s not in current map, skipping message",
+                        device_id,
+                    )
+                    continue
+
+                if msg_type == "condition":
+                    source = device_data.get("condition")
+                    if not isinstance(source, dict) or not source:
+                        continue
+                    updated_state = _apply_condition_update(states.get(key, {}), source)
+                else:
+                    source = device_data.get("settings")
+                    if not isinstance(source, dict) or not source:
+                        continue
+                    updated_state = _apply_settings_update(states.get(key, {}), source)
+
+                if updated_state != states.get(key, {}):
+                    states[key] = updated_state
+                    changed = True
+                    changed_device_ids.append(key)
+
+            if not changed:
+                return
+
+            coordinator.async_set_updated_data(
+                {
+                    "devices": cur.get("devices", []),
+                    "device_map": dict(device_map),
+                    "states": states,
+                    "last_success_ts": cur.get("last_success_ts"),
+                    "avg_latency_ms": cur.get("avg_latency_ms"),
+                    "request_retries": cur.get("request_retries", 0),
+                }
+            )
+            _fire_websocket_device_updated(changed_device_ids, msg_type)
+
     if enable_websocket:
         try:
             from .websocket import WebSocketManager
-            
+
+            async def _drain_websocket_messages() -> None:
+                """Process queued websocket messages in order using one task."""
+                try:
+                    while websocket_message_queue:
+                        message = websocket_message_queue.popleft()
+                        try:
+                            await _apply_websocket_message(message)
+                        except Exception as err:  # noqa: BLE001
+                            _LOGGER.error("Error processing WebSocket message: %s", err)
+                finally:
+                    _ws_task_ref["task"] = None
+                    if runtime_data is not None:
+                        runtime_data.websocket_message_task = None
+
             def on_websocket_message(message: dict[str, Any]) -> None:
-                """Handle WebSocket message and update coordinator directly.
-                
-                Message format from Atmeex WebSocket:
-                {
-                    "type": "condition",
-                    "data": [
-                        {
-                            "id": 13555,
-                            "condition": {...},
-                            "mac": "..."
-                        },
-                        ...
-                    ]
-                }
-                
-                We update the coordinator directly from WebSocket data to avoid
-                race conditions with stale HTTP responses.
-                """
+                """Queue websocket message for serialized coordinator updates."""
+                websocket_message_queue.append(message)
+                task = _ws_task_ref["task"]
+                if task and not task.done():
+                    return
+                new_task = _create_background_task(_drain_websocket_messages())
+                _ws_task_ref["task"] = new_task
+                if runtime_data is not None:
+                    runtime_data.websocket_message_task = new_task
+
+            ws_reauth_started = False
+
+            def _on_ws_auth_failure() -> None:
+                """Start config-entry reauth when WS token becomes invalid."""
+                nonlocal ws_reauth_started
+                if ws_reauth_started:
+                    return
+                ws_reauth_started = True
+
+                _LOGGER.warning(
+                    "WebSocket auth rejected; starting config-entry reauth flow"
+                )
+
+                start_reauth = getattr(entry, "async_start_reauth", None)
+                if not callable(start_reauth):
+                    _LOGGER.error(
+                        "Config entry has no async_start_reauth; WS auth failure cannot trigger reauth"
+                    )
+                    return
+
                 try:
-                    msg_type = message.get("type")
-                    
-                    if msg_type == "condition":
-                        # Device state update - apply directly without HTTP request
-                        data = message.get("data", [])
-                        if isinstance(data, list):
-                            for device_data in data:
-                                device_id = device_data.get("id")
-                                condition = device_data.get("condition", {})
-                                if device_id and condition:
-                                    _LOGGER.debug("WebSocket update for device %s", device_id)
-                                    # Update coordinator directly from WebSocket data
-                                    update_device_from_websocket(device_id, condition)
+                    start_reauth(hass)
+                except Exception as err:  # noqa: BLE001
+                    _LOGGER.error(
+                        "Failed to start reauth after WebSocket auth failure: %s",
+                        err,
+                    )
+
+            if not hasattr(session, "ws_connect"):
+                _LOGGER.warning("WebSocket skipped: HTTP session has no ws_connect()")
+                websocket_manager = None
+            elif not api.token:
+                _LOGGER.warning("WebSocket skipped: API token is unavailable")
+                websocket_manager = None
+            else:
+                websocket_manager = WebSocketManager(
+                    session=session,
+                    token_getter=lambda: api.token,
+                    on_message=on_websocket_message,
+                    on_auth_failure=_on_ws_auth_failure,
+                )
+
+                async def _start_websocket() -> None:
+                    try:
+                        success = await websocket_manager.connect()
+                        if success:
+                            _LOGGER.info("WebSocket connected for real-time updates")
                         else:
-                            _LOGGER.warning("WebSocket message has unexpected data format: %s", data)
-                    elif msg_type == "settings":
-                        # Settings update - also apply directly
-                        data = message.get("data", [])
-                        if isinstance(data, list):
-                            for device_data in data:
-                                device_id = device_data.get("id")
-                                settings = device_data.get("settings", {})
-                                if device_id and settings:
-                                    _LOGGER.debug("WebSocket settings update for device %s: %s", device_id, settings)
-                                    # For settings, we need to refresh to get full state
-                                    # But we can update u_fan_speed directly
-                                    key = str(device_id)
-                                    cur = coordinator.data or {}
-                                    states = dict(cur.get("states", {}))
-                                    if key in states:
-                                        state = dict(states[key])
-                                        if "u_fan_speed" in settings:
-                                            # Convert API speed to HA speed
-                                            from .helpers import api_to_fan_speed
-                                            state["u_fan_speed"] = api_to_fan_speed(settings["u_fan_speed"])
-                                        if "u_pwr_on" in settings:
-                                            state["pwr_on"] = to_bool(settings["u_pwr_on"])
-                                        states[key] = state
-                                        coordinator.async_set_updated_data({
-                                            **cur,
-                                            "states": states,
-                                        })
-                    else:
-                        _LOGGER.debug("WebSocket message type '%s' ignored", msg_type)
-                        
-                except Exception as err:
-                    _LOGGER.error("Error processing WebSocket message: %s", err)
-            
-            websocket_manager = WebSocketManager(
-                session=session,
-                token=api._token,
-                on_message=on_websocket_message,
-            )
-            
-            # Try to connect WebSocket (non-blocking)
-            async def _start_websocket():
-                try:
-                    success = await websocket_manager.connect()
-                    if success:
-                        _LOGGER.info("WebSocket connected for real-time updates")
-                    else:
-                        _LOGGER.warning("WebSocket connection failed, using HTTP polling only")
-                except Exception as err:
-                    _LOGGER.warning("Failed to start WebSocket: %s. Using HTTP polling only.", err)
-            
-            # Start WebSocket in background
-            hass.async_create_task(_start_websocket())
-            
+                            _LOGGER.warning(
+                                "WebSocket bootstrap failed, reconnect loop will continue in background"
+                            )
+                    except Exception as err:  # noqa: BLE001
+                        _LOGGER.warning(
+                            "Failed to start WebSocket: %s. Using HTTP polling only.",
+                            err,
+                        )
+
+                websocket_start_task = _create_background_task(_start_websocket())
+
         except ImportError:
             _LOGGER.warning("WebSocket module not available, using HTTP polling only")
-        except Exception as err:
+        except Exception as err:  # noqa: BLE001
             _LOGGER.warning("Failed to initialize WebSocket: %s. Using HTTP polling only.", err)
     else:
         _LOGGER.info("WebSocket disabled in options, using HTTP polling only")
@@ -735,6 +804,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         coordinator=coordinator,
         refresh_device=refresh_device,
         websocket_manager=websocket_manager,
+        websocket_start_task=websocket_start_task,
     )
     entry.runtime_data = runtime_data
 
@@ -744,8 +814,25 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Unload Atmeex Cloud config entry."""
-    # Disconnect WebSocket if active
     runtime: AtmeexRuntimeData = entry.runtime_data
+
+    message_task = getattr(runtime, "websocket_message_task", None)
+    if message_task and not message_task.done():
+        message_task.cancel()
+        try:
+            await message_task
+        except asyncio.CancelledError:
+            pass
+
+    start_task = getattr(runtime, "websocket_start_task", None)
+    if start_task and not start_task.done():
+        start_task.cancel()
+        try:
+            await start_task
+        except asyncio.CancelledError:
+            pass
+
+    # Disconnect WebSocket if active
     if runtime and runtime.websocket_manager:
         try:
             await runtime.websocket_manager.disconnect()

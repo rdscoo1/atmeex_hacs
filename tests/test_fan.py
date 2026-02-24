@@ -1,9 +1,10 @@
 import pytest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
+from homeassistant.exceptions import HomeAssistantError
 
 from custom_components.atmeex_cloud.fan import AtmeexFanEntity
-from custom_components.atmeex_cloud.api import AtmeexDevice
+from custom_components.atmeex_cloud.api import ApiError, AtmeexDevice
 
 
 def _make_fan_entity():
@@ -19,6 +20,7 @@ def _make_fan_entity():
     )
     api = MagicMock()
     api.set_fan_speed = AsyncMock()
+    api.set_power = AsyncMock()
 
     dev = AtmeexDevice.from_raw(
         {"id": 1, "name": "Dev1", "model": "m", "online": True}
@@ -49,4 +51,24 @@ async def test_fan_async_set_percentage():
     await fan.async_set_percentage(75)
 
     api.set_fan_speed.assert_awaited_once_with(1, 5)
+    coord.async_request_refresh.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_fan_async_set_percentage_raises_homeassistant_error_on_api_failure():
+    fan, cond, api, coord = _make_fan_entity()
+    api.set_fan_speed.side_effect = ApiError("boom", status=500)
+
+    with pytest.raises(HomeAssistantError, match="Failed to set fan speed"):
+        await fan.async_set_percentage(75)
+
+
+@pytest.mark.asyncio
+async def test_fan_async_turn_off_uses_set_power():
+    fan, cond, api, coord = _make_fan_entity()
+
+    await fan.async_turn_off()
+
+    api.set_power.assert_awaited_once_with(1, False)
+    api.set_fan_speed.assert_not_awaited()
     coord.async_request_refresh.assert_awaited_once()

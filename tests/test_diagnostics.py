@@ -47,6 +47,7 @@ async def test_config_entry_diagnostics(hass):
         api=api,
         coordinator=coordinator,
         refresh_device=_refresh,
+        websocket_manager=SimpleNamespace(is_connected=True, last_message_age=3.21),
     )
     entry.runtime_data = runtime
 
@@ -55,6 +56,10 @@ async def test_config_entry_diagnostics(hass):
     assert diag["entry"]["title"] == entry.title
     # убеждаемся, что структура данных координатора протащилась
     assert diag["coordinator"]["data"]["devices"][0]["id"] == 1
+    assert diag["websocket"]["configured"] is True
+    assert diag["websocket"]["manager_initialized"] is True
+    assert diag["websocket"]["is_connected"] is True
+    assert diag["websocket"]["last_message_age_sec"] == 3.2
     # и что секреты (email/password) отредактированы
     assert diag["entry"]["data"][CONF_EMAIL] != "user@example.com"
     assert diag["entry"]["data"][CONF_PASSWORD] != "secret"
@@ -108,5 +113,9 @@ async def test_device_diagnostics(hass):
 
     assert diag["device"]["internal_id"] == "1"
     assert diag["device"]["state"]["pwr_on"] is True
+    assert diag["websocket"]["configured"] is True
+    assert diag["websocket"]["manager_initialized"] is False
+    assert diag["websocket"]["is_connected"] is False
+    assert diag["websocket"]["last_message_age_sec"] is None
     # и secret-ы также редактируются
     assert diag["entry"]["data"][CONF_EMAIL] != "user@example.com"

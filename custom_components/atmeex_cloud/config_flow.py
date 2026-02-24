@@ -33,6 +33,16 @@ DATA_SCHEMA = vol.Schema(
 )
 
 
+def _clean_email(email: str) -> str:
+    """Normalize user input for storage/login."""
+    return email.strip()
+
+
+def _email_unique_id(email: str) -> str:
+    """Normalize email for stable unique_id checks."""
+    return _clean_email(email).casefold()
+
+
 class AtmeexConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     """Config flow для интеграции Atmeex Cloud."""
 
@@ -53,6 +63,8 @@ class AtmeexConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         errors: dict[str, str] = {}
 
         if user_input is not None:
+            email = _clean_email(user_input[CONF_EMAIL])
+            password = user_input[CONF_PASSWORD]
             session = async_get_clientsession(self.hass)
             api = AtmeexApi(session)
 
@@ -62,20 +74,23 @@ class AtmeexConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 
             try:
                 # 1. Проверяем логин/пароль и получаем токен.
-                await api.login(user_input[CONF_EMAIL], user_input[CONF_PASSWORD])
+                await api.login(email, password)
 
                 # 2. Делаем небольшой sanity-check: хотя бы один успешный вызов API.
                 await api.get_devices()
 
                 # 3. Делаем email уникальным идентификатором конфигурации,
                 #    чтобы не создавать дубликаты интеграции для одного и того же аккаунта.
-                await self.async_set_unique_id(user_input[CONF_EMAIL])
+                await self.async_set_unique_id(_email_unique_id(email))
                 self._abort_if_unique_id_configured()
 
                 # 4. Создаём конфигурационную запись.
                 return self.async_create_entry(
-                    title=user_input[CONF_EMAIL],
-                    data=user_input,
+                    title=email,
+                    data={
+                        CONF_EMAIL: email,
+                        CONF_PASSWORD: password,
+                    },
                 )
 
             except ApiError as err:
@@ -112,6 +127,8 @@ class AtmeexConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         errors: dict[str, str] = {}
 
         if user_input is not None:
+            email = _clean_email(user_input[CONF_EMAIL])
+            password = user_input[CONF_PASSWORD]
             session = async_get_clientsession(self.hass)
             api = AtmeexApi(session)
 
@@ -119,23 +136,21 @@ class AtmeexConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 await api.async_init()
 
             try:
-                await api.login(user_input[CONF_EMAIL], user_input[CONF_PASSWORD])
+                await api.login(email, password)
                 await api.get_devices()
 
-                # Update the existing config entry with new credentials
                 if self._reauth_entry:
-                    self.hass.config_entries.async_update_entry(
+                    await self.async_set_unique_id(_email_unique_id(email))
+                    self._abort_if_unique_id_mismatch()
+
+                    return self.async_update_reload_and_abort(
                         self._reauth_entry,
-                        data={
-                            **self._reauth_entry.data,
-                            CONF_EMAIL: user_input[CONF_EMAIL],
-                            CONF_PASSWORD: user_input[CONF_PASSWORD],
+                        data_updates={
+                            CONF_EMAIL: email,
+                            CONF_PASSWORD: password,
                         },
+                        reason="reauth_successful",
                     )
-                    await self.hass.config_entries.async_reload(
-                        self._reauth_entry.entry_id
-                    )
-                    return self.async_abort(reason="reauth_successful")
 
                 return self.async_abort(reason="reauth_successful")
 
@@ -174,7 +189,10 @@ class AtmeexOptionsFlowHandler(config_entries.OptionsFlow):
 
     async def async_step_init(self, user_input=None) -> FlowResult:
         if user_input is not None:
-            interval = int(user_input[CONF_UPDATE_INTERVAL])
+            try:
+                interval = int(user_input[CONF_UPDATE_INTERVAL])
+            except (TypeError, ValueError):
+                interval = DEFAULT_UPDATE_INTERVAL
             interval = max(MIN_UPDATE_INTERVAL, min(MAX_UPDATE_INTERVAL, interval))
             enable_ws = user_input.get(CONF_ENABLE_WEBSOCKET, DEFAULT_ENABLE_WEBSOCKET)
             

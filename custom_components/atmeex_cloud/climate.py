@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import time
 from datetime import datetime, timezone
 import logging
 from typing import Any, Callable, Awaitable
@@ -15,20 +14,22 @@ from homeassistant.components.climate import (
 from homeassistant.const import (
     UnitOfTemperature,
     ATTR_TEMPERATURE,
-    PRECISION_WHOLE,
+    PRECISION_HALVES,
 )
 from homeassistant.components.climate.const import (
     PRESET_NONE,
     PRESET_BOOST,
     PRESET_SLEEP,
 )
+import voluptuous as vol
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
+from homeassistant.helpers.entity_platform import async_get_current_platform
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 from homeassistant.exceptions import HomeAssistantError
 from .api import ApiError, AtmeexDevice
 
-from .const import DOMAIN, BREEZER_MODES
+from .const import BREEZER_MODES
 from . import AtmeexRuntimeData
 
 _LOGGER = logging.getLogger(__name__)
@@ -73,6 +74,18 @@ async def async_setup_entry(
     if entities:
         async_add_entities(entities)
 
+    platform = async_get_current_platform()
+    platform.async_register_entity_service(
+        "set_breezer_mode",
+        {vol.Required("mode"): vol.In(BREEZER_MODES)},
+        "async_set_breezer_mode",
+    )
+    platform.async_register_entity_service(
+        "set_humidifier_stage",
+        {vol.Required("stage"): vol.All(vol.Coerce(int), vol.Range(min=0, max=3))},
+        "async_set_humidifier_stage",
+    )
+
 
 class AtmeexClimateEntity(AtmeexEntityMixin, CoordinatorEntity, ClimateEntity):
     """Климатическая сущность для бризера Atmeex.
@@ -80,20 +93,13 @@ class AtmeexClimateEntity(AtmeexEntityMixin, CoordinatorEntity, ClimateEntity):
     Управляет:
     * целевой температурой;
     * скоростью вентилятора (1..7);
-    * режимом заслонки (swing / brizer mode);
+    * режимом заслонки (swing / breezer mode);
     * целевой влажностью (если есть увлажнитель).
     """
 
-    # Базовый набор возможностей (без учёта увлажнителя)
-    _base_supported = (
-        ClimateEntityFeature.TARGET_TEMPERATURE
-        | ClimateEntityFeature.FAN_MODE
-        | ClimateEntityFeature.SWING_MODE
-    )
-
     _attr_hvac_modes = [HVACMode.FAN_ONLY, HVACMode.OFF]
     _attr_temperature_unit = UnitOfTemperature.CELSIUS
-    _attr_precision = PRECISION_WHOLE
+    _attr_precision = PRECISION_HALVES
     _attr_target_temperature_step = 0.5
     _attr_min_temp = 10
     _attr_max_temp = 30
@@ -125,7 +131,6 @@ class AtmeexClimateEntity(AtmeexEntityMixin, CoordinatorEntity, ClimateEntity):
         self._attr_name = device.name
         self._attr_unique_id = f"{device.id}_climate"
         self._saved_fan_mode: str | None = None
-        self._saved_target_temp: float | None = None
         self._is_boost = False
 
     # ---------- вспомогательные свойства ----------
@@ -135,17 +140,6 @@ class AtmeexClimateEntity(AtmeexEntityMixin, CoordinatorEntity, ClimateEntity):
         stg = self._device_state.get("hum_stg")
         return isinstance(stg, (int, float)) or ("hum_stg" in self._device_state)
 
-    async def _refresh(self) -> None:
-        """Запросить актуальные данные по одному устройству через refresh_device.
-
-        В проде refresh_device приходит из runtime_data и ходит в API.
-        В тестах этот метод часто заменяется на AsyncMock().
-        """
-        if callable(self._refresh_device_cb):
-            await self._refresh_device_cb(self._device_id)
-        else:
-            await self.coordinator.async_request_refresh()
-        
     @property
     def boost_fan_mode(self) -> str:
         return FAN_MODES[-1]  # "7"
@@ -153,13 +147,6 @@ class AtmeexClimateEntity(AtmeexEntityMixin, CoordinatorEntity, ClimateEntity):
     @property
     def sleep_max_fan_mode(self) -> str:
         return "2"
-
-    # ---------- доступность сущности ----------
-
-    @property
-    def available(self) -> bool:
-        """Считать сущность доступной, если устройство online."""
-        return bool(self._device_state.get("online", False))
 
     # ---------- поддерживаемые возможности ----------
 
@@ -184,29 +171,19 @@ class AtmeexClimateEntity(AtmeexEntityMixin, CoordinatorEntity, ClimateEntity):
         Uses pending command value if a recent command was sent and not yet
         confirmed by the device, to prevent UI regression.
         """
-        confirmed_pwr = self._device_state.get("pwr_on")
-        
-        # Check if there's a pending pwr_on command that should take precedence
-        if self._runtime is not None:
-            pending = self._runtime.get_pending(self._device_id, "pwr_on")
-            if pending is not None:
-                age = time.monotonic() - pending.timestamp
-                if age <= PENDING_COMMAND_TTL:
-                    # Use pending value if not expired and not yet confirmed
-                    if pending.value != confirmed_pwr:
-                        _LOGGER.debug(
-                            "Climate: Using pending pwr_on=%s instead of confirmed=%s (age=%.1fs)",
-                            pending.value, confirmed_pwr, age
-                        )
-                        return HVACMode.FAN_ONLY if pending.value else HVACMode.OFF
-                    else:
-                        # Device confirmed our value, clear pending
-                        self._runtime.clear_pending(self._device_id, "pwr_on")
-                else:
-                    # Pending expired, clear it
-                    self._runtime.clear_pending(self._device_id, "pwr_on")
-        
-        return HVACMode.FAN_ONLY if bool(confirmed_pwr) else HVACMode.OFF
+        confirmed_pwr = bool(self._device_state.get("pwr_on"))
+        effective_pwr = self._state_with_pending(
+            "pwr_on",
+            confirmed_pwr,
+            tolerance=PENDING_COMMAND_TTL,
+        )
+        if effective_pwr != confirmed_pwr:
+            _LOGGER.debug(
+                "Climate: using pending pwr_on=%s instead of confirmed=%s",
+                effective_pwr,
+                confirmed_pwr,
+            )
+        return HVACMode.FAN_ONLY if bool(effective_pwr) else HVACMode.OFF
 
     async def async_set_hvac_mode(self, hvac_mode: HVACMode) -> None:
         """Включить/выключить устройство по смене режима HVAC.
@@ -347,34 +324,26 @@ class AtmeexClimateEntity(AtmeexEntityMixin, CoordinatorEntity, ClimateEntity):
         Uses pending command value if a recent command was sent and not yet
         confirmed by the device, to prevent UI regression during rapid changes.
         """
-        confirmed_speed = self._device_state.get("fan_speed")
-        
-        # Check if there's a pending fan_speed command that should take precedence
-        if self._runtime is not None:
-            pending = self._runtime.get_pending(self._device_id, "fan_speed")
-            if pending is not None:
-                age = time.monotonic() - pending.timestamp
-                if age <= PENDING_COMMAND_TTL:
-                    # Use pending value if not expired and not yet confirmed
-                    if pending.value != confirmed_speed:
-                        _LOGGER.debug(
-                            "Climate: Using pending fan_speed=%s instead of confirmed=%s (age=%.1fs)",
-                            pending.value, confirmed_speed, age
-                        )
-                        speed = pending.value
-                        if isinstance(speed, (int, float)):
-                            speed = int(speed)
-                        return str(speed) if speed in range(1, 8) else None
-                    else:
-                        # Device confirmed our value, clear pending
-                        self._runtime.clear_pending(self._device_id, "fan_speed")
-                else:
-                    # Pending expired, clear it
-                    self._runtime.clear_pending(self._device_id, "fan_speed")
-        
-        if isinstance(confirmed_speed, (int, float)):
-            confirmed_speed = int(confirmed_speed)
-        return str(confirmed_speed) if confirmed_speed in range(1, 8) else None
+        confirmed_speed_raw = self._device_state.get("fan_speed")
+        confirmed_speed = int(confirmed_speed_raw) if isinstance(
+            confirmed_speed_raw, (int, float)
+        ) else None
+        effective_speed = self._state_with_pending(
+            "fan_speed",
+            confirmed_speed,
+            tolerance=PENDING_COMMAND_TTL,
+        )
+        if effective_speed != confirmed_speed:
+            _LOGGER.debug(
+                "Climate: using pending speed=%s instead of confirmed=%s",
+                effective_speed,
+                confirmed_speed,
+            )
+
+        if isinstance(effective_speed, (int, float)):
+            speed = int(effective_speed)
+            return str(speed) if speed in range(1, 8) else None
+        return None
 
     async def async_set_fan_mode(self, fan_mode: str) -> None:
         """Установить скорость вентилятора по выбранному режиму.
@@ -449,6 +418,21 @@ class AtmeexClimateEntity(AtmeexEntityMixin, CoordinatorEntity, ClimateEntity):
                 "Failed to set swing mode for %s: %s", self._device_id, err
             )
             raise HomeAssistantError("Failed to set swing mode") from err
+        await self._refresh()
+
+    async def async_set_breezer_mode(self, mode: str) -> None:
+        """Service handler: set damper/breezer mode by name."""
+        await self.async_set_swing_mode(mode)
+
+    async def async_set_humidifier_stage(self, stage: int) -> None:
+        """Service handler: set humidifier stage directly (0=off, 1-3)."""
+        if not self._has_humidifier():
+            return
+        stage = max(0, min(3, int(stage)))
+        try:
+            await self.api.set_humid_stage(self._device_id, stage)
+        except ApiError as err:
+            raise HomeAssistantError("Failed to set humidifier stage") from err
         await self._refresh()
 
     # ---------- установка пресетов ----------

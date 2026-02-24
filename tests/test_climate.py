@@ -1,18 +1,23 @@
+import time
 import pytest
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 from homeassistant.components.climate import ClimateEntityFeature, HVACMode
+from homeassistant.components.climate.const import PRESET_BOOST, PRESET_NONE, PRESET_SLEEP
 from homeassistant.const import ATTR_TEMPERATURE
+from homeassistant.exceptions import HomeAssistantError
 from typing import Any
 
+from custom_components.atmeex_cloud import AtmeexRuntimeData, PendingCommand
+from custom_components.atmeex_cloud.api import ApiError
 from custom_components.atmeex_cloud.climate import (
     AtmeexClimateEntity,
     quantize_humidity,
     HUM_ALLOWED,
     BREEZER_SWING_MODES,
 )
-from custom_components.atmeex_cloud.const import DOMAIN
+from custom_components.atmeex_cloud.const import DOMAIN, BREEZER_MODES
 from custom_components.atmeex_cloud.api import AtmeexDevice
 
 
@@ -87,6 +92,18 @@ def _make_entity(overrides: dict[str, Any] | None = None):
     return ent, cond, api
 
 
+def _make_entity_with_runtime(overrides: dict[str, Any] | None = None):
+    ent, cond, api = _make_entity(overrides)
+    runtime = AtmeexRuntimeData(
+        api=api,
+        coordinator=ent.coordinator,
+        refresh_device=AsyncMock(),
+    )
+    ent._runtime = runtime
+    ent._refresh_device_cb = runtime.refresh_device
+    return ent, cond, api, runtime
+
+
 def test_climate_basic_properties():
     ent, cond, api = _make_entity()
 
@@ -99,6 +116,7 @@ def test_climate_basic_properties():
 
     assert ent.current_temperature == pytest.approx(21.5)
     assert ent.target_temperature == pytest.approx(22.5)
+    assert ent.precision == 0.5
 
     assert ent.current_humidity == 45
     assert ent.target_humidity == HUM_ALLOWED[1]  # 33
@@ -247,3 +265,191 @@ async def test_async_set_swing_mode_valid_and_invalid():
     await ent.async_set_swing_mode("неизвестный режим")
     assert api.set_breezer_mode.await_count == 0
     ent._refresh.assert_not_awaited()
+
+
+def test_climate_hvac_mode_uses_pending_value():
+    ent, cond, api, runtime = _make_entity_with_runtime({"pwr_on": False})
+    runtime.set_pending(1, "pwr_on", True)
+
+    assert ent.hvac_mode == HVACMode.FAN_ONLY
+
+
+def test_climate_hvac_mode_clears_expired_pending():
+    ent, cond, api, runtime = _make_entity_with_runtime({"pwr_on": False})
+    runtime.pending_commands["1"] = {
+        "pwr_on": PendingCommand(
+            value=True,
+            timestamp=time.monotonic() - 20.0,
+            attribute="pwr_on",
+        )
+    }
+
+    assert ent.hvac_mode == HVACMode.OFF
+    assert runtime.get_pending(1, "pwr_on") is None
+
+
+def test_climate_hvac_mode_uses_runtime_helper():
+    ent, cond, api, runtime = _make_entity_with_runtime({"pwr_on": True})
+    runtime.clear_pending_if_confirmed = MagicMock(
+        wraps=runtime.clear_pending_if_confirmed
+    )
+
+    assert ent.hvac_mode == HVACMode.FAN_ONLY
+    runtime.clear_pending_if_confirmed.assert_called_once_with(
+        1,
+        "pwr_on",
+        True,
+        tolerance=8.0,
+    )
+
+
+def test_climate_fan_mode_uses_and_clears_pending():
+    ent, cond, api, runtime = _make_entity_with_runtime({"fan_speed": 3})
+    runtime.set_pending(1, "fan_speed", 5)
+
+    assert ent.fan_mode == "5"
+    cond["fan_speed"] = 5
+    assert ent.fan_mode == "5"
+    assert runtime.get_pending(1, "fan_speed") is None
+
+
+@pytest.mark.asyncio
+async def test_async_set_hvac_mode_raises_and_clears_pending_on_api_error():
+    ent, cond, api, runtime = _make_entity_with_runtime()
+    api.set_power.side_effect = ApiError("boom", status=500)
+
+    with pytest.raises(HomeAssistantError, match="Failed to set HVAC mode"):
+        await ent.async_set_hvac_mode(HVACMode.OFF)
+
+    assert runtime.get_pending(1, "pwr_on") is None
+
+
+@pytest.mark.asyncio
+async def test_async_set_fan_mode_raises_and_clears_pending_on_api_error():
+    ent, cond, api, runtime = _make_entity_with_runtime()
+    api.set_fan_speed.side_effect = ApiError("boom", status=500)
+
+    with pytest.raises(HomeAssistantError, match="Failed to set fan mode"):
+        await ent.async_set_fan_mode("5")
+
+    assert runtime.get_pending(1, "fan_speed") is None
+
+
+@pytest.mark.asyncio
+async def test_async_set_swing_mode_raises_homeassistant_error():
+    ent, cond, api = _make_entity()
+    api.set_breezer_mode.side_effect = ApiError("boom", status=500)
+
+    with pytest.raises(HomeAssistantError, match="Failed to set swing mode"):
+        await ent.async_set_swing_mode(BREEZER_SWING_MODES[1])
+
+
+@pytest.mark.asyncio
+async def test_preset_sleep_then_restore_previous_fan_mode():
+    ent, cond, api = _make_entity({"fan_speed": 4})
+    ent.async_write_ha_state = lambda: None
+
+    await ent.async_set_preset_mode(PRESET_SLEEP)
+    assert ent.preset_mode == PRESET_SLEEP
+    assert ent._saved_fan_mode == "4"
+    api.set_fan_speed.assert_awaited_once_with(1, 2)
+
+    api.set_fan_speed.reset_mock()
+    cond["fan_speed"] = 2
+
+    await ent.async_set_preset_mode(PRESET_NONE)
+    assert ent.preset_mode == PRESET_NONE
+    assert ent._saved_fan_mode is None
+    api.set_fan_speed.assert_awaited_once_with(1, 4)
+
+
+@pytest.mark.asyncio
+async def test_preset_boost_then_restore_previous_fan_mode():
+    ent, cond, api = _make_entity({"fan_speed": 3})
+    ent.async_write_ha_state = lambda: None
+
+    await ent.async_set_preset_mode(PRESET_BOOST)
+    assert ent.preset_mode == PRESET_BOOST
+    assert ent._is_boost is True
+    assert ent._saved_fan_mode == "3"
+    api.set_fan_speed.assert_awaited_once_with(1, 7)
+
+    api.set_fan_speed.reset_mock()
+    cond["fan_speed"] = 7
+
+    await ent.async_set_preset_mode(PRESET_NONE)
+    assert ent.preset_mode == PRESET_NONE
+    assert ent._is_boost is False
+    assert ent._saved_fan_mode is None
+    api.set_fan_speed.assert_awaited_once_with(1, 3)
+
+
+# ---------------------------------------------------------------------------
+# Service: set_breezer_mode
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_service_set_breezer_mode_calls_api():
+    """set_breezer_mode delegates to async_set_swing_mode → api.set_breezer_mode."""
+    ent, _cond, api = _make_entity()
+    mode = BREEZER_MODES[1]  # "recirculation"
+    await ent.async_set_breezer_mode(mode)
+    api.set_breezer_mode.assert_awaited_once_with(1, 1)
+
+
+@pytest.mark.asyncio
+async def test_service_set_breezer_mode_all_valid_modes():
+    """Every entry in BREEZER_MODES maps to the correct API index."""
+    for idx, mode in enumerate(BREEZER_MODES):
+        ent, _cond, api = _make_entity()
+        await ent.async_set_breezer_mode(mode)
+        api.set_breezer_mode.assert_awaited_once_with(1, idx)
+
+
+@pytest.mark.asyncio
+async def test_service_set_breezer_mode_raises_on_api_error():
+    """ApiError from set_breezer_mode is re-raised as HomeAssistantError."""
+    ent, _cond, api = _make_entity()
+    api.set_breezer_mode.side_effect = ApiError("network", status=503)
+    with pytest.raises(HomeAssistantError):
+        await ent.async_set_breezer_mode(BREEZER_MODES[0])
+
+
+# ---------------------------------------------------------------------------
+# Service: set_humidifier_stage
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_service_set_humidifier_stage_calls_api():
+    """set_humidifier_stage calls api.set_humid_stage with the requested stage."""
+    ent, _cond, api = _make_entity({"hum_stg": 0})
+    await ent.async_set_humidifier_stage(2)
+    api.set_humid_stage.assert_awaited_once_with(1, 2)
+
+
+@pytest.mark.asyncio
+async def test_service_set_humidifier_stage_no_humidifier_is_noop():
+    """When the device has no humidifier, the API is never called."""
+    # Remove hum_stg from state so _has_humidifier() returns False
+    ent, _cond, api = _make_entity({})
+    del ent.coordinator.data["states"]["1"]["hum_stg"]
+    await ent.async_set_humidifier_stage(1)
+    api.set_humid_stage.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stage,expected", [(-1, 0), (0, 0), (3, 3), (4, 3)])
+async def test_service_set_humidifier_stage_clamps_value(stage, expected):
+    """Stage is clamped to 0–3 before being sent to the API."""
+    ent, _cond, api = _make_entity({"hum_stg": 1})
+    await ent.async_set_humidifier_stage(stage)
+    api.set_humid_stage.assert_awaited_once_with(1, expected)
+
+
+@pytest.mark.asyncio
+async def test_service_set_humidifier_stage_raises_on_api_error():
+    """ApiError from set_humid_stage is re-raised as HomeAssistantError."""
+    ent, _cond, api = _make_entity({"hum_stg": 1})
+    api.set_humid_stage.side_effect = ApiError("timeout", status=None)
+    with pytest.raises(HomeAssistantError):
+        await ent.async_set_humidifier_stage(1)

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import logging
 from typing import Any
 
+_LOGGER = logging.getLogger(__name__)
 
 FAN_MIN = 1
 FAN_MAX = 7
@@ -129,3 +131,96 @@ def to_bool(v: Any) -> bool:
         return bool(int(v))
     except (TypeError, ValueError):
         return bool(v)
+
+
+def _normalize_device_state(item: dict[str, Any]) -> dict[str, Any]:
+    """Merge condition + settings into a normalized HA state."""
+    cond = dict(item.get("condition") or {})
+    st = dict(item.get("settings") or {})
+
+    pwr_cond = cond.get("pwr_on")
+    pwr_settings = st.get("u_pwr_on")
+
+    if pwr_cond is not None:
+        pwr = to_bool(pwr_cond)
+    elif pwr_settings is not None:
+        pwr = to_bool(pwr_settings)
+    else:
+        pwr = False
+
+    _LOGGER.debug(
+        "Normalize pwr_on: condition=%s, settings=%s, result=%s",
+        pwr_cond,
+        pwr_settings,
+        pwr,
+    )
+
+    fan_raw = cond.get("fan_speed")
+    u_fan_raw = st.get("u_fan_speed")
+
+    _LOGGER.debug(
+        "Normalize fan_speed: condition.fan_speed=%s, settings.u_fan_speed=%s, pwr=%s",
+        fan_raw,
+        u_fan_raw,
+        pwr,
+    )
+
+    if (fan_raw is None or (fan_raw == 0 and pwr)) and u_fan_raw is not None and pwr:
+        fan = api_to_fan_speed(u_fan_raw)
+    else:
+        fan = api_to_fan_speed(fan_raw) if fan_raw is not None else None
+
+    damp = cond.get("damp_pos")
+    if damp is None and "u_damp_pos" in st:
+        damp = st.get("u_damp_pos")
+
+    u_temp = cond.get("u_temp_room")
+    if u_temp is None and "u_temp_room" in st:
+        u_temp = st.get("u_temp_room")
+
+    hum_stg = cond.get("hum_stg")
+    if hum_stg is None and "u_hum_stg" in st:
+        hum_stg = st.get("u_hum_stg")
+
+    hum_room = cond.get("hum_room")
+    temp_room = cond.get("temp_room")
+
+    out = dict(cond) if cond else {}
+    if pwr is not None:
+        out["pwr_on"] = bool(pwr)
+    if fan is not None:
+        try:
+            out["fan_speed"] = int(fan)
+        except (TypeError, ValueError):
+            pass
+
+    if damp is not None:
+        try:
+            out["damp_pos"] = int(damp)
+        except (TypeError, ValueError):
+            pass
+
+    if hum_stg is not None:
+        try:
+            out["hum_stg"] = int(hum_stg)
+        except (TypeError, ValueError):
+            pass
+
+    if u_temp is not None:
+        try:
+            out["u_temp_room"] = int(u_temp)
+        except (TypeError, ValueError):
+            pass
+
+    if isinstance(hum_room, (int, float)):
+        out["hum_room"] = int(hum_room)
+    if isinstance(temp_room, (int, float)):
+        out["temp_room"] = int(temp_room)
+
+    online = item.get("online")
+    if online is not None:
+        out["online"] = bool(online)
+    else:
+        out["online"] = bool(cond and cond.get("time"))
+
+    return out

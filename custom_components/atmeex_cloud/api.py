@@ -8,7 +8,7 @@ from dataclasses import dataclass, field
 
 from aiohttp import ClientSession, ClientError, ClientResponse
 
-from .helpers import c_to_deci
+from .helpers import _normalize_device_state, c_to_deci, fan_speed_to_api
 from .const import API_BASE_URL, RETRY_MAX_DELAY_SEC, RETRY_MAX_ATTEMPTS, RETRY_BASE_DELAY_SEC
 
 _LOGGER = logging.getLogger(__name__)
@@ -90,9 +90,7 @@ class AtmeexState:
 
     @classmethod
     def from_device_dict(cls, device: Dict[str, Any]) -> "AtmeexState":
-        """Использует уже существующую _normalize_device_state."""
-        from . import _normalize_device_state  # импорт внутри, чтобы не ловить циклы
-
+        """Build normalized state from raw device payload."""
         normalized = _normalize_device_state(device)
         did = int(device["id"])
         return cls(
@@ -134,6 +132,11 @@ class AtmeexApi:
         return
 
     # ---------- helpers ----------
+
+    @property
+    def token(self) -> str:
+        """Return the current auth token (empty string if not set)."""
+        return self._token or ""
 
     def _token_is_valid(self) -> bool:
         """Проверить, что токен ещё жив и не протухнет прямо сейчас."""
@@ -277,15 +280,15 @@ class AtmeexApi:
         await self._with_retries(_do_login, "login")
     
     async def _request(
-    self,
-    method: str,
-    path: str,
-    *,
-    timeout: int = 20,
-    json: Any | None = None,
-    headers: Dict[str, str] | None = None,
-) -> tuple[int, Any]:
-        """Запрос с токеном + 1 auto-relogin по 401/403/500.
+        self,
+        method: str,
+        path: str,
+        *,
+        timeout: int = 20,
+        json: Any | None = None,
+        headers: Dict[str, str] | None = None,
+    ) -> tuple[int, Any]:
+        """Запрос с токеном + 1 auto-relogin по 401/403.
         Возвращает (status, payload), где payload = json (если <400) иначе text.
         """
         await self._ensure_token()
@@ -299,7 +302,7 @@ class AtmeexApi:
             async with self._session.request(
                 method, url, json=json, headers=req_headers, timeout=timeout
             ) as resp:
-                if resp.status in (401, 403, 500) and retry_auth and self._email and self._password:
+                if resp.status in (401, 403) and retry_auth and self._email and self._password:
                     self._token_expires_at = None
                     await self._sign_in()
                     return await _do(retry_auth=False)
@@ -410,8 +413,6 @@ class AtmeexApi:
         HA uses speed 1-7, but API expects 0-6.
         Speed 0 = off, Speed 1-7 → API 0-6
         """
-        from .helpers import fan_speed_to_api
-        
         speed_int = int(speed)
         api_speed = fan_speed_to_api(speed_int)
         
@@ -423,14 +424,10 @@ class AtmeexApi:
         body = {"u_fan_speed": api_speed}
         await self._put_params(device_id, body, "set_fan_speed")
 
-    async def set_brizer_mode(self, device_id: int | str, damp_pos: int) -> None:
+    async def set_breezer_mode(self, device_id: int | str, damp_pos: int) -> None:
         """Установить режим бризера (положение заслонки) 0..3."""
         body = {"u_damp_pos": int(damp_pos)}
         await self._put_params(device_id, body, "set_breezer_mode")
-
-    async def set_breezer_mode(self, device_id: int | str, damp_pos: int) -> None:
-        """Установить режим бризера (положение заслонки) 0..3. Alias for set_brizer_mode."""
-        await self.set_brizer_mode(device_id, damp_pos)
 
     async def set_humid_stage(self, device_id: int | str, stage: int) -> None:
         """Установить ступень работы увлажнителя 0..3."""

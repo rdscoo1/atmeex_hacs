@@ -1,6 +1,7 @@
 import pytest
 from aiohttp import ClientError
 
+import custom_components.atmeex_cloud.api as api_mod
 from custom_components.atmeex_cloud.api import AtmeexApi, ApiError, API_BASE_URL
 
 
@@ -12,7 +13,12 @@ class ErrorSession:
 
 
 @pytest.mark.asyncio
-async def test_get_devices_fallback_network_error_returns_empty_list():
+async def test_get_devices_fallback_network_error_returns_empty_list(monkeypatch):
+    async def _fast_sleep(_delay: float) -> None:
+        return None
+
+    monkeypatch.setattr(api_mod.asyncio, "sleep", _fast_sleep)
+
     session = ErrorSession()
     api = AtmeexApi(session)
     api._token = "t"  # токен есть, чтобы не упираться в отсутствие логина
@@ -23,7 +29,12 @@ async def test_get_devices_fallback_network_error_returns_empty_list():
 
 
 @pytest.mark.asyncio
-async def test_get_devices_no_fallback_raises_on_network_error():
+async def test_get_devices_no_fallback_raises_on_network_error(monkeypatch):
+    async def _fast_sleep(_delay: float) -> None:
+        return None
+
+    monkeypatch.setattr(api_mod.asyncio, "sleep", _fast_sleep)
+
     session = ErrorSession()
     api = AtmeexApi(session)
     api._token = "t"
