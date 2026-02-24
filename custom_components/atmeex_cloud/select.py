@@ -1,20 +1,16 @@
 from __future__ import annotations
 
-import logging
-from typing import Any, Callable, Awaitable
-
 from homeassistant.components.select import SelectEntity
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
+from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
-from .api import AtmeexDevice
+from .api import ApiError, AtmeexDevice
 from .entity_base import AtmeexEntityMixin
 
-from .const import DOMAIN, BREEZER_MODES, HUMIDIFICATION_OPTIONS
+from .const import BREEZER_MODES, HUMIDIFICATION_OPTIONS
 from . import AtmeexRuntimeData
-
-_LOGGER = logging.getLogger(__name__)
 
 HUM_OPTIONS = HUMIDIFICATION_OPTIONS
 BREEZER_OPTIONS = BREEZER_MODES
@@ -30,15 +26,12 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_e
 
     entities: list[SelectEntity] = []
 
-    for key, dev in device_map.items():
-        name = dev.name
-
+    for dev in device_map.values():
         entities.append(
             AtmeexHumidificationSelect(
                 coordinator=coordinator,
-                api = runtime.api,
+                api=runtime.api,
                 device=dev,
-                name=f"{name} humidification mode",
                 refresh_device_cb=runtime.refresh_device,
             )
         )
@@ -47,7 +40,6 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_e
                 coordinator=coordinator,
                 api=runtime.api,
                 device=dev,
-                name=f"{name} breezer mode",
                 refresh_device_cb=runtime.refresh_device,
             )
         )
@@ -57,25 +49,13 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_e
 
 
 class _BaseSelect(AtmeexEntityMixin, CoordinatorEntity, SelectEntity):
-    def __init__(self, coordinator, api, device: AtmeexDevice, name: str, refresh_device_cb=None):
+    def __init__(self, coordinator, api, device: AtmeexDevice, refresh_device_cb=None):
         super().__init__(coordinator)
         self.api = api
         self._device_meta = device
         self._device_id = device.id
-        self._attr_name = name
         self._attr_has_entity_name = True
         self._refresh_device_cb = refresh_device_cb
-
-    async def _refresh(self) -> None:
-        if callable(self._refresh_device_cb):
-            await self._refresh_device_cb(self._device_id)
-        else:
-            await self.coordinator.async_request_refresh()
-
-    @property
-    def available(self) -> bool:
-        st = self._device_state
-        return bool(st.get("online", getattr(self._device_meta, "online", False)))
 
 
 class AtmeexHumidificationSelect(_BaseSelect):
@@ -87,10 +67,9 @@ class AtmeexHumidificationSelect(_BaseSelect):
         coordinator,
         api,
         device: AtmeexDevice,
-        name,
         refresh_device_cb=None,
     ) -> None:
-        super().__init__(coordinator, api, device, name, refresh_device_cb)
+        super().__init__(coordinator, api, device, refresh_device_cb)
         self._attr_unique_id = f"{device.id}_hum_mode"
 
     @property
@@ -106,7 +85,10 @@ class AtmeexHumidificationSelect(_BaseSelect):
         if option not in HUM_OPTIONS:
             return
         stage = 0 if option == "off" else int(option)
-        await self.api.set_humid_stage(self._device_id, stage)
+        try:
+            await self.api.set_humid_stage(self._device_id, stage)
+        except ApiError as err:
+            raise HomeAssistantError(f"Failed to set humidification stage: {err}") from err
         self._attr_current_option = option
         await self._refresh()
 
@@ -120,10 +102,9 @@ class AtmeexBreezerSelect(_BaseSelect):
         coordinator,
         api,
         device: AtmeexDevice,
-        name,
         refresh_device_cb=None,
     ) -> None:
-        super().__init__(coordinator, api, device, name, refresh_device_cb)
+        super().__init__(coordinator, api, device, refresh_device_cb)
         self._attr_unique_id = f"{device.id}_breezer_mode"
 
     @property
@@ -137,6 +118,9 @@ class AtmeexBreezerSelect(_BaseSelect):
         if option not in BREEZER_OPTIONS:
             return
         pos = BREEZER_OPTIONS.index(option)
-        await self.api.set_breezer_mode(self._device_id, pos)
+        try:
+            await self.api.set_breezer_mode(self._device_id, pos)
+        except ApiError as err:
+            raise HomeAssistantError(f"Failed to set breezer mode: {err}") from err
         self._attr_current_option = option
         await self._refresh()

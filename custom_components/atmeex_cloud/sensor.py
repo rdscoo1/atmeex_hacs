@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from math import isfinite
 from typing import Any
 
 from homeassistant.components.sensor import (
@@ -34,9 +35,6 @@ async def async_setup_entry(
 
     runtime: AtmeexRuntimeData = entry.runtime_data
     coordinator = runtime.coordinator
-
-    if runtime is None:
-        return
 
     entities: list[SensorEntity] = []
 
@@ -94,6 +92,7 @@ class AtmeexDiagnosticsSensor(CoordinatorEntity, SensorEntity):
         """
         super().__init__(runtime.coordinator)
         self._entry_id = entry_id
+        self._runtime = runtime
 
     @property
     def unique_id(self) -> str:
@@ -121,7 +120,7 @@ class AtmeexDiagnosticsSensor(CoordinatorEntity, SensorEntity):
         states = data.get("states") or {}
 
         last_success_ts = data.get("last_success_ts")
-        last_api_error = data.get("last_api_error")
+        last_api_error = getattr(self.coordinator, "last_api_error", None)
 
         if isinstance(last_success_ts, (int, float)):
             last_success_utc = datetime.fromtimestamp(
@@ -131,12 +130,23 @@ class AtmeexDiagnosticsSensor(CoordinatorEntity, SensorEntity):
         else:
             last_success_utc = None
 
+        ws_manager = getattr(self._runtime, "websocket_manager", None)
+        ws_connected = None
+        ws_last_message_age_sec = None
+        if ws_manager is not None:
+            ws_connected = bool(getattr(ws_manager, "is_connected", False))
+            ws_age = getattr(ws_manager, "last_message_age", None)
+            if isinstance(ws_age, (int, float)) and isfinite(float(ws_age)):
+                ws_last_message_age_sec = round(float(ws_age), 1)
+
         return {
             "device_count": len(devices) if isinstance(devices, list) else 0,
             "state_entries": len(states) if isinstance(states, dict) else 0,
             "last_success_ts": last_success_ts,
             "last_success_utc": last_success_utc,
             "last_api_error": last_api_error,
+            "websocket_connected": ws_connected,
+            "websocket_last_message_age_sec": ws_last_message_age_sec,
             "domain": DOMAIN,
         }
 

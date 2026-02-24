@@ -1,12 +1,19 @@
 import asyncio
 import pytest
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 from types import SimpleNamespace
 
 import custom_components.atmeex_cloud as atmeex_init
 from custom_components.atmeex_cloud.helpers import to_bool
-from custom_components.atmeex_cloud.const import DOMAIN, PLATFORMS
+from custom_components.atmeex_cloud.const import (
+    CONF_UPDATE_INTERVAL,
+    DEFAULT_UPDATE_INTERVAL,
+    DOMAIN,
+    PLATFORMS,
+)
 from custom_components.atmeex_cloud.api import AtmeexDevice
+from custom_components.atmeex_cloud.api import ApiError
+from homeassistant.exceptions import ConfigEntryAuthFailed, ConfigEntryNotReady
 
 
 @pytest.mark.parametrize(
@@ -369,9 +376,9 @@ async def test_websocket_batch_message_updates_coordinator_once(monkeypatch):
     created_ws_managers = []
 
     class FakeWebSocketManager:
-        def __init__(self, session, token, on_message):
+        def __init__(self, session, token_getter, on_message):
             self.session = session
-            self.token = token
+            self.token_getter = token_getter
             self.on_message = on_message
             created_callbacks.append(on_message)
             created_ws_managers.append(self)
@@ -450,6 +457,7 @@ async def test_websocket_batch_message_updates_coordinator_once(monkeypatch):
 
     hass = SimpleNamespace(
         data={},
+        bus=SimpleNamespace(async_fire=MagicMock()),
         async_create_task=asyncio.create_task,
         config_entries=SimpleNamespace(
             async_forward_entry_setups=AsyncMock(),
@@ -482,8 +490,590 @@ async def test_websocket_batch_message_updates_coordinator_once(monkeypatch):
             ],
         }
     )
+    if runtime.websocket_message_task:
+        await runtime.websocket_message_task
 
     coordinator = runtime.coordinator
     assert coordinator.update_calls == 1
     assert coordinator.data["states"]["1"]["fan_speed"] == 4
     assert coordinator.data["states"]["2"]["fan_speed"] == 5
+    assert any(
+        call.args and call.args[0] == atmeex_init.EVENT_DEVICE_UPDATED
+        for call in hass.bus.async_fire.call_args_list
+    )
+
+
+def test_resolve_update_interval_invalid_input_falls_back_to_default():
+    assert atmeex_init._resolve_update_interval_seconds({CONF_UPDATE_INTERVAL: "bad"}) == DEFAULT_UPDATE_INTERVAL
+
+
+@pytest.mark.asyncio
+async def test_setup_entry_raises_auth_failed_on_invalid_credentials(monkeypatch):
+    class FakeApi:
+        def __init__(self, _session):
+            self.async_init = AsyncMock()
+            self.login = AsyncMock(side_effect=ApiError("bad creds", status=401))
+
+    monkeypatch.setattr(atmeex_init, "AtmeexApi", FakeApi)
+    monkeypatch.setattr(atmeex_init, "async_get_clientsession", lambda _hass: object())
+
+    hass = SimpleNamespace(
+        config_entries=SimpleNamespace(
+            async_forward_entry_setups=AsyncMock(),
+            async_unload_platforms=AsyncMock(return_value=True),
+        ),
+    )
+    entry = SimpleNamespace(
+        data={"email": "user@example.com", "password": "pwd"},
+        options={},
+        entry_id="entry1",
+        add_update_listener=lambda _listener: (lambda: None),
+        async_on_unload=lambda _cb: None,
+    )
+
+    with pytest.raises(ConfigEntryAuthFailed):
+        await atmeex_init.async_setup_entry(hass, entry)
+
+
+@pytest.mark.asyncio
+async def test_setup_entry_raises_not_ready_on_non_auth_error(monkeypatch):
+    class FakeApi:
+        def __init__(self, _session):
+            self.async_init = AsyncMock()
+            self.login = AsyncMock(side_effect=ApiError("server down", status=500))
+
+    monkeypatch.setattr(atmeex_init, "AtmeexApi", FakeApi)
+    monkeypatch.setattr(atmeex_init, "async_get_clientsession", lambda _hass: object())
+
+    hass = SimpleNamespace(
+        config_entries=SimpleNamespace(
+            async_forward_entry_setups=AsyncMock(),
+            async_unload_platforms=AsyncMock(return_value=True),
+        ),
+    )
+    entry = SimpleNamespace(
+        data={"email": "user@example.com", "password": "pwd"},
+        options={},
+        entry_id="entry1",
+        add_update_listener=lambda _listener: (lambda: None),
+        async_on_unload=lambda _cb: None,
+    )
+
+    with pytest.raises(ConfigEntryNotReady):
+        await atmeex_init.async_setup_entry(hass, entry)
+
+
+@pytest.mark.asyncio
+async def test_setup_entry_uses_fallback_devices_and_hydration_fallback(monkeypatch):
+    class FakeApi:
+        def __init__(self, _session):
+            self.async_init = AsyncMock()
+            self.login = AsyncMock()
+            self._token = "token"
+            self.get_devices_calls = []
+
+            self.dev = AtmeexDevice.from_raw(
+                {
+                    "id": 1,
+                    "name": "FallbackDev",
+                    "model": "m",
+                    "online": True,
+                    "condition": {"pwr_on": 1, "fan_speed": 2},
+                    "settings": {},
+                }
+            )
+
+            async def _get_devices(*, fallback=False):
+                self.get_devices_calls.append(fallback)
+                if not fallback:
+                    raise ApiError("primary failed", status=500)
+                return [self.dev]
+
+            self.get_devices = AsyncMock(side_effect=_get_devices)
+            self.get_device = AsyncMock(side_effect=ApiError("partial failure", status=500))
+
+    monkeypatch.setattr(atmeex_init, "AtmeexApi", FakeApi)
+    monkeypatch.setattr(atmeex_init, "async_get_clientsession", lambda _hass: object())
+
+    class DummyCoordinator:
+        def __init__(self, hass, logger, name, update_method, update_interval):
+            self.hass = hass
+            self.logger = logger
+            self.name = name
+            self.update_method = update_method
+            self.update_interval = update_interval
+            self.data = None
+            self.last_update_success = True
+
+        async def async_config_entry_first_refresh(self):
+            self.data = await self.update_method()
+
+        def async_set_updated_data(self, data):
+            self.data = data
+
+    monkeypatch.setattr(atmeex_init, "DataUpdateCoordinator", DummyCoordinator)
+
+    hass = SimpleNamespace(
+        data={},
+        config_entries=SimpleNamespace(
+            async_forward_entry_setups=AsyncMock(),
+            async_unload_platforms=AsyncMock(return_value=True),
+        ),
+    )
+    entry = SimpleNamespace(
+        data={"email": "user@example.com", "password": "pwd"},
+        options={"enable_websocket": False},
+        entry_id="entry1",
+        add_update_listener=lambda _listener: (lambda: None),
+        async_on_unload=lambda _cb: None,
+    )
+
+    assert await atmeex_init.async_setup_entry(hass, entry) is True
+    runtime = entry.runtime_data
+
+    assert runtime.api.get_devices_calls == [False, True]
+    runtime.api.get_device.assert_awaited_once_with(1)
+    assert runtime.coordinator.data["device_map"]["1"].id == 1
+    assert runtime.coordinator.data["states"]["1"]["fan_speed"] == 3
+
+
+@pytest.mark.asyncio
+async def test_setup_entry_reauth_on_fallback_auth_error(monkeypatch):
+    class FakeApi:
+        def __init__(self, _session):
+            self.async_init = AsyncMock()
+            self.login = AsyncMock()
+            self._token = "token"
+
+            async def _get_devices(*, fallback=False):
+                if not fallback:
+                    return []
+                raise ApiError("token expired", status=401)
+
+            self.get_devices = AsyncMock(side_effect=_get_devices)
+            self.get_device = AsyncMock()
+
+    monkeypatch.setattr(atmeex_init, "AtmeexApi", FakeApi)
+    monkeypatch.setattr(atmeex_init, "async_get_clientsession", lambda _hass: object())
+
+    class DummyCoordinator:
+        def __init__(self, hass, logger, name, update_method, update_interval):
+            self.hass = hass
+            self.logger = logger
+            self.name = name
+            self.update_method = update_method
+            self.update_interval = update_interval
+            self.data = None
+            self.last_update_success = True
+
+        async def async_config_entry_first_refresh(self):
+            self.data = await self.update_method()
+
+    monkeypatch.setattr(atmeex_init, "DataUpdateCoordinator", DummyCoordinator)
+
+    hass = SimpleNamespace(
+        data={},
+        config_entries=SimpleNamespace(
+            async_forward_entry_setups=AsyncMock(),
+            async_unload_platforms=AsyncMock(return_value=True),
+        ),
+    )
+    entry = SimpleNamespace(
+        data={"email": "user@example.com", "password": "pwd"},
+        options={"enable_websocket": False},
+        entry_id="entry1",
+        add_update_listener=lambda _listener: (lambda: None),
+        async_on_unload=lambda _cb: None,
+    )
+
+    with pytest.raises(ConfigEntryAuthFailed):
+        await atmeex_init.async_setup_entry(hass, entry)
+
+
+@pytest.mark.asyncio
+async def test_setup_entry_registers_reload_listener(monkeypatch):
+    class FakeApi:
+        def __init__(self, _session):
+            self.async_init = AsyncMock()
+            self.login = AsyncMock()
+            self._token = "token"
+            dev = AtmeexDevice.from_raw({"id": 1, "condition": {"pwr_on": 1, "fan_speed": 2}})
+            self.get_devices = AsyncMock(return_value=[dev])
+            self.get_device = AsyncMock(return_value=dev)
+
+    monkeypatch.setattr(atmeex_init, "AtmeexApi", FakeApi)
+    monkeypatch.setattr(atmeex_init, "async_get_clientsession", lambda _hass: object())
+
+    class DummyCoordinator:
+        def __init__(self, hass, logger, name, update_method, update_interval):
+            self.hass = hass
+            self.logger = logger
+            self.name = name
+            self.update_method = update_method
+            self.update_interval = update_interval
+            self.data = None
+            self.last_update_success = True
+
+        async def async_config_entry_first_refresh(self):
+            self.data = await self.update_method()
+
+        def async_set_updated_data(self, data):
+            self.data = data
+
+    monkeypatch.setattr(atmeex_init, "DataUpdateCoordinator", DummyCoordinator)
+
+    captured_listener = {}
+
+    def add_update_listener(listener):
+        captured_listener["cb"] = listener
+        return lambda: None
+
+    hass = SimpleNamespace(
+        data={},
+        config_entries=SimpleNamespace(
+            async_forward_entry_setups=AsyncMock(),
+            async_unload_platforms=AsyncMock(return_value=True),
+            async_reload=AsyncMock(),
+        ),
+    )
+    entry = SimpleNamespace(
+        data={"email": "user@example.com", "password": "pwd"},
+        options={"enable_websocket": False},
+        entry_id="entry1",
+        add_update_listener=add_update_listener,
+        async_on_unload=lambda _cb: None,
+    )
+
+    assert await atmeex_init.async_setup_entry(hass, entry) is True
+    await captured_listener["cb"](hass, entry)
+    hass.config_entries.async_reload.assert_awaited_once_with("entry1")
+
+
+@pytest.mark.asyncio
+async def test_setup_entry_websocket_skipped_without_ws_connect(monkeypatch):
+    class SessionNoWS:
+        pass
+
+    class FakeApi:
+        def __init__(self, _session):
+            self.async_init = AsyncMock()
+            self.login = AsyncMock()
+            self._token = "token"
+            dev = AtmeexDevice.from_raw({"id": 1, "condition": {"pwr_on": 1, "fan_speed": 2}})
+            self.get_devices = AsyncMock(return_value=[dev])
+            self.get_device = AsyncMock(return_value=dev)
+
+    monkeypatch.setattr(atmeex_init, "AtmeexApi", FakeApi)
+    monkeypatch.setattr(atmeex_init, "async_get_clientsession", lambda _hass: SessionNoWS())
+
+    class DummyCoordinator:
+        def __init__(self, hass, logger, name, update_method, update_interval):
+            self.data = None
+            self.last_update_success = True
+            self.update_method = update_method
+
+        async def async_config_entry_first_refresh(self):
+            self.data = await self.update_method()
+
+        def async_set_updated_data(self, data):
+            self.data = data
+
+    monkeypatch.setattr(atmeex_init, "DataUpdateCoordinator", DummyCoordinator)
+
+    hass = SimpleNamespace(
+        data={},
+        config_entries=SimpleNamespace(
+            async_forward_entry_setups=AsyncMock(),
+            async_unload_platforms=AsyncMock(return_value=True),
+        ),
+    )
+    entry = SimpleNamespace(
+        data={"email": "user@example.com", "password": "pwd"},
+        options={"enable_websocket": True},
+        entry_id="entry1",
+        add_update_listener=lambda _listener: (lambda: None),
+        async_on_unload=lambda _cb: None,
+    )
+
+    assert await atmeex_init.async_setup_entry(hass, entry) is True
+    assert entry.runtime_data.websocket_manager is None
+
+
+@pytest.mark.asyncio
+async def test_setup_entry_websocket_skipped_without_token(monkeypatch):
+    class SessionWS:
+        async def ws_connect(self, *args, **kwargs):
+            raise AssertionError("ws_connect should not be called without token")
+
+    class FakeApi:
+        def __init__(self, _session):
+            self.async_init = AsyncMock()
+            self.login = AsyncMock()
+            self._token = None
+            dev = AtmeexDevice.from_raw({"id": 1, "condition": {"pwr_on": 1, "fan_speed": 2}})
+            self.get_devices = AsyncMock(return_value=[dev])
+            self.get_device = AsyncMock(return_value=dev)
+
+    monkeypatch.setattr(atmeex_init, "AtmeexApi", FakeApi)
+    monkeypatch.setattr(atmeex_init, "async_get_clientsession", lambda _hass: SessionWS())
+
+    class DummyCoordinator:
+        def __init__(self, hass, logger, name, update_method, update_interval):
+            self.data = None
+            self.last_update_success = True
+            self.update_method = update_method
+
+        async def async_config_entry_first_refresh(self):
+            self.data = await self.update_method()
+
+        def async_set_updated_data(self, data):
+            self.data = data
+
+    monkeypatch.setattr(atmeex_init, "DataUpdateCoordinator", DummyCoordinator)
+
+    hass = SimpleNamespace(
+        data={},
+        config_entries=SimpleNamespace(
+            async_forward_entry_setups=AsyncMock(),
+            async_unload_platforms=AsyncMock(return_value=True),
+        ),
+    )
+    entry = SimpleNamespace(
+        data={"email": "user@example.com", "password": "pwd"},
+        options={"enable_websocket": True},
+        entry_id="entry1",
+        add_update_listener=lambda _listener: (lambda: None),
+        async_on_unload=lambda _cb: None,
+    )
+
+    assert await atmeex_init.async_setup_entry(hass, entry) is True
+    assert entry.runtime_data.websocket_manager is None
+
+
+@pytest.mark.asyncio
+async def test_websocket_settings_message_updates_state(monkeypatch):
+    import custom_components.atmeex_cloud.websocket as websocket_mod
+
+    callbacks = []
+
+    class FakeWebSocketManager:
+        def __init__(self, session, token_getter, on_message):
+            self.on_message = on_message
+            callbacks.append(on_message)
+
+        async def connect(self):
+            return True
+
+        async def disconnect(self):
+            return None
+
+    monkeypatch.setattr(websocket_mod, "WebSocketManager", FakeWebSocketManager)
+
+    class FakeSession:
+        async def ws_connect(self, *args, **kwargs):
+            raise AssertionError("ws_connect should not be called")
+
+    class FakeApi:
+        def __init__(self, _session):
+            self.async_init = AsyncMock()
+            self.login = AsyncMock()
+            self._token = "token"
+            dev = AtmeexDevice.from_raw(
+                {
+                    "id": 1,
+                    "name": "Dev1",
+                    "model": "m",
+                    "online": True,
+                    "condition": {"pwr_on": 1, "fan_speed": 2, "damp_pos": 0, "hum_stg": 0},
+                    "settings": {},
+                }
+            )
+            self.get_devices = AsyncMock(return_value=[dev])
+            self.get_device = AsyncMock(return_value=dev)
+
+    monkeypatch.setattr(atmeex_init, "AtmeexApi", FakeApi)
+    monkeypatch.setattr(atmeex_init, "async_get_clientsession", lambda _hass: FakeSession())
+
+    class DummyCoordinator:
+        def __init__(self, hass, logger, name, update_method, update_interval):
+            self.data = None
+            self.last_update_success = True
+            self.update_method = update_method
+            self.update_calls = 0
+
+        async def async_config_entry_first_refresh(self):
+            self.data = await self.update_method()
+
+        def async_set_updated_data(self, data):
+            self.update_calls += 1
+            self.data = data
+
+    monkeypatch.setattr(atmeex_init, "DataUpdateCoordinator", DummyCoordinator)
+
+    hass = SimpleNamespace(
+        data={},
+        bus=SimpleNamespace(async_fire=MagicMock()),
+        async_create_task=asyncio.create_task,
+        config_entries=SimpleNamespace(
+            async_forward_entry_setups=AsyncMock(),
+            async_unload_platforms=AsyncMock(return_value=True),
+        ),
+    )
+    entry = SimpleNamespace(
+        data={"email": "user@example.com", "password": "pwd"},
+        options={"update_interval": 30, "enable_websocket": True},
+        entry_id="entry1",
+        add_update_listener=lambda _listener: (lambda: None),
+        async_on_unload=lambda _cb: None,
+    )
+
+    assert await atmeex_init.async_setup_entry(hass, entry) is True
+    runtime = entry.runtime_data
+    if runtime.websocket_start_task:
+        await runtime.websocket_start_task
+
+    callback = callbacks[0]
+    callback(
+        {
+            "type": "settings",
+            "data": [
+                {
+                    "id": 1,
+                    "settings": {
+                        "u_fan_speed": 3,
+                        "u_pwr_on": 1,
+                        "u_temp_room": "215",
+                        "u_hum_stg": 2,
+                        "u_damp_pos": 1,
+                    },
+                }
+            ],
+        }
+    )
+    callback({"type": "unknown", "data": []})
+    callback({"type": "settings", "data": "bad"})
+    if runtime.websocket_message_task:
+        await runtime.websocket_message_task
+
+    state = runtime.coordinator.data["states"]["1"]
+    assert runtime.coordinator.update_calls == 1
+    assert state["u_fan_speed"] == 4
+    assert state["fan_speed"] == 4
+    assert state["pwr_on"] is True
+    assert state["u_temp_room"] == 215
+    assert state["hum_stg"] == 2
+    assert state["damp_pos"] == 1
+
+
+@pytest.mark.asyncio
+async def test_websocket_logbook_device_events_are_throttled(monkeypatch):
+    import custom_components.atmeex_cloud.websocket as websocket_mod
+
+    callbacks = []
+
+    class FakeWebSocketManager:
+        def __init__(self, session, token_getter, on_message):
+            self.on_message = on_message
+            callbacks.append(on_message)
+
+        async def connect(self):
+            return True
+
+        async def disconnect(self):
+            return None
+
+    monkeypatch.setattr(websocket_mod, "WebSocketManager", FakeWebSocketManager)
+
+    monotonic_state = {"value": 100.0}
+    monkeypatch.setattr(atmeex_init.time, "monotonic", lambda: monotonic_state["value"])
+
+    class FakeSession:
+        async def ws_connect(self, *args, **kwargs):
+            raise AssertionError("ws_connect should not be called")
+
+    class FakeApi:
+        def __init__(self, _session):
+            self.async_init = AsyncMock()
+            self.login = AsyncMock()
+            self._token = "token"
+            dev = AtmeexDevice.from_raw(
+                {
+                    "id": 1,
+                    "name": "Dev1",
+                    "model": "m",
+                    "online": True,
+                    "condition": {"pwr_on": 1, "fan_speed": 2},
+                    "settings": {},
+                }
+            )
+            self.get_devices = AsyncMock(return_value=[dev])
+            self.get_device = AsyncMock(return_value=dev)
+
+    monkeypatch.setattr(atmeex_init, "AtmeexApi", FakeApi)
+    monkeypatch.setattr(atmeex_init, "async_get_clientsession", lambda _hass: FakeSession())
+
+    class DummyCoordinator:
+        def __init__(self, hass, logger, name, update_method, update_interval):
+            self.data = None
+            self.last_update_success = True
+            self.update_method = update_method
+
+        async def async_config_entry_first_refresh(self):
+            self.data = await self.update_method()
+
+        def async_set_updated_data(self, data):
+            self.data = data
+
+    monkeypatch.setattr(atmeex_init, "DataUpdateCoordinator", DummyCoordinator)
+
+    hass = SimpleNamespace(
+        data={},
+        bus=SimpleNamespace(async_fire=MagicMock()),
+        async_create_task=asyncio.create_task,
+        config_entries=SimpleNamespace(
+            async_forward_entry_setups=AsyncMock(),
+            async_unload_platforms=AsyncMock(return_value=True),
+        ),
+    )
+    entry = SimpleNamespace(
+        data={"email": "user@example.com", "password": "pwd"},
+        options={"update_interval": 30, "enable_websocket": True},
+        entry_id="entry1",
+        add_update_listener=lambda _listener: (lambda: None),
+        async_on_unload=lambda _cb: None,
+    )
+
+    assert await atmeex_init.async_setup_entry(hass, entry) is True
+    runtime = entry.runtime_data
+    if runtime.websocket_start_task:
+        await runtime.websocket_start_task
+
+    callback = callbacks[0]
+    callback(
+        {"type": "condition", "data": [{"id": 1, "condition": {"fan_speed": 3, "time": "ok"}}]}
+    )
+    if runtime.websocket_message_task:
+        await runtime.websocket_message_task
+
+    monotonic_state["value"] = 101.0
+    callback(
+        {"type": "condition", "data": [{"id": 1, "condition": {"fan_speed": 4, "time": "ok"}}]}
+    )
+    if runtime.websocket_message_task:
+        await runtime.websocket_message_task
+
+    monotonic_state["value"] = 106.0
+    callback(
+        {"type": "condition", "data": [{"id": 1, "condition": {"fan_speed": 5, "time": "ok"}}]}
+    )
+    if runtime.websocket_message_task:
+        await runtime.websocket_message_task
+
+    device_events = [
+        call.args[1]
+        for call in hass.bus.async_fire.call_args_list
+        if call.args and call.args[0] == atmeex_init.EVENT_DEVICE_UPDATED
+    ]
+    assert len(device_events) == 2
+    assert device_events[0]["source"] == "websocket"
+    assert device_events[1]["suppressed_updates"] == 1

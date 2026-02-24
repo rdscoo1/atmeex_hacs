@@ -8,7 +8,7 @@ from dataclasses import dataclass, field
 
 from aiohttp import ClientSession, ClientError, ClientResponse
 
-from .helpers import c_to_deci
+from .helpers import _normalize_device_state, c_to_deci, fan_speed_to_api
 from .const import API_BASE_URL, RETRY_MAX_DELAY_SEC, RETRY_MAX_ATTEMPTS, RETRY_BASE_DELAY_SEC
 
 _LOGGER = logging.getLogger(__name__)
@@ -90,9 +90,7 @@ class AtmeexState:
 
     @classmethod
     def from_device_dict(cls, device: Dict[str, Any]) -> "AtmeexState":
-        """Использует уже существующую _normalize_device_state."""
-        from . import _normalize_device_state  # импорт внутри, чтобы не ловить циклы
-
+        """Build normalized state from raw device payload."""
         normalized = _normalize_device_state(device)
         did = int(device["id"])
         return cls(
@@ -410,8 +408,6 @@ class AtmeexApi:
         HA uses speed 1-7, but API expects 0-6.
         Speed 0 = off, Speed 1-7 → API 0-6
         """
-        from .helpers import fan_speed_to_api
-        
         speed_int = int(speed)
         api_speed = fan_speed_to_api(speed_int)
         

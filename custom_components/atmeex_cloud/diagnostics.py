@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from math import isfinite
 from typing import Any
 
 from homeassistant.components.diagnostics import async_redact_data
@@ -9,7 +10,7 @@ from homeassistant.core import HomeAssistant
 from homeassistant.helpers.device_registry import DeviceEntry
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 
-from .const import DOMAIN
+from .const import DOMAIN, CONF_ENABLE_WEBSOCKET, DEFAULT_ENABLE_WEBSOCKET
 from . import AtmeexRuntimeData, AtmeexCoordinatorData
 
 # Поля, которые всегда редактируем (удаляем/маскируем) из diagnostics
@@ -64,6 +65,26 @@ def get_diagnostics_snapshot(
     }
 
 
+def _get_websocket_snapshot(runtime: AtmeexRuntimeData, options: dict[str, Any]) -> dict[str, Any]:
+    """Return websocket diagnostics snapshot."""
+    ws_manager = getattr(runtime, "websocket_manager", None)
+    configured = bool(options.get(CONF_ENABLE_WEBSOCKET, DEFAULT_ENABLE_WEBSOCKET))
+    ws_age = getattr(ws_manager, "last_message_age", None) if ws_manager is not None else None
+
+    age_seconds: float | None = None
+    if isinstance(ws_age, (int, float)) and isfinite(float(ws_age)):
+        age_seconds = round(float(ws_age), 1)
+
+    return {
+        "configured": configured,
+        "manager_initialized": ws_manager is not None,
+        "is_connected": bool(getattr(ws_manager, "is_connected", False))
+        if ws_manager is not None
+        else False,
+        "last_message_age_sec": age_seconds,
+    }
+
+
 async def async_get_config_entry_diagnostics(
     hass: HomeAssistant,
     entry: ConfigEntry,
@@ -82,11 +103,12 @@ async def async_get_config_entry_diagnostics(
     # компактный snapshot по координатору (device_count, last_success_ts, last_api_error)
     coordinator_diag = get_diagnostics_snapshot(coordinator)
 
+    options = dict(entry.options)
     diag: dict[str, Any] = {
         "entry": {
             "title": entry.title,
             "data": dict(entry.data),
-            "options": dict(entry.options),
+            "options": options,
         },
         "coordinator": {
             "last_update_success": getattr(coordinator, "last_update_success", None),
@@ -100,6 +122,7 @@ async def async_get_config_entry_diagnostics(
             # Только факт наличия токена, без самого токена
             "has_token": bool(getattr(api, "_token", None)) if api is not None else None,
         },
+        "websocket": _get_websocket_snapshot(runtime, options),
     }
 
     return async_redact_data(diag, TO_REDACT)
@@ -114,6 +137,7 @@ async def async_get_device_diagnostics(
 
     runtime: AtmeexRuntimeData = entry.runtime_data
     coordinator = runtime.coordinator
+    options = dict(entry.options)
     coordinator_data: dict[str, Any] = getattr(coordinator, "data", {}) or {}
     devices = coordinator_data.get("devices", []) or []
     states = coordinator_data.get("states", {}) or {}
@@ -157,6 +181,7 @@ async def async_get_device_diagnostics(
             "state": device_state,
         },
         "coordinator_diagnostics": coordinator_diag,
+        "websocket": _get_websocket_snapshot(runtime, options),
     }
 
     return async_redact_data(diag, TO_REDACT)

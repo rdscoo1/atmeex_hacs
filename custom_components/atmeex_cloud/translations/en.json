@@ -119,6 +119,14 @@
       "humidity": {
         "name": "Humidity"
       }
+    },
+    "switch": {
+      "auto_nanny": {
+        "name": "AutoNanny"
+      },
+      "sleep_mode": {
+        "name": "Sleep Mode"
+      }
     }
   },
   "services": {

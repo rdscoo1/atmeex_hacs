@@ -153,6 +153,20 @@ class TestFanEntityRaceProtection:
         # No pending command, should use coordinator value
         # speed=3 -> 3 * 100 / 7 ≈ 43%
         assert fan.percentage == 43
+
+    def test_percentage_uses_runtime_helper(self):
+        fan, runtime, api, coordinator = _make_fan_entity_with_runtime()
+        runtime.clear_pending_if_confirmed = MagicMock(
+            wraps=runtime.clear_pending_if_confirmed
+        )
+
+        assert fan.percentage == 43
+        runtime.clear_pending_if_confirmed.assert_called_once_with(
+            1,
+            "fan_speed",
+            3,
+            tolerance=PENDING_COMMAND_TTL,
+        )
     
     def test_percentage_clears_pending_when_confirmed(self):
         fan, runtime, api, coordinator = _make_fan_entity_with_runtime()
@@ -239,12 +253,12 @@ async def test_lock_serializes_operations():
     
     async def slow_set_fan_speed(device_id, speed):
         order.append(f"start_set_{speed}")
-        await asyncio.sleep(0.1)
+        await asyncio.sleep(0)
         order.append(f"end_set_{speed}")
     
     async def slow_refresh(device_id):
         order.append(f"start_refresh")
-        await asyncio.sleep(0.05)
+        await asyncio.sleep(0)
         order.append(f"end_refresh")
     
     api.set_fan_speed = slow_set_fan_speed

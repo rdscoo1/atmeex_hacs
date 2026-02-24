@@ -1,6 +1,7 @@
 import pytest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
+from homeassistant.exceptions import HomeAssistantError
 
 from custom_components.atmeex_cloud.select import (
     AtmeexHumidificationSelect,
@@ -8,8 +9,7 @@ from custom_components.atmeex_cloud.select import (
     HUM_OPTIONS,
     BREEZER_OPTIONS,
 )
-from custom_components.atmeex_cloud.const import DOMAIN
-from custom_components.atmeex_cloud.api import AtmeexDevice
+from custom_components.atmeex_cloud.api import ApiError, AtmeexDevice
 
 
 def _make_selects(cond_overrides: dict | None = None):
@@ -34,18 +34,15 @@ def _make_selects(cond_overrides: dict | None = None):
         {"id": 1, "name": "Dev1", "model": "m", "online": True}
     )
 
-    hum = AtmeexHumidificationSelect(coordinator, api, dev, "Hum mode")
-    breezer = AtmeexBreezerSelect(coordinator, api, dev, "Breezer mode")
-
-    # hass не нужен, т.к. эти классы не используют _refresh
-    hum.hass = SimpleNamespace(data={DOMAIN: {}})
-    breezer.hass = SimpleNamespace(data={DOMAIN: {}})
+    hum = AtmeexHumidificationSelect(coordinator, api, dev)
+    breezer = AtmeexBreezerSelect(coordinator, api, dev)
 
     return hum, breezer, cond, api, coordinator
 
 
 def test_humidification_select_current_option_from_hum_stg():
     hum, breezer, cond, api, coord = _make_selects({"hum_stg": 2})
+    assert getattr(hum, "_attr_name", None) is None
     assert hum.current_option == HUM_OPTIONS[2]
     cond["hum_stg"] = 0
     assert hum.current_option == "off"
@@ -77,8 +74,18 @@ async def test_humidification_select_invalid_option_noop():
     coord.async_request_refresh.assert_not_awaited()
 
 
+@pytest.mark.asyncio
+async def test_humidification_select_raises_homeassistant_error_on_api_failure():
+    hum, breezer, cond, api, coord = _make_selects()
+    api.set_humid_stage.side_effect = ApiError("boom", status=500)
+
+    with pytest.raises(HomeAssistantError, match="Failed to set humidification stage"):
+        await hum.async_select_option("2")
+
+
 def test_breezer_select_current_option_from_damp_pos():
     hum, breezer, cond, api, coord = _make_selects({"damp_pos": 1})
+    assert getattr(breezer, "_attr_name", None) is None
     assert breezer.current_option == BREEZER_OPTIONS[1]
 
     cond["damp_pos"] = 10
@@ -102,3 +109,12 @@ async def test_breezer_select_invalid_option_noop():
     await breezer.async_select_option("неизвестно")
     api.set_breezer_mode.assert_not_awaited()
     coord.async_request_refresh.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_breezer_select_raises_homeassistant_error_on_api_failure():
+    hum, breezer, cond, api, coord = _make_selects()
+    api.set_breezer_mode.side_effect = ApiError("boom", status=500)
+
+    with pytest.raises(HomeAssistantError, match="Failed to set breezer mode"):
+        await breezer.async_select_option(BREEZER_OPTIONS[1])

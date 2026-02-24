@@ -53,7 +53,7 @@ class WebSocketManager:
     - Graceful shutdown
     
     Usage:
-        manager = WebSocketManager(token, on_message_callback)
+        manager = WebSocketManager(token_getter, on_message_callback)
         await manager.connect()
         # ... manager runs in background ...
         await manager.disconnect()
@@ -62,7 +62,7 @@ class WebSocketManager:
     def __init__(
         self,
         session: aiohttp.ClientSession,
-        token: str,
+        token_getter: Callable[[], str] | str,
         on_message: Callable[[dict[str, Any]], None],
         config: Optional[WebSocketConfig] = None,
     ) -> None:
@@ -70,12 +70,17 @@ class WebSocketManager:
         
         Args:
             session: aiohttp ClientSession for WebSocket connection
-            token: Authentication token from API login
+            token_getter: Callable returning current auth token, or static token string.
+                Use a callable so reconnects pick up refreshed tokens.
             on_message: Callback function for received messages
             config: Optional WebSocket configuration
         """
         self._session = session
-        self._token = token
+        if callable(token_getter):
+            self._token_getter: Callable[[], str] = token_getter
+        else:
+            static_token = token_getter
+            self._token_getter = lambda: static_token
         self._on_message = on_message
         self._config = config or WebSocketConfig()
         
@@ -103,7 +108,8 @@ class WebSocketManager:
         """Try exactly one WebSocket connection attempt."""
         try:
             _LOGGER.info("Connecting to Atmeex WebSocket: %s", self._config.base_url)
-            headers = {"Authorization": f"Bearer {self._token}"}
+            token = self._token_getter() or ""
+            headers = {"Authorization": f"Bearer {token}"}
             self._ws = await self._session.ws_connect(
                 self._config.base_url,
                 headers=headers,
