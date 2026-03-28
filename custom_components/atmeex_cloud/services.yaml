@@ -8,7 +8,7 @@ set_breezer_mode:
   fields:
     mode:
       name: Mode
-      description: The breezer mode to set.
+      description: The breezer mode to set (supply_ventilation, recirculation, mixed_mode, supply_valve).
       required: true
       example: "recirculation"
       selector:
@@ -29,7 +29,7 @@ set_humidifier_stage:
   fields:
     stage:
       name: Stage
-      description: The humidifier stage (0=off, 1-3=stages).
+      description: The humidifier stage (0=off, 1=low, 2=medium, 3=high).
       required: true
       example: 2
       selector:

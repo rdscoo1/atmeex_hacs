@@ -136,7 +136,7 @@ async def test_async_setup_entry_happy_path(monkeypatch):
         def async_set_updated_data(self, data):
             self.data = data
 
-    monkeypatch.setattr(atmeex_init, "DataUpdateCoordinator", DummyCoordinator)
+    monkeypatch.setattr(atmeex_init, "AtmeexCoordinator", DummyCoordinator)
 
     # подменяем async_get_clientsession
     monkeypatch.setattr(atmeex_init, "async_get_clientsession", lambda hass: object())
@@ -241,7 +241,7 @@ async def test_async_setup_entry_uses_options_update_interval(
         def async_set_updated_data(self, data):
             self.data = data
 
-    monkeypatch.setattr(atmeex_init, "DataUpdateCoordinator", DummyCoordinator)
+    monkeypatch.setattr(atmeex_init, "AtmeexCoordinator", DummyCoordinator)
 
     hass = SimpleNamespace(
         data={},
@@ -328,7 +328,7 @@ async def test_refresh_device_coalesces_parallel_requests(monkeypatch):
         def async_set_updated_data(self, data):
             self.data = data
 
-    monkeypatch.setattr(atmeex_init, "DataUpdateCoordinator", DummyCoordinator)
+    monkeypatch.setattr(atmeex_init, "AtmeexCoordinator", DummyCoordinator)
 
     hass = SimpleNamespace(
         data={},
@@ -458,7 +458,7 @@ async def test_websocket_batch_message_updates_coordinator_once(monkeypatch):
             self.update_calls += 1
             self.data = data
 
-    monkeypatch.setattr(atmeex_init, "DataUpdateCoordinator", DummyCoordinator)
+    monkeypatch.setattr(atmeex_init, "AtmeexCoordinator", DummyCoordinator)
 
     hass = SimpleNamespace(
         data={},
@@ -616,7 +616,7 @@ async def test_setup_entry_uses_fallback_devices_and_hydration_fallback(monkeypa
         def async_set_updated_data(self, data):
             self.data = data
 
-    monkeypatch.setattr(atmeex_init, "DataUpdateCoordinator", DummyCoordinator)
+    monkeypatch.setattr(atmeex_init, "AtmeexCoordinator", DummyCoordinator)
 
     hass = SimpleNamespace(
         data={},
@@ -674,7 +674,7 @@ async def test_setup_entry_reauth_on_fallback_auth_error(monkeypatch):
         async def async_config_entry_first_refresh(self):
             self.data = await self.update_method()
 
-    monkeypatch.setattr(atmeex_init, "DataUpdateCoordinator", DummyCoordinator)
+    monkeypatch.setattr(atmeex_init, "AtmeexCoordinator", DummyCoordinator)
 
     hass = SimpleNamespace(
         data={},
@@ -725,7 +725,7 @@ async def test_setup_entry_registers_reload_listener(monkeypatch):
         def async_set_updated_data(self, data):
             self.data = data
 
-    monkeypatch.setattr(atmeex_init, "DataUpdateCoordinator", DummyCoordinator)
+    monkeypatch.setattr(atmeex_init, "AtmeexCoordinator", DummyCoordinator)
 
     captured_listener = {}
 
@@ -783,7 +783,7 @@ async def test_setup_entry_websocket_skipped_without_ws_connect(monkeypatch):
         def async_set_updated_data(self, data):
             self.data = data
 
-    monkeypatch.setattr(atmeex_init, "DataUpdateCoordinator", DummyCoordinator)
+    monkeypatch.setattr(atmeex_init, "AtmeexCoordinator", DummyCoordinator)
 
     hass = SimpleNamespace(
         data={},
@@ -834,7 +834,7 @@ async def test_setup_entry_websocket_skipped_without_token(monkeypatch):
         def async_set_updated_data(self, data):
             self.data = data
 
-    monkeypatch.setattr(atmeex_init, "DataUpdateCoordinator", DummyCoordinator)
+    monkeypatch.setattr(atmeex_init, "AtmeexCoordinator", DummyCoordinator)
 
     hass = SimpleNamespace(
         data={},
@@ -914,7 +914,7 @@ async def test_setup_entry_websocket_auth_failure_starts_reauth(monkeypatch):
         def async_set_updated_data(self, data):
             self.data = data
 
-    monkeypatch.setattr(atmeex_init, "DataUpdateCoordinator", DummyCoordinator)
+    monkeypatch.setattr(atmeex_init, "AtmeexCoordinator", DummyCoordinator)
 
     hass = SimpleNamespace(
         data={},
@@ -1004,7 +1004,7 @@ async def test_websocket_settings_message_updates_state(monkeypatch):
             self.update_calls += 1
             self.data = data
 
-    monkeypatch.setattr(atmeex_init, "DataUpdateCoordinator", DummyCoordinator)
+    monkeypatch.setattr(atmeex_init, "AtmeexCoordinator", DummyCoordinator)
 
     hass = SimpleNamespace(
         data={},
@@ -1125,7 +1125,7 @@ async def test_websocket_logbook_device_events_are_throttled(monkeypatch):
         def async_set_updated_data(self, data):
             self.data = data
 
-    monkeypatch.setattr(atmeex_init, "DataUpdateCoordinator", DummyCoordinator)
+    monkeypatch.setattr(atmeex_init, "AtmeexCoordinator", DummyCoordinator)
 
     hass = SimpleNamespace(
         data={},
@@ -1245,7 +1245,7 @@ async def _build_ws_runtime(monkeypatch, *, initial_condition=None):
         def async_set_updated_data(self, data):
             self.data = data
 
-    monkeypatch.setattr(atmeex_init, "DataUpdateCoordinator", _Coord)
+    monkeypatch.setattr(atmeex_init, "AtmeexCoordinator", _Coord)
 
     hass = SimpleNamespace(
         data={},

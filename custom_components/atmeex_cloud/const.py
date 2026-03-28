@@ -16,6 +16,11 @@ RETRY_BASE_DELAY_SEC = 1.0
 RETRY_MAX_DELAY_SEC = 32.0  # CAP exponential backoff!
 TOKEN_REFRESH_BUFFER_SEC = 60
 
+# Logbook event types (shared between __init__ and logbook modules)
+EVENT_API_ERROR = "atmeex_cloud_api_error"
+EVENT_DEVICE_UPDATED = "atmeex_cloud_device_updated"
+WS_LOGBOOK_MIN_INTERVAL_SEC = 5.0
+
 CONF_UPDATE_INTERVAL = "update_interval"
 CONF_ENABLE_WEBSOCKET = "enable_websocket"
 DEFAULT_UPDATE_INTERVAL = 30

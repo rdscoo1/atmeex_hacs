@@ -133,6 +133,86 @@ def to_bool(v: Any) -> bool:
         return bool(v)
 
 
+def _to_int(value: Any) -> int | None:
+    """Safe int conversion, returns None on failure."""
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def apply_condition_update(
+    state: dict[str, Any], condition_data: dict[str, Any]
+) -> dict[str, Any]:
+    """Apply a WebSocket condition update to an existing device state.
+
+    Handles the same fields as ``_normalize_device_state`` but operates
+    incrementally — only the fields present in *condition_data* are touched.
+    """
+    updated = dict(state)
+
+    if "pwr_on" in condition_data:
+        updated["pwr_on"] = to_bool(condition_data["pwr_on"])
+
+    if "fan_speed" in condition_data:
+        updated["fan_speed"] = api_to_fan_speed(condition_data["fan_speed"])
+
+    for field in ("temp_room", "temp_in", "hum_room", "co2_ppm", "damp_pos", "hum_stg"):
+        if field in condition_data:
+            parsed = _to_int(condition_data[field])
+            if parsed is not None:
+                updated[field] = parsed
+
+    if "no_water" in condition_data:
+        updated["no_water"] = to_bool(condition_data["no_water"])
+
+    if "time" in condition_data:
+        updated["time"] = condition_data["time"]
+
+    # Any received WS condition means device connection is alive right now.
+    updated["online"] = True
+    return updated
+
+
+def apply_settings_update(
+    state: dict[str, Any], settings_data: dict[str, Any]
+) -> dict[str, Any]:
+    """Apply a WebSocket settings update to an existing device state.
+
+    Same rationale as ``apply_condition_update`` — incremental overlay.
+    """
+    updated = dict(state)
+
+    if "u_pwr_on" in settings_data:
+        updated["pwr_on"] = to_bool(settings_data["u_pwr_on"])
+
+    if "u_fan_speed" in settings_data:
+        normalized_speed = api_to_fan_speed(settings_data["u_fan_speed"])
+        updated["u_fan_speed"] = normalized_speed
+        # Sync fan_speed (condition) only when device is on to avoid reporting
+        # a non-zero speed while the device is actually off.
+        if updated.get("pwr_on"):
+            updated["fan_speed"] = normalized_speed
+
+    if "u_temp_room" in settings_data:
+        parsed = _to_int(settings_data["u_temp_room"])
+        if parsed is not None:
+            updated["u_temp_room"] = parsed
+
+    if "u_hum_stg" in settings_data:
+        parsed = _to_int(settings_data["u_hum_stg"])
+        if parsed is not None:
+            updated["hum_stg"] = parsed
+
+    if "u_damp_pos" in settings_data:
+        parsed = _to_int(settings_data["u_damp_pos"])
+        if parsed is not None:
+            updated["damp_pos"] = parsed
+
+    updated["online"] = True
+    return updated
+
+
 def _normalize_device_state(item: dict[str, Any]) -> dict[str, Any]:
     """Merge condition + settings into a normalized HA state."""
     cond = dict(item.get("condition") or {})

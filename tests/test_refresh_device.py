@@ -76,7 +76,7 @@ async def test_refresh_device_updates_coordinator_data(monkeypatch):
         def async_set_updated_data(self, data):
             self.data = data
 
-    monkeypatch.setattr(atmeex_init, "DataUpdateCoordinator", DummyCoordinator)
+    monkeypatch.setattr(atmeex_init, "AtmeexCoordinator", DummyCoordinator)
 
     # подменяем async_get_clientsession, чтобы не создавать реальную сессию
     monkeypatch.setattr(atmeex_init, "async_get_clientsession", lambda hass: object())

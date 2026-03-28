@@ -6,7 +6,7 @@ import time
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import timedelta
-from typing import Any, TypedDict, Callable, Awaitable
+from typing import Any, Callable, Awaitable
 
 import aiohttp
 from homeassistant.config_entries import ConfigEntry
@@ -14,13 +14,11 @@ from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import ConfigEntryNotReady, ConfigEntryAuthFailed
 from homeassistant.helpers.device_registry import DeviceEntry
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
-from homeassistant.helpers.update_coordinator import (
-    DataUpdateCoordinator,
-    UpdateFailed,
-)
+from homeassistant.helpers.update_coordinator import UpdateFailed
 from homeassistant.const import CONF_EMAIL, CONF_PASSWORD
 
 from .api import AtmeexApi, ApiError, AtmeexDevice, AtmeexState
+from .coordinator import AtmeexCoordinator, AtmeexCoordinatorData
 from .const import (
     DOMAIN,
     PLATFORMS,
@@ -30,27 +28,13 @@ from .const import (
     DEFAULT_UPDATE_INTERVAL,
     MIN_UPDATE_INTERVAL,
     MAX_UPDATE_INTERVAL,
+    EVENT_API_ERROR,
+    EVENT_DEVICE_UPDATED,
+    WS_LOGBOOK_MIN_INTERVAL_SEC,
 )
-from .config_flow import AtmeexOptionsFlowHandler
-from .helpers import api_to_fan_speed, to_bool
+from .helpers import apply_condition_update, apply_settings_update
 
 _LOGGER = logging.getLogger(__name__)
-
-# События, которые будут попадать в Logbook
-EVENT_API_ERROR = "atmeex_cloud_api_error"
-EVENT_DEVICE_UPDATED = "atmeex_cloud_device_updated"
-WS_LOGBOOK_MIN_INTERVAL_SEC = 5.0
-
-
-class AtmeexCoordinatorData(TypedDict, total=False):
-    """Структура данных, хранимая координатором."""
-    devices: list[dict[str, Any]
-                  ]  # "сырой" payload для обратной совместимости / диагностики
-    device_map: dict[str, AtmeexDevice]
-    states: dict[str, dict[str, Any]]
-    last_success_ts: float | None
-    avg_latency_ms: float | None
-    request_retries: int
 
 
 @dataclass
@@ -65,7 +49,7 @@ class PendingCommand:
 class AtmeexRuntimeData:
     """Единый runtime-объект для записи конфигурации."""
     api: AtmeexApi
-    coordinator: DataUpdateCoordinator[AtmeexCoordinatorData]
+    coordinator: AtmeexCoordinator
     refresh_device: Callable[[int | str], Awaitable[None]]
     # Per-device locks to serialize set+refresh operations
     device_locks: dict[str, asyncio.Lock] = field(default_factory=dict)
@@ -155,10 +139,12 @@ class AtmeexRuntimeData:
 __all__ = [
     "async_setup_entry",
     "async_unload_entry",
-    "async_get_options_flow",
+    "AtmeexCoordinator",
     "AtmeexCoordinatorData",
     "AtmeexRuntimeData",
     "PendingCommand",
+    "EVENT_API_ERROR",
+    "EVENT_DEVICE_UPDATED",
 ]
 
 
@@ -224,7 +210,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         _fire_logbook_event(EVENT_API_ERROR, data)
         _api_error_last_ts = now
 
-    coordinator: DataUpdateCoordinator[AtmeexCoordinatorData]
+    coordinator: AtmeexCoordinator
 
     async def _update_listener(hass: HomeAssistant, entry: ConfigEntry) -> None:
         await hass.config_entries.async_reload(entry.entry_id)
@@ -296,11 +282,14 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     async def _async_update_data() -> AtmeexCoordinatorData:
         """Плановый опрос: тянем устройства, при ошибке кидаем UpdateFailed / AuthFailed."""
 
+        # Record monotonic time *before* the network round-trip so we can
+        # detect WS updates that arrived while the poll was in-flight.
+        poll_start_mono = time.monotonic()
         start_ts = time.perf_counter()
         try:
             device_objs = await _fetch_devices_safely()
         except ApiError as err:
-            setattr(coordinator, "last_api_error", err)
+            coordinator.last_api_error = err
             status = getattr(err, "status", None)
             _fire_api_error_event(
                 {
@@ -318,7 +307,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 f"Error communicating with Atmeex API: {err}"
             ) from err
         except Exception as err:
-            setattr(coordinator, "last_api_error", None)
+            coordinator.last_api_error = None
             _fire_api_error_event(
                 {"message": str(err), "source": "coordinator_update"}
             )
@@ -373,6 +362,22 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
         retry_count = getattr(api, "_retry_count", 0)
 
+        # Preserve WS state for devices that received a fresher WebSocket
+        # update while this poll was in-flight.  Without this, the poll
+        # result (started *before* the WS message) would overwrite the
+        # newer WS-pushed state.
+        cur_data = coordinator.data
+        if cur_data and isinstance(cur_data, dict):
+            cur_states = cur_data.get("states") or {}
+            for did, ws_ts in _ws_device_update_ts.items():
+                if ws_ts >= poll_start_mono and did in cur_states and did in states:
+                    _LOGGER.debug(
+                        "Preserving fresher WS state for device %s "
+                        "(ws_ts=%.3f >= poll_start=%.3f)",
+                        did, ws_ts, poll_start_mono,
+                    )
+                    states[did] = cur_states[did]
+
         data: AtmeexCoordinatorData = {
             "devices": devices_raw,
             "device_map": device_map,
@@ -383,22 +388,18 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         }
 
         # успех — сохраняем timestamp и сбрасываем ошибку
-        setattr(coordinator, "last_success_ts", data["last_success_ts"])
-        setattr(coordinator, "last_api_error", None)
+        coordinator.last_success_ts = data["last_success_ts"]
+        coordinator.last_api_error = None
 
-        # успешный апдейт — обнуляем last error
         return data
 
-    coordinator = DataUpdateCoordinator(
+    coordinator = AtmeexCoordinator(
         hass,
         _LOGGER,
         name="Atmeex Cloud",
         update_method=_async_update_data,
         update_interval=timedelta(seconds=update_interval_seconds),
     )
-
-    setattr(coordinator, "last_api_error", None)
-    setattr(coordinator, "last_success_ts", None)
 
     await coordinator.async_config_entry_first_refresh()
 
@@ -407,11 +408,14 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     refresh_tasks: dict[str, asyncio.Task[None]] = {}
     state_update_lock = asyncio.Lock()
-    websocket_message_queue: deque[dict[str, Any]] = deque()
+    websocket_message_queue: deque[dict[str, Any]] = deque(maxlen=500)
     # Mutable container avoids nonlocal and keeps runtime_data in sync automatically.
     _ws_task_ref: dict[str, asyncio.Task[None] | None] = {"task": None}
     ws_logbook_last_event_ts: float = float("-inf")
     ws_logbook_suppressed_updates = 0
+    # Per-device monotonic timestamp of last WS state update — used to prevent
+    # polling from overwriting fresher WS data.
+    _ws_device_update_ts: dict[str, float] = {}
 
     def _create_background_task(coro: Awaitable[None]) -> asyncio.Task[None]:
         """Create background task via HA scheduler."""
@@ -562,73 +566,6 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     websocket_start_task: asyncio.Task[None] | None = None
     enable_websocket = bool(options.get(CONF_ENABLE_WEBSOCKET, DEFAULT_ENABLE_WEBSOCKET))
 
-    def _to_int(value: Any) -> int | None:
-        try:
-            return int(value)
-        except (TypeError, ValueError):
-            return None
-
-    def _apply_condition_update(
-        state: dict[str, Any], condition_data: dict[str, Any]
-    ) -> dict[str, Any]:
-        updated = dict(state)
-
-        if "pwr_on" in condition_data:
-            updated["pwr_on"] = to_bool(condition_data["pwr_on"])
-
-        if "fan_speed" in condition_data:
-            updated["fan_speed"] = api_to_fan_speed(condition_data["fan_speed"])
-
-        for field in ("temp_room", "temp_in", "hum_room", "co2_ppm", "damp_pos", "hum_stg"):
-            if field in condition_data:
-                parsed = _to_int(condition_data[field])
-                if parsed is not None:
-                    updated[field] = parsed
-
-        if "no_water" in condition_data:
-            updated["no_water"] = to_bool(condition_data["no_water"])
-
-        if "time" in condition_data:
-            updated["time"] = condition_data["time"]
-
-        # Any received WS condition means device connection is alive right now.
-        updated["online"] = True
-        return updated
-
-    def _apply_settings_update(
-        state: dict[str, Any], settings_data: dict[str, Any]
-    ) -> dict[str, Any]:
-        updated = dict(state)
-
-        if "u_pwr_on" in settings_data:
-            updated["pwr_on"] = to_bool(settings_data["u_pwr_on"])
-
-        if "u_fan_speed" in settings_data:
-            normalized_speed = api_to_fan_speed(settings_data["u_fan_speed"])
-            updated["u_fan_speed"] = normalized_speed
-            # Sync fan_speed (condition) only when device is on to avoid reporting
-            # a non-zero speed while the device is actually off.
-            if updated.get("pwr_on"):
-                updated["fan_speed"] = normalized_speed
-
-        if "u_temp_room" in settings_data:
-            parsed = _to_int(settings_data["u_temp_room"])
-            if parsed is not None:
-                updated["u_temp_room"] = parsed
-
-        if "u_hum_stg" in settings_data:
-            parsed = _to_int(settings_data["u_hum_stg"])
-            if parsed is not None:
-                updated["hum_stg"] = parsed
-
-        if "u_damp_pos" in settings_data:
-            parsed = _to_int(settings_data["u_damp_pos"])
-            if parsed is not None:
-                updated["damp_pos"] = parsed
-
-        updated["online"] = True
-        return updated
-
     async def _apply_websocket_message(message: dict[str, Any]) -> None:
         msg_type = message.get("type")
         if msg_type not in ("condition", "settings"):
@@ -677,12 +614,12 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                     source = device_data.get("condition")
                     if not isinstance(source, dict) or not source:
                         continue
-                    updated_state = _apply_condition_update(states.get(key, {}), source)
+                    updated_state = apply_condition_update(states.get(key, {}), source)
                 else:
                     source = device_data.get("settings")
                     if not isinstance(source, dict) or not source:
                         continue
-                    updated_state = _apply_settings_update(states.get(key, {}), source)
+                    updated_state = apply_settings_update(states.get(key, {}), source)
 
                 if updated_state != states.get(key, {}):
                     states[key] = updated_state
@@ -691,6 +628,12 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
             if not changed:
                 return
+
+            # Record per-device WS update timestamp so polling knows not to
+            # overwrite this fresher state.
+            ws_now = time.monotonic()
+            for did in changed_device_ids:
+                _ws_device_update_ts[did] = ws_now
 
             coordinator.async_set_updated_data(
                 {
@@ -842,11 +785,6 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     
     unload_ok = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
     return unload_ok
-
-
-async def async_get_options_flow(config_entry: ConfigEntry):
-    """Hook для options flow."""
-    return AtmeexOptionsFlowHandler(config_entry)
 
 
 async def async_remove_config_entry_device(

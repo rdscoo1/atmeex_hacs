@@ -5,8 +5,7 @@ from typing import Any
 
 import voluptuous as vol
 from homeassistant import config_entries
-from homeassistant.config_entries import ConfigEntry
-from homeassistant.data_entry_flow import FlowResult
+from homeassistant.config_entries import ConfigEntry, ConfigFlowResult
 from homeassistant.const import CONF_EMAIL, CONF_PASSWORD
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 
@@ -52,7 +51,14 @@ class AtmeexConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         """Initialize the config flow."""
         self._reauth_entry: ConfigEntry | None = None
 
-    async def async_step_user(self, user_input: dict[str, Any] | None = None) -> FlowResult:
+    @staticmethod
+    def async_get_options_flow(
+        config_entry: ConfigEntry,
+    ) -> AtmeexOptionsFlowHandler:
+        """Return the options flow handler."""
+        return AtmeexOptionsFlowHandler()
+
+    async def async_step_user(self, user_input: dict[str, Any] | None = None) -> ConfigFlowResult:
         """Первый (и единственный) шаг мастера настройки.
 
         На этом шаге:
@@ -68,7 +74,6 @@ class AtmeexConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             session = async_get_clientsession(self.hass)
             api = AtmeexApi(session)
 
-            # Приводим поведение к __init__.py
             if hasattr(api, "async_init"):
                 await api.async_init()
 
@@ -113,7 +118,7 @@ class AtmeexConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 
     async def async_step_reauth(
         self, entry_data: dict[str, Any]
-    ) -> FlowResult:
+    ) -> ConfigFlowResult:
         """Handle re-authentication when credentials become invalid."""
         self._reauth_entry = self.hass.config_entries.async_get_entry(
             self.context["entry_id"]
@@ -122,7 +127,7 @@ class AtmeexConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 
     async def async_step_reauth_confirm(
         self, user_input: dict[str, Any] | None = None
-    ) -> FlowResult:
+    ) -> ConfigFlowResult:
         """Confirm re-authentication with new credentials."""
         errors: dict[str, str] = {}
 
@@ -184,10 +189,13 @@ class AtmeexConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 
 
 class AtmeexOptionsFlowHandler(config_entries.OptionsFlow):
-    def __init__(self, config_entry: config_entries.ConfigEntry) -> None:
-        self._config_entry = config_entry
+    """Options flow handler for Atmeex Cloud.
 
-    async def async_step_init(self, user_input=None) -> FlowResult:
+    Modern HA provides ``self.config_entry`` automatically — no need to
+    accept it in ``__init__``.
+    """
+
+    async def async_step_init(self, user_input: dict[str, Any] | None = None) -> ConfigFlowResult:
         if user_input is not None:
             try:
                 interval = int(user_input[CONF_UPDATE_INTERVAL])
@@ -195,7 +203,7 @@ class AtmeexOptionsFlowHandler(config_entries.OptionsFlow):
                 interval = DEFAULT_UPDATE_INTERVAL
             interval = max(MIN_UPDATE_INTERVAL, min(MAX_UPDATE_INTERVAL, interval))
             enable_ws = user_input.get(CONF_ENABLE_WEBSOCKET, DEFAULT_ENABLE_WEBSOCKET)
-            
+
             return self.async_create_entry(
                 title="",
                 data={
@@ -204,7 +212,7 @@ class AtmeexOptionsFlowHandler(config_entries.OptionsFlow):
                 },
             )
 
-        options = getattr(self._config_entry, "options", {}) or {}
+        options = self.config_entry.options or {}
         current_interval = options.get(CONF_UPDATE_INTERVAL, DEFAULT_UPDATE_INTERVAL)
         current_ws = options.get(CONF_ENABLE_WEBSOCKET, DEFAULT_ENABLE_WEBSOCKET)
 

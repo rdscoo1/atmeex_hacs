@@ -76,6 +76,11 @@ class AtmeexOnlineSensor(AtmeexEntityMixin, CoordinatorEntity, BinarySensorEntit
         self._attr_unique_id = f"{device.id}_online"
 
     @property
+    def available(self) -> bool:
+        """Online sensor is always available so it can report offline state."""
+        return True
+
+    @property
     def is_on(self) -> bool:
         """Return True if the device is online."""
         return bool(self._device_state.get("online", False))

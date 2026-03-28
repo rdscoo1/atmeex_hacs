@@ -108,6 +108,8 @@ class AtmeexClimateEntity(AtmeexEntityMixin, CoordinatorEntity, ClimateEntity):
     _attr_icon = "mdi:air-purifier"
     _attr_has_entity_name = True
     _attr_translation_key = "breezer"
+    _attr_min_humidity = 0
+    _attr_max_humidity = 100
     _attr_preset_modes = [PRESET_NONE, PRESET_BOOST, PRESET_SLEEP]
     _attr_preset_mode = PRESET_NONE
 
@@ -128,7 +130,6 @@ class AtmeexClimateEntity(AtmeexEntityMixin, CoordinatorEntity, ClimateEntity):
         self._refresh_device_cb = refresh_device_cb
         self._runtime = runtime
 
-        self._attr_name = device.name
         self._attr_unique_id = f"{device.id}_climate"
         self._saved_fan_mode: str | None = None
         self._is_boost = False
@@ -235,12 +236,12 @@ class AtmeexClimateEntity(AtmeexEntityMixin, CoordinatorEntity, ClimateEntity):
         return deci_to_c(self._device_state.get("temp_room"))
 
     @property
-    def target_temperature(self) -> float:
+    def target_temperature(self) -> float | None:
         v = self._device_state.get("u_temp_room")
         t = deci_to_c(v)
-        if t is not None:
+        if t is not None and self._attr_min_temp <= t <= self._attr_max_temp:
             return t
-        return self.current_temperature or 20.0
+        return None
 
     async def async_set_temperature(self, **kwargs) -> None:
         """Установить целевую температуру.
@@ -477,9 +478,10 @@ class AtmeexClimateEntity(AtmeexEntityMixin, CoordinatorEntity, ClimateEntity):
     @property
     def extra_state_attributes(self) -> dict[str, Any] | None:
         """Вернуть дополнительные атрибуты (температуры в °C и наличие увлажнителя)."""
-        attrs = dict(self._device_state)
-        room = deci_to_c(self._device_state.get("temp_room"))
-        target = deci_to_c(self._device_state.get("u_temp_room"))
+        attrs: dict[str, Any] = {}
+        state = self._device_state
+        room = deci_to_c(state.get("temp_room"))
+        target = deci_to_c(state.get("u_temp_room"))
         if room is not None:
             attrs["room_temp_c"] = round(room, 1)
         if target is not None:

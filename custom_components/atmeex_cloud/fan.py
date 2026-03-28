@@ -65,7 +65,7 @@ class AtmeexFanEntity(AtmeexEntityMixin, CoordinatorEntity, FanEntity):
     
     _attr_supported_features = _supported_features
     _attr_has_entity_name = True
-    _attr_percentage_step = 1
+    _attr_speed_count = 7
     _attr_translation_key = "breezer_fan"
 
     def __init__(
@@ -84,7 +84,6 @@ class AtmeexFanEntity(AtmeexEntityMixin, CoordinatorEntity, FanEntity):
         self._device_id = device.id
         self._refresh_device_cb = refresh_device_cb
         self._runtime = runtime
-        self._attr_name = device.name
         self._attr_unique_id = f"{device.id}_fan"
 
     def _speed_to_percentage(self, speed: int | float | None) -> int:
@@ -223,5 +222,8 @@ class AtmeexFanEntity(AtmeexEntityMixin, CoordinatorEntity, FanEntity):
             await _do_turn_off()
 
     async def async_set_percentage(self, percentage: int) -> None:
+        if percentage == 0:
+            await self.async_turn_off()
+            return
         speed = self._percentage_to_speed(percentage)
         await self._set_fan_speed_with_lock(speed)

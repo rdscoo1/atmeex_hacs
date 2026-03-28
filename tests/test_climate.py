@@ -144,13 +144,17 @@ def test_climate_no_humidifier():
 
 
 def test_climate_target_temp_fallbacks():
-    # нет цели, есть текущая температура
+    # нет цели → None (no fake target from current_temperature)
     ent, cond, api = _make_entity({"u_temp_room": None})
-    assert ent.target_temperature == pytest.approx(21.5)
+    assert ent.target_temperature is None
 
-    # нет ни цели, ни текущей — дефолт 20.0
+    # нет ни цели, ни текущей — тоже None
     ent2, cond2, api2 = _make_entity({"u_temp_room": None, "temp_room": None})
-    assert ent2.target_temperature == 20.0
+    assert ent2.target_temperature is None
+
+    # sentinel value out of range → None
+    ent3, cond3, api3 = _make_entity({"u_temp_room": -1000})
+    assert ent3.target_temperature is None
 
 
 def test_climate_fan_mode_invalid():

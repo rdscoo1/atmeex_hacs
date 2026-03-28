@@ -8,10 +8,9 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import CONF_EMAIL, CONF_PASSWORD
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.device_registry import DeviceEntry
-from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
-
 from .const import DOMAIN, CONF_ENABLE_WEBSOCKET, DEFAULT_ENABLE_WEBSOCKET
-from . import AtmeexRuntimeData, AtmeexCoordinatorData
+from .coordinator import AtmeexCoordinator, AtmeexCoordinatorData
+from . import AtmeexRuntimeData
 
 # Поля, которые всегда редактируем (удаляем/маскируем) из diagnostics
 TO_REDACT: set[str] = {
@@ -26,7 +25,7 @@ TO_REDACT: set[str] = {
 
 
 def get_diagnostics_snapshot(
-    coordinator: DataUpdateCoordinator[AtmeexCoordinatorData],
+    coordinator: AtmeexCoordinator,
 ) -> dict[str, Any]:
     """Компактный snapshot для диагностики (entities / diagnostics UI).
 

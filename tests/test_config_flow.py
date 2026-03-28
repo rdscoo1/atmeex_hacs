@@ -156,7 +156,8 @@ async def test_config_flow_show_form_without_input():
 @pytest.mark.asyncio
 async def test_options_flow_sets_update_interval():
     entry = SimpleNamespace(options={"update_interval": 30})
-    flow = AtmeexOptionsFlowHandler(entry)
+    flow = AtmeexOptionsFlowHandler()
+    flow._config_entry = entry
 
     result = await flow.async_step_init(
         user_input={CONF_UPDATE_INTERVAL: 60, CONF_ENABLE_WEBSOCKET: True}
@@ -170,7 +171,8 @@ async def test_options_flow_sets_update_interval():
 @pytest.mark.asyncio
 async def test_options_flow_clamps_interval_and_parses_invalid():
     entry = SimpleNamespace(options={})
-    flow = AtmeexOptionsFlowHandler(entry)
+    flow = AtmeexOptionsFlowHandler()
+    flow._config_entry = entry
 
     result_low = await flow.async_step_init(
         user_input={CONF_UPDATE_INTERVAL: "bad", CONF_ENABLE_WEBSOCKET: False}
@@ -199,7 +201,8 @@ async def test_options_flow_show_form_with_current_values():
             CONF_ENABLE_WEBSOCKET: False,
         }
     )
-    flow = AtmeexOptionsFlowHandler(entry)
+    flow = AtmeexOptionsFlowHandler()
+    flow._config_entry = entry
 
     result = await flow.async_step_init(user_input=None)
 

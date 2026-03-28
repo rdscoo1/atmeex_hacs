@@ -2,8 +2,7 @@ from __future__ import annotations
 
 from homeassistant.core import HomeAssistant, Event, callback
 
-from .const import DOMAIN
-from . import EVENT_API_ERROR, EVENT_DEVICE_UPDATED
+from .const import DOMAIN, EVENT_API_ERROR, EVENT_DEVICE_UPDATED
 
 
 @callback
