@@ -35,11 +35,13 @@
         "description": "Configure integration settings.",
         "data": {
           "update_interval": "Update interval (seconds)",
-          "enable_websocket": "Enable WebSocket (real-time updates)"
+          "enable_websocket": "Enable WebSocket (real-time updates)",
+          "enable_co2": "Enable CO2 sensor"
         },
         "data_description": {
           "update_interval": "How often to poll the API (10-300 seconds). Lower values = more frequent updates but more API calls.",
-          "enable_websocket": "Use WebSocket for instant updates. Disable to use HTTP polling only (more reliable but slower)."
+          "enable_websocket": "Use WebSocket for instant updates. Disable to use HTTP polling only (more reliable but slower).",
+          "enable_co2": "Show the CO2 level sensor for each device. Disable if your device does not have a CO2 sensor."
         }
       }
     }
@@ -68,6 +70,15 @@
               "recirculation": "Recirculation",
               "mixed_mode": "Mixed mode",
               "supply_valve": "Supply valve"
+            }
+          },
+          "preset_mode": {
+            "name": "Preset mode",
+            "state": {
+              "none": "None",
+              "auto": "Auto",
+              "boost": "Boost",
+              "sleep": "Sleep"
             }
           }
         }
@@ -115,6 +126,9 @@
       },
       "inlet_temperature": {
         "name": "Inlet temperature"
+      },
+      "outdoor_temperature": {
+        "name": "Outdoor temperature"
       },
       "humidity": {
         "name": "Humidity"

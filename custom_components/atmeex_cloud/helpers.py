@@ -157,7 +157,7 @@ def apply_condition_update(
     if "fan_speed" in condition_data:
         updated["fan_speed"] = api_to_fan_speed(condition_data["fan_speed"])
 
-    for field in ("temp_room", "temp_in", "hum_room", "co2_ppm", "damp_pos", "hum_stg"):
+    for field in ("temp_room", "temp_in", "temp_out", "hum_room", "co2_ppm", "damp_pos", "hum_stg"):
         if field in condition_data:
             parsed = _to_int(condition_data[field])
             if parsed is not None:
@@ -168,6 +168,10 @@ def apply_condition_update(
 
     if "time" in condition_data:
         updated["time"] = condition_data["time"]
+
+    for bool_field in ("u_auto", "u_night"):
+        if bool_field in condition_data:
+            updated[bool_field] = to_bool(condition_data[bool_field])
 
     # Any received WS condition means device connection is alive right now.
     updated["online"] = True
@@ -208,6 +212,10 @@ def apply_settings_update(
         parsed = _to_int(settings_data["u_damp_pos"])
         if parsed is not None:
             updated["damp_pos"] = parsed
+
+    for bool_field in ("u_auto", "u_night"):
+        if bool_field in settings_data:
+            updated[bool_field] = to_bool(settings_data[bool_field])
 
     updated["online"] = True
     return updated
@@ -296,6 +304,18 @@ def _normalize_device_state(item: dict[str, Any]) -> dict[str, Any]:
         out["hum_room"] = int(hum_room)
     if isinstance(temp_room, (int, float)):
         out["temp_room"] = int(temp_room)
+
+    temp_out = cond.get("temp_out")
+    if isinstance(temp_out, (int, float)):
+        out["temp_out"] = int(temp_out)
+
+    # Normalize boolean mode flags (auto / night)
+    for bool_field in ("u_auto", "u_night"):
+        val = cond.get(bool_field)
+        if val is None:
+            val = st.get(bool_field)
+        if val is not None:
+            out[bool_field] = to_bool(val)
 
     online = item.get("online")
     if online is not None:

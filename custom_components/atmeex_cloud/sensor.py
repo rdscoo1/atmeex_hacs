@@ -21,7 +21,7 @@ from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from . import AtmeexRuntimeData
 from .api import AtmeexDevice
-from .const import DOMAIN
+from .const import DOMAIN, CONF_ENABLE_CO2, DEFAULT_ENABLE_CO2
 from .entity_base import AtmeexEntityMixin
 from .helpers import deci_to_c
 
@@ -45,18 +45,30 @@ async def async_setup_entry(
     data = coordinator.data or {}
     device_map: dict[str, AtmeexDevice] = data.get("device_map", {}) or {}
 
+    options = getattr(entry, "options", {}) or {}
+    enable_co2 = options.get(CONF_ENABLE_CO2, DEFAULT_ENABLE_CO2)
+
     for dev in device_map.values():
-        # CO2 sensor
+        # CO2 sensor (conditional on options toggle)
+        if enable_co2:
+            entities.append(
+                AtmeexCO2Sensor(
+                    coordinator=coordinator,
+                    device=dev,
+                    entry_id=entry.entry_id,
+                )
+            )
+        # Inlet temperature sensor
         entities.append(
-            AtmeexCO2Sensor(
+            AtmeexInletTempSensor(
                 coordinator=coordinator,
                 device=dev,
                 entry_id=entry.entry_id,
             )
         )
-        # Inlet temperature sensor
+        # Outdoor temperature sensor
         entities.append(
-            AtmeexInletTempSensor(
+            AtmeexOutdoorTempSensor(
                 coordinator=coordinator,
                 device=dev,
                 entry_id=entry.entry_id,
@@ -206,6 +218,34 @@ class AtmeexInletTempSensor(AtmeexEntityMixin, CoordinatorEntity, SensorEntity):
     def native_value(self) -> float | None:
         """Вернуть температуру входящего воздуха в °C."""
         return deci_to_c(self._device_state.get("temp_in"))
+
+
+class AtmeexOutdoorTempSensor(AtmeexEntityMixin, CoordinatorEntity, SensorEntity):
+    """Сенсор температуры наружного воздуха."""
+
+    _attr_device_class = SensorDeviceClass.TEMPERATURE
+    _attr_state_class = SensorStateClass.MEASUREMENT
+    _attr_native_unit_of_measurement = UnitOfTemperature.CELSIUS
+    _attr_has_entity_name = True
+    _attr_translation_key = "outdoor_temperature"
+
+    def __init__(
+        self,
+        coordinator,
+        device: AtmeexDevice,
+        entry_id: str,
+    ) -> None:
+        """Инициализация сенсора наружной температуры."""
+        super().__init__(coordinator)
+        self._device_meta = device
+        self._device_id = device.id
+        self._entry_id = entry_id
+        self._attr_unique_id = f"{device.id}_outdoor_temp"
+
+    @property
+    def native_value(self) -> float | None:
+        """Вернуть температуру наружного воздуха в °C."""
+        return deci_to_c(self._device_state.get("temp_out"))
 
 
 class AtmeexHumiditySensor(AtmeexEntityMixin, CoordinatorEntity, SensorEntity):
