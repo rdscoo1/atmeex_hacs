@@ -121,6 +121,7 @@ class AtmeexApi:
         self._session = session
         self._token: Optional[str] = None
         self._token_type: str = "Bearer"
+        self._refresh_token: Optional[str] = None
         self._email: Optional[str] = None
         self._password: Optional[str] = None
         self._retry_count: int = 0  # суммарное число сетевых ретраев
@@ -138,6 +139,11 @@ class AtmeexApi:
         """Return the current auth token (empty string if not set)."""
         return self._token or ""
 
+    @property
+    def refresh_token(self) -> str | None:
+        """Return the current refresh token (None if not set)."""
+        return self._refresh_token
+
     def _token_is_valid(self) -> bool:
         """Проверить, что токен ещё жив и не протухнет прямо сейчас."""
         if not self._token:
@@ -152,6 +158,7 @@ class AtmeexApi:
     async def _ensure_token(self) -> None:
         """Гарантировать, что у нас есть валидный токен.
 
+        Tries refresh token first (cheaper), falls back to full login.
         Использует блокировку, чтобы не логиниться параллельно из разных корутин.
         """
         if self._token_is_valid():
@@ -161,6 +168,14 @@ class AtmeexApi:
             # второй раз проверяем внутри lock — вдруг кто-то уже залогинился
             if self._token_is_valid():
                 return
+
+            # Try refresh token first — it's cheaper than full login
+            if self._refresh_token:
+                try:
+                    await self._signin_refresh()
+                    return
+                except ApiError:
+                    _LOGGER.debug("Refresh token failed, falling back to basic login")
 
             if not self._email or not self._password:
                 raise ApiError("login: credentials not set")
@@ -235,6 +250,26 @@ class AtmeexApi:
             raise ApiError(f"{action_name} network error: {last_exc}") from last_exc
         return fallback_value
 
+    def _apply_token_response(self, data: dict) -> None:
+        """Extract and store token data from an auth response."""
+        token = data.get("access_token") or data.get("token")
+        token_type = data.get("token_type") or "Bearer"
+        if not token:
+            raise ApiError("login: token missing in response")
+        self._token = token
+        self._token_type = token_type
+
+        # Store refresh token if provided
+        rt = data.get("refresh_token")
+        if rt:
+            self._refresh_token = rt
+
+        expires_in = data.get("expires_in")
+        if isinstance(expires_in, (int, float)):
+            self._token_expires_at = time.time() + int(expires_in)
+        else:
+            self._token_expires_at = None
+
     async def _sign_in(self) -> None:
         """Выполнить логин по уже сохранённым email/паролю и сохранить токен доступа."""
         if not self._email or not self._password:
@@ -255,29 +290,44 @@ class AtmeexApi:
             ) as resp:
                 text = await resp.text()
                 if resp.status >= 400:
-                    # сообщение об ошибке должно содержать 'Auth failed {status}'
                     raise ApiError(
                         f"Auth failed {resp.status}: {text[:200]}",
                         status=resp.status,
                     )
                 data = await self._json(resp)
+                self._apply_token_response(data)
 
-                token = data.get("access_token") or data.get("token")
-                token_type = data.get("token_type") or "Bearer"
-                if not token:
-                    # строка, на которую уже есть тесты/логи
-                    raise ApiError("login: token missing in response")
-                self._token = token
-                self._token_type = token_type
-
-                expires_in = data.get("expires_in")
-                if isinstance(expires_in, (int, float)):
-                    self._token_expires_at = time.time() + int(expires_in)
-                else:
-                    self._token_expires_at = None
-
-        # Формат network-ошибки сохраняем: 'login network error: {e}'
         await self._with_retries(_do_login, "login")
+
+    async def _signin_refresh(self) -> None:
+        """Authenticate using the refresh token (cheaper than full login)."""
+        if not self._refresh_token:
+            raise ApiError("refresh: no refresh token")
+
+        async def _do_refresh():
+            async with self._session.post(
+                f"{API_BASE_URL}/auth/signin",
+                json={
+                    "grant_type": "refresh_token",
+                    "refresh_token": self._refresh_token,
+                },
+                headers={
+                    "Accept": "application/json",
+                    "Content-Type": "application/json",
+                },
+            ) as resp:
+                text = await resp.text()
+                if resp.status >= 400:
+                    # Invalidate refresh token on auth errors
+                    self._refresh_token = None
+                    raise ApiError(
+                        f"Auth failed {resp.status}: {text[:200]}",
+                        status=resp.status,
+                    )
+                data = await self._json(resp)
+                self._apply_token_response(data)
+
+        await self._with_retries(_do_refresh, "refresh_token")
     
     async def _request(
         self,

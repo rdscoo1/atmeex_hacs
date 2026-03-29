@@ -168,6 +168,11 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     api = AtmeexApi(session)
     await api.async_init()
 
+    # Restore refresh token from previous session if available
+    stored_refresh_token = entry.data.get("refresh_token")
+    if stored_refresh_token:
+        api._refresh_token = stored_refresh_token
+
     # Логин: различаем неверные креды и временные сетевые проблемы
     try:
         await api.login(email, password)
@@ -182,6 +187,11 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         raise ConfigEntryNotReady(
             f"Cannot connect to Atmeex Cloud: {err}"
         ) from err
+
+    # Persist refresh token if the API returned one
+    if api.refresh_token and api.refresh_token != stored_refresh_token:
+        new_data = {**entry.data, "refresh_token": api.refresh_token}
+        hass.config_entries.async_update_entry(entry, data=new_data)
 
     options = getattr(entry, "options", {}) or {}
     update_interval_seconds = _resolve_update_interval_seconds(options)
