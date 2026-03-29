@@ -726,6 +726,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                     token_getter=lambda: api.token,
                     on_message=on_websocket_message,
                     on_auth_failure=_on_ws_auth_failure,
+                    on_token_refresh=coordinator.async_request_refresh,
                 )
 
                 async def _start_websocket() -> None:

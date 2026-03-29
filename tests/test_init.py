@@ -379,7 +379,7 @@ async def test_websocket_batch_message_updates_coordinator_once(monkeypatch):
     created_ws_managers = []
 
     class FakeWebSocketManager:
-        def __init__(self, session, token_getter, on_message, on_auth_failure=None):
+        def __init__(self, session, token_getter, on_message, on_auth_failure=None, on_token_refresh=None):
             self.session = session
             self.token_getter = token_getter
             self.on_message = on_message
@@ -462,6 +462,9 @@ async def test_websocket_batch_message_updates_coordinator_once(monkeypatch):
             self.update_calls += 1
             self.data = data
 
+        async def async_request_refresh(self):
+            self.data = await self.update_method()
+
     monkeypatch.setattr(atmeex_init, "AtmeexCoordinator", DummyCoordinator)
 
     hass = SimpleNamespace(
@@ -474,9 +477,9 @@ async def test_websocket_batch_message_updates_coordinator_once(monkeypatch):
         ),
     )
     entry = SimpleNamespace(
-        data={"email": "user@example.com", "password": "pwd"},
+        data={"email": "test@example.com", "password": "testpassword"},
         options={"update_interval": 30, "enable_websocket": True},
-        entry_id="entry1",
+        entry_id="test_entry",
         add_update_listener=lambda _listener: (lambda: None),
         async_on_unload=lambda _cb: None,
     )
@@ -869,7 +872,7 @@ async def test_setup_entry_websocket_auth_failure_starts_reauth(monkeypatch):
     import custom_components.atmeex_cloud.websocket as websocket_mod
 
     class FakeWebSocketManager:
-        def __init__(self, session, token_getter, on_message, on_auth_failure=None):
+        def __init__(self, session, token_getter, on_message, on_auth_failure=None, on_token_refresh=None):
             self.on_auth_failure = on_auth_failure
 
         async def connect(self):
@@ -924,6 +927,9 @@ async def test_setup_entry_websocket_auth_failure_starts_reauth(monkeypatch):
         def async_set_updated_data(self, data):
             self.data = data
 
+        async def async_request_refresh(self):
+            self.data = await self.update_method()
+
     monkeypatch.setattr(atmeex_init, "AtmeexCoordinator", DummyCoordinator)
 
     hass = SimpleNamespace(
@@ -958,7 +964,7 @@ async def test_websocket_settings_message_updates_state(monkeypatch):
     callbacks = []
 
     class FakeWebSocketManager:
-        def __init__(self, session, token_getter, on_message, on_auth_failure=None):
+        def __init__(self, session, token_getter, on_message, on_auth_failure=None, on_token_refresh=None):
             self.on_message = on_message
             self.on_auth_failure = on_auth_failure
             callbacks.append(on_message)
@@ -1014,6 +1020,9 @@ async def test_websocket_settings_message_updates_state(monkeypatch):
         def async_set_updated_data(self, data):
             self.update_calls += 1
             self.data = data
+
+        async def async_request_refresh(self):
+            self.data = await self.update_method()
 
     monkeypatch.setattr(atmeex_init, "AtmeexCoordinator", DummyCoordinator)
 
@@ -1079,7 +1088,7 @@ async def test_websocket_logbook_device_events_are_throttled(monkeypatch):
     callbacks = []
 
     class FakeWebSocketManager:
-        def __init__(self, session, token_getter, on_message, on_auth_failure=None):
+        def __init__(self, session, token_getter, on_message, on_auth_failure=None, on_token_refresh=None):
             self.on_message = on_message
             self.on_auth_failure = on_auth_failure
             callbacks.append(on_message)
@@ -1136,6 +1145,9 @@ async def test_websocket_logbook_device_events_are_throttled(monkeypatch):
 
         def async_set_updated_data(self, data):
             self.data = data
+
+        async def async_request_refresh(self):
+            self.data = await self.update_method()
 
     monkeypatch.setattr(atmeex_init, "AtmeexCoordinator", DummyCoordinator)
 
@@ -1207,7 +1219,7 @@ async def _build_ws_runtime(monkeypatch, *, initial_condition=None):
     _callbacks: list = []
 
     class _FakeWS:
-        def __init__(self, session, token_getter, on_message, on_auth_failure=None):
+        def __init__(self, session, token_getter, on_message, on_auth_failure=None, on_token_refresh=None):
             _callbacks.append(on_message)
 
         async def connect(self):
@@ -1257,6 +1269,9 @@ async def _build_ws_runtime(monkeypatch, *, initial_condition=None):
 
         def async_set_updated_data(self, data):
             self.data = data
+
+        async def async_request_refresh(self):
+            self.data = await self.update_method()
 
     monkeypatch.setattr(atmeex_init, "AtmeexCoordinator", _Coord)
 

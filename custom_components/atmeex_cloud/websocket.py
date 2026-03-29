@@ -30,6 +30,7 @@ WS_RECONNECT_DELAY_MIN = 1.0  # seconds
 WS_RECONNECT_DELAY_MAX = 60.0  # seconds
 WS_PING_INTERVAL = 30.0  # seconds
 WS_PING_TIMEOUT = 10.0  # seconds
+WS_MAX_UNAUTHORIZED_BEFORE_REAUTH = 5  # trigger reauth after this many consecutive failures
 
 
 @dataclass
@@ -66,6 +67,7 @@ class WebSocketManager:
         on_message: Callable[[dict[str, Any]], None],
         config: Optional[WebSocketConfig] = None,
         on_auth_failure: Optional[Callable[[], None]] = None,
+        on_token_refresh: Optional[Callable[[], Any]] = None,
     ) -> None:
         """Initialize WebSocket manager.
 
@@ -78,6 +80,9 @@ class WebSocketManager:
             on_auth_failure: Optional callback invoked when the server rejects the token
                 with HTTP 401 or 403.  After calling this callback the manager stops
                 all reconnect attempts so the caller can start a reauth flow.
+            on_token_refresh: Optional async/sync callback to request a token refresh
+                (e.g. coordinator.async_request_refresh).  Called on 'unauthorized'
+                messages so the next reconnect picks up a fresh token.
         """
         self._session = session
         if callable(token_getter):
@@ -87,6 +92,7 @@ class WebSocketManager:
             self._token_getter = lambda: static_token
         self._on_message = on_message
         self._on_auth_failure = on_auth_failure
+        self._on_token_refresh = on_token_refresh
         self._config = config or WebSocketConfig()
         
         self._ws: Optional[ClientWebSocketResponse] = None
@@ -96,6 +102,7 @@ class WebSocketManager:
         
         self._reconnect_delay = self._config.reconnect_delay_min
         self._last_message_time = 0.0
+        self._consecutive_auth_failures = 0
         
     async def connect(self) -> bool:
         """Start WebSocket connection and keep reconnect loop active on failures."""
@@ -140,7 +147,8 @@ class WebSocketManager:
             self._ws = None
             return False
 
-        self._reconnect_delay = self._config.reconnect_delay_min
+        if self._consecutive_auth_failures == 0:
+            self._reconnect_delay = self._config.reconnect_delay_min
         await self._cancel_task(self._listen_task)
         self._listen_task = asyncio.create_task(self._listen())
         _LOGGER.info("WebSocket connected successfully")
@@ -233,7 +241,63 @@ class WebSocketManager:
             message = json.loads(data)
             
             _LOGGER.debug("WebSocket message received: %s", message)
-            
+
+            # Handle server-level 'unauthorized' rejection.
+            # The TCP handshake succeeds but the server immediately sends
+            # {"type": "unauthorized"} and closes the connection.  Without
+            # this check the manager would reconnect every ~1 s with the
+            # same stale token.  We apply exponential backoff and wait for
+            # the HTTP polling cycle to refresh the token.
+            if message.get("type") == "unauthorized":
+                self._consecutive_auth_failures += 1
+
+                if self._consecutive_auth_failures >= WS_MAX_UNAUTHORIZED_BEFORE_REAUTH:
+                    _LOGGER.warning(
+                        "WebSocket received %d consecutive 'unauthorized' "
+                        "messages — stopping reconnect and requesting reauth",
+                        self._consecutive_auth_failures,
+                    )
+                    self._running = False
+                    if self._on_auth_failure is not None:
+                        self._on_auth_failure()
+                    if self._ws and not self._ws.closed:
+                        await self._ws.close()
+                    return
+
+                delay = min(
+                    self._config.reconnect_delay_min
+                    * (2 ** self._consecutive_auth_failures),
+                    self._config.reconnect_delay_max,
+                )
+                self._reconnect_delay = delay
+                _LOGGER.warning(
+                    "WebSocket received 'unauthorized' message "
+                    "(attempt %d/%d), requesting token refresh, "
+                    "next reconnect in %.1f s",
+                    self._consecutive_auth_failures,
+                    WS_MAX_UNAUTHORIZED_BEFORE_REAUTH,
+                    delay,
+                )
+
+                # Ask the coordinator to refresh data (and the token)
+                # so the next reconnect picks up a valid token.
+                if self._on_token_refresh is not None:
+                    try:
+                        result = self._on_token_refresh()
+                        if asyncio.isfuture(result) or asyncio.iscoroutine(result):
+                            await result
+                    except Exception as err:  # noqa: BLE001
+                        _LOGGER.debug(
+                            "Token refresh request failed: %s", err
+                        )
+
+                if self._ws and not self._ws.closed:
+                    await self._ws.close()
+                return
+
+            # Successful data message — reset auth failure counter.
+            self._consecutive_auth_failures = 0
+
             # Call the message handler callback
             if callable(self._on_message):
                 try:

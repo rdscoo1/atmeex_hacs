@@ -399,3 +399,104 @@ async def test_reconnect_stops_after_success(monkeypatch):
     assert manager._connect_once.await_count == 2
     assert delays == [0.5, 1.0]
     assert manager._reconnect_task is None
+
+
+@pytest.mark.asyncio
+async def test_unauthorized_message_triggers_backoff_and_token_refresh():
+    """Unauthorized WS message should bump reconnect delay and call on_token_refresh."""
+    refresh_called = asyncio.Event()
+
+    async def fake_refresh():
+        refresh_called.set()
+
+    on_message_calls: list[dict] = []
+    manager = WebSocketManager(
+        session=_FlakySession(failures=0),
+        token_getter="token",
+        on_message=lambda payload: on_message_calls.append(payload),
+        config=WebSocketConfig(reconnect_delay_min=1.0, reconnect_delay_max=60.0),
+        on_token_refresh=fake_refresh,
+    )
+    manager._running = True
+    fake_ws = _FakeWebSocket()
+    manager._ws = fake_ws
+
+    await manager._handle_message(json.dumps({"type": "unauthorized", "data": None}))
+
+    # Token refresh was called
+    assert refresh_called.is_set()
+    # Counter incremented
+    assert manager._consecutive_auth_failures == 1
+    # Delay bumped: min * 2^1 = 2.0
+    assert manager._reconnect_delay == 2.0
+    # WS closed
+    assert fake_ws.closed is True
+    # Message NOT forwarded to on_message callback
+    assert on_message_calls == []
+    # Manager still running (below threshold)
+    assert manager._running is True
+
+
+@pytest.mark.asyncio
+async def test_unauthorized_counter_resets_on_successful_data_message():
+    """After unauthorized attempts, a real data message should reset the failure counter."""
+    manager = WebSocketManager(
+        session=_FlakySession(failures=0),
+        token_getter="token",
+        on_message=lambda _payload: None,
+        config=WebSocketConfig(reconnect_delay_min=1.0, reconnect_delay_max=60.0),
+    )
+    manager._running = True
+    manager._ws = _FakeWebSocket()
+
+    # Simulate 3 unauthorized attempts
+    for _ in range(3):
+        manager._ws = _FakeWebSocket()
+        await manager._handle_message(json.dumps({"type": "unauthorized", "data": None}))
+
+    assert manager._consecutive_auth_failures == 3
+    assert manager._reconnect_delay == 8.0  # 1.0 * 2^3
+
+    # Now a real data message arrives after successful reconnect
+    manager._ws = _FakeWebSocket()
+    await manager._handle_message(json.dumps({"type": "condition", "data": []}))
+
+    # Counter reset
+    assert manager._consecutive_auth_failures == 0
+
+
+@pytest.mark.asyncio
+async def test_unauthorized_triggers_reauth_after_max_failures():
+    """After WS_MAX_UNAUTHORIZED_BEFORE_REAUTH consecutive failures, on_auth_failure is called."""
+    auth_failure_called = MagicMock()
+    refresh_calls = 0
+
+    async def fake_refresh():
+        nonlocal refresh_calls
+        refresh_calls += 1
+
+    manager = WebSocketManager(
+        session=_FlakySession(failures=0),
+        token_getter="token",
+        on_message=lambda _payload: None,
+        config=WebSocketConfig(reconnect_delay_min=1.0, reconnect_delay_max=60.0),
+        on_auth_failure=auth_failure_called,
+        on_token_refresh=fake_refresh,
+    )
+    manager._running = True
+
+    max_attempts = websocket_mod.WS_MAX_UNAUTHORIZED_BEFORE_REAUTH
+
+    # Send unauthorized messages up to the threshold
+    for i in range(max_attempts):
+        manager._ws = _FakeWebSocket()
+        await manager._handle_message(json.dumps({"type": "unauthorized", "data": None}))
+
+    # on_auth_failure called on the last attempt
+    auth_failure_called.assert_called_once()
+    # Manager stopped
+    assert manager._running is False
+    # Counter equals max
+    assert manager._consecutive_auth_failures == max_attempts
+    # Token refresh was called for attempts 1..max-1 (not on the final one that triggers reauth)
+    assert refresh_calls == max_attempts - 1
