@@ -14,8 +14,10 @@ from .const import (
     DOMAIN,
     CONF_UPDATE_INTERVAL,
     CONF_ENABLE_WEBSOCKET,
+    CONF_ENABLE_CO2,
     DEFAULT_UPDATE_INTERVAL,
     DEFAULT_ENABLE_WEBSOCKET,
+    DEFAULT_ENABLE_CO2,
     MIN_UPDATE_INTERVAL,
     MAX_UPDATE_INTERVAL,
 )
@@ -203,18 +205,21 @@ class AtmeexOptionsFlowHandler(config_entries.OptionsFlow):
                 interval = DEFAULT_UPDATE_INTERVAL
             interval = max(MIN_UPDATE_INTERVAL, min(MAX_UPDATE_INTERVAL, interval))
             enable_ws = user_input.get(CONF_ENABLE_WEBSOCKET, DEFAULT_ENABLE_WEBSOCKET)
+            enable_co2 = user_input.get(CONF_ENABLE_CO2, DEFAULT_ENABLE_CO2)
 
             return self.async_create_entry(
                 title="",
                 data={
                     CONF_UPDATE_INTERVAL: interval,
                     CONF_ENABLE_WEBSOCKET: enable_ws,
+                    CONF_ENABLE_CO2: enable_co2,
                 },
             )
 
         options = self.config_entry.options or {}
         current_interval = options.get(CONF_UPDATE_INTERVAL, DEFAULT_UPDATE_INTERVAL)
         current_ws = options.get(CONF_ENABLE_WEBSOCKET, DEFAULT_ENABLE_WEBSOCKET)
+        current_co2 = options.get(CONF_ENABLE_CO2, DEFAULT_ENABLE_CO2)
 
         schema = vol.Schema(
             {
@@ -223,6 +228,7 @@ class AtmeexOptionsFlowHandler(config_entries.OptionsFlow):
                     vol.Clamp(min=MIN_UPDATE_INTERVAL, max=MAX_UPDATE_INTERVAL),
                 ),
                 vol.Optional(CONF_ENABLE_WEBSOCKET, default=current_ws): bool,
+                vol.Optional(CONF_ENABLE_CO2, default=current_co2): bool,
             }
         )
         return self.async_show_form(step_id="init", data_schema=schema)
