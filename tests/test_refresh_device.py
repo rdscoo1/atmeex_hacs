@@ -36,6 +36,7 @@ class FakeApi:
         self._dev_refreshed = AtmeexDevice.from_raw(dev_refreshed_raw)
 
         self.async_init = AsyncMock()
+        self.refresh_token = None
         self.login = AsyncMock()
 
         # первый полный опрос — список устройств (включённое)

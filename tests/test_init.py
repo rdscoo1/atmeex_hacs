@@ -100,6 +100,7 @@ async def test_async_setup_entry_happy_path(monkeypatch):
         def __init__(self, session):
             self.session = session
             self.async_init = AsyncMock()
+            self.refresh_token = None
             self.login = AsyncMock()
             dev_raw = {
                 "id": 1,
@@ -214,6 +215,7 @@ async def test_async_setup_entry_uses_options_update_interval(
         def __init__(self, session):
             self.session = session
             self.async_init = AsyncMock()
+            self.refresh_token = None
             self.login = AsyncMock()
             dev = AtmeexDevice.from_raw({"id": 1, "condition": {}})
             self.get_devices = AsyncMock(return_value=[dev])
@@ -285,6 +287,7 @@ async def test_refresh_device_coalesces_parallel_requests(monkeypatch):
         def __init__(self, session):
             self.session = session
             self.async_init = AsyncMock()
+            self.refresh_token = None
             self.login = AsyncMock()
             self._gate = asyncio.Event()
             self._block_get_device = False
@@ -400,6 +403,7 @@ async def test_websocket_batch_message_updates_coordinator_once(monkeypatch):
         def __init__(self, session):
             self.session = session
             self.async_init = AsyncMock()
+            self.refresh_token = None
             self.login = AsyncMock()
             self._token = "token-123"
 
@@ -573,6 +577,7 @@ async def test_setup_entry_uses_fallback_devices_and_hydration_fallback(monkeypa
     class FakeApi:
         def __init__(self, _session):
             self.async_init = AsyncMock()
+            self.refresh_token = None
             self.login = AsyncMock()
             self._token = "token"
             self.get_devices_calls = []
@@ -647,6 +652,7 @@ async def test_setup_entry_reauth_on_fallback_auth_error(monkeypatch):
     class FakeApi:
         def __init__(self, _session):
             self.async_init = AsyncMock()
+            self.refresh_token = None
             self.login = AsyncMock()
             self._token = "token"
 
@@ -700,6 +706,7 @@ async def test_setup_entry_registers_reload_listener(monkeypatch):
     class FakeApi:
         def __init__(self, _session):
             self.async_init = AsyncMock()
+            self.refresh_token = None
             self.login = AsyncMock()
             self._token = "token"
             dev = AtmeexDevice.from_raw({"id": 1, "condition": {"pwr_on": 1, "fan_speed": 2}})
@@ -762,6 +769,7 @@ async def test_setup_entry_websocket_skipped_without_ws_connect(monkeypatch):
     class FakeApi:
         def __init__(self, _session):
             self.async_init = AsyncMock()
+            self.refresh_token = None
             self.login = AsyncMock()
             self._token = "token"
             dev = AtmeexDevice.from_raw({"id": 1, "condition": {"pwr_on": 1, "fan_speed": 2}})
@@ -813,6 +821,7 @@ async def test_setup_entry_websocket_skipped_without_token(monkeypatch):
     class FakeApi:
         def __init__(self, _session):
             self.async_init = AsyncMock()
+            self.refresh_token = None
             self.login = AsyncMock()
             self._token = None
             dev = AtmeexDevice.from_raw({"id": 1, "condition": {"pwr_on": 1, "fan_speed": 2}})
@@ -880,6 +889,7 @@ async def test_setup_entry_websocket_auth_failure_starts_reauth(monkeypatch):
     class FakeApi:
         def __init__(self, _session):
             self.async_init = AsyncMock()
+            self.refresh_token = None
             self.login = AsyncMock()
             self._token = "token"
             dev = AtmeexDevice.from_raw(
@@ -968,6 +978,7 @@ async def test_websocket_settings_message_updates_state(monkeypatch):
     class FakeApi:
         def __init__(self, _session):
             self.async_init = AsyncMock()
+            self.refresh_token = None
             self.login = AsyncMock()
             self._token = "token"
             dev = AtmeexDevice.from_raw(
@@ -1091,6 +1102,7 @@ async def test_websocket_logbook_device_events_are_throttled(monkeypatch):
     class FakeApi:
         def __init__(self, _session):
             self.async_init = AsyncMock()
+            self.refresh_token = None
             self.login = AsyncMock()
             self._token = "token"
             dev = AtmeexDevice.from_raw(
@@ -1217,6 +1229,7 @@ async def _build_ws_runtime(monkeypatch, *, initial_condition=None):
     class _FakeApi:
         def __init__(self, _s):
             self.async_init = AsyncMock()
+            self.refresh_token = None
             self.login = AsyncMock()
             self._token = "tok"
             self.get_devices = AsyncMock(return_value=[dev])

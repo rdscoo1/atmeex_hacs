@@ -13,6 +13,7 @@ from custom_components.atmeex_cloud import AtmeexRuntimeData, PendingCommand
 from custom_components.atmeex_cloud.api import ApiError
 from custom_components.atmeex_cloud.climate import (
     AtmeexClimateEntity,
+    PRESET_AUTO,
     quantize_humidity,
     HUM_ALLOWED,
     BREEZER_SWING_MODES,
@@ -61,6 +62,8 @@ def _make_entity(overrides: dict[str, Any] | None = None):
         set_humid_stage=AsyncMock(),
         set_fan_speed=AsyncMock(),
         set_breezer_mode=AsyncMock(),
+        set_sleep_mode=AsyncMock(),
+        set_auto_mode=AsyncMock(),
     )
 
     # Минимальный raw для устройства
@@ -353,17 +356,25 @@ async def test_preset_sleep_then_restore_previous_fan_mode():
     ent, cond, api = _make_entity({"fan_speed": 4})
     ent.async_write_ha_state = lambda: None
 
+    # Simulate device state update after API call
+    async def _set_sleep(dev_id, enabled):
+        cond["u_night"] = enabled
+    api.set_sleep_mode.side_effect = _set_sleep
+
     await ent.async_set_preset_mode(PRESET_SLEEP)
     assert ent.preset_mode == PRESET_SLEEP
     assert ent._saved_fan_mode == "4"
+    api.set_sleep_mode.assert_awaited_once_with(1, True)
     api.set_fan_speed.assert_awaited_once_with(1, 2)
 
     api.set_fan_speed.reset_mock()
+    api.set_sleep_mode.reset_mock()
     cond["fan_speed"] = 2
 
     await ent.async_set_preset_mode(PRESET_NONE)
     assert ent.preset_mode == PRESET_NONE
     assert ent._saved_fan_mode is None
+    api.set_sleep_mode.assert_awaited_once_with(1, False)
     api.set_fan_speed.assert_awaited_once_with(1, 4)
 
 
@@ -386,6 +397,52 @@ async def test_preset_boost_then_restore_previous_fan_mode():
     assert ent._is_boost is False
     assert ent._saved_fan_mode is None
     api.set_fan_speed.assert_awaited_once_with(1, 3)
+
+
+@pytest.mark.asyncio
+async def test_preset_auto_calls_api():
+    """PRESET_AUTO activates auto mode via the API."""
+    ent, cond, api = _make_entity({"fan_speed": 3})
+    ent.async_write_ha_state = lambda: None
+
+    async def _set_auto(dev_id, enabled):
+        cond["u_auto"] = enabled
+    api.set_auto_mode.side_effect = _set_auto
+
+    await ent.async_set_preset_mode(PRESET_AUTO)
+    assert ent.preset_mode == PRESET_AUTO
+    api.set_auto_mode.assert_awaited_once_with(1, True)
+    # Fan speed should not change in auto mode
+    api.set_fan_speed.assert_not_called()
+
+    api.set_auto_mode.reset_mock()
+    await ent.async_set_preset_mode(PRESET_NONE)
+    assert ent.preset_mode == PRESET_NONE
+    api.set_auto_mode.assert_awaited_once_with(1, False)
+
+
+@pytest.mark.asyncio
+async def test_preset_mode_reads_from_device_state():
+    """preset_mode property reflects u_auto and u_night from device state."""
+    ent, cond, _api = _make_entity({"fan_speed": 3})
+    assert ent.preset_mode == PRESET_NONE
+
+    cond["u_night"] = True
+    assert ent.preset_mode == PRESET_SLEEP
+
+    cond["u_night"] = False
+    cond["u_auto"] = True
+    assert ent.preset_mode == PRESET_AUTO
+
+    cond["u_auto"] = False
+    assert ent.preset_mode == PRESET_NONE
+
+    # BOOST is client-side
+    ent._is_boost = True
+    assert ent.preset_mode == PRESET_BOOST
+    # BOOST takes priority even if u_auto is set
+    cond["u_auto"] = True
+    assert ent.preset_mode == PRESET_BOOST
 
 
 # ---------------------------------------------------------------------------

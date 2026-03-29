@@ -21,6 +21,8 @@ from homeassistant.components.climate.const import (
     PRESET_BOOST,
     PRESET_SLEEP,
 )
+
+PRESET_AUTO = "auto"
 import voluptuous as vol
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
@@ -110,8 +112,7 @@ class AtmeexClimateEntity(AtmeexEntityMixin, CoordinatorEntity, ClimateEntity):
     _attr_translation_key = "breezer"
     _attr_min_humidity = 0
     _attr_max_humidity = 100
-    _attr_preset_modes = [PRESET_NONE, PRESET_BOOST, PRESET_SLEEP]
-    _attr_preset_mode = PRESET_NONE
+    _attr_preset_modes = [PRESET_NONE, PRESET_AUTO, PRESET_BOOST, PRESET_SLEEP]
 
     def __init__(
         self,
@@ -133,6 +134,7 @@ class AtmeexClimateEntity(AtmeexEntityMixin, CoordinatorEntity, ClimateEntity):
         self._attr_unique_id = f"{device.id}_climate"
         self._saved_fan_mode: str | None = None
         self._is_boost = False
+        self._local_preset: str | None = None  # tracks BOOST (client-side only)
 
     # ---------- вспомогательные свойства ----------
 
@@ -436,40 +438,76 @@ class AtmeexClimateEntity(AtmeexEntityMixin, CoordinatorEntity, ClimateEntity):
             raise HomeAssistantError("Failed to set humidifier stage") from err
         await self._refresh()
 
-    # ---------- установка пресетов ----------
+    # ---------- пресеты ----------
+
+    @property
+    def preset_mode(self) -> str:
+        """Return current preset based on device state and local overrides.
+
+        PRESET_AUTO and PRESET_SLEEP are read from the API (u_auto / u_night).
+        PRESET_BOOST is client-side only (max fan speed override).
+        """
+        if self._is_boost:
+            return PRESET_BOOST
+
+        st = self._device_state
+        if st.get("u_night"):
+            return PRESET_SLEEP
+        if st.get("u_auto"):
+            return PRESET_AUTO
+        return PRESET_NONE
 
     async def async_set_preset_mode(self, preset_mode: str) -> None:
         old = self.preset_mode
 
-        actions: list[tuple[Callable, dict]] = []
+        # --- exit current mode first ---
+        if old == PRESET_BOOST and preset_mode != PRESET_BOOST:
+            self._is_boost = False
+            if self._saved_fan_mode is not None:
+                await self.async_set_fan_mode(self._saved_fan_mode)
+                self._saved_fan_mode = None
+        if old == PRESET_SLEEP and preset_mode != PRESET_SLEEP:
+            try:
+                await self.api.set_sleep_mode(self._device_id, False)
+            except ApiError as err:
+                _LOGGER.error("Failed to disable sleep mode: %s", err)
+            if self._saved_fan_mode is not None:
+                await self.async_set_fan_mode(self._saved_fan_mode)
+                self._saved_fan_mode = None
+        if old == PRESET_AUTO and preset_mode != PRESET_AUTO:
+            try:
+                await self.api.set_auto_mode(self._device_id, False)
+            except ApiError as err:
+                _LOGGER.error("Failed to disable auto mode: %s", err)
 
-        # Переход в SLEEP
-        if preset_mode == PRESET_SLEEP and old != PRESET_SLEEP:
+        # --- enter new mode ---
+        if preset_mode == PRESET_AUTO:
+            try:
+                await self.api.set_auto_mode(self._device_id, True)
+            except ApiError as err:
+                _LOGGER.error("Failed to enable auto mode: %s", err)
+                raise HomeAssistantError("Failed to set auto mode") from err
+
+        elif preset_mode == PRESET_SLEEP:
             if self._saved_fan_mode is None and self.fan_mode is not None:
                 self._saved_fan_mode = self.fan_mode
             target = min(int(self.fan_mode or "1"), int(self.sleep_max_fan_mode))
-            actions.append((self.async_set_fan_mode, {"fan_mode": str(target)}))
+            try:
+                await self.api.set_sleep_mode(self._device_id, True)
+            except ApiError as err:
+                _LOGGER.error("Failed to enable sleep mode: %s", err)
+                raise HomeAssistantError("Failed to set sleep mode") from err
+            await self.async_set_fan_mode(str(target))
 
-        # Переход в BOOST
-        if preset_mode == PRESET_BOOST and old != PRESET_BOOST:
+        elif preset_mode == PRESET_BOOST:
             self._is_boost = True
             if self._saved_fan_mode is None and self.fan_mode is not None:
                 self._saved_fan_mode = self.fan_mode
-            actions.append((self.async_set_fan_mode, {"fan_mode": self.boost_fan_mode}))
+            await self.async_set_fan_mode(self.boost_fan_mode)
 
-        # Выход из BOOST/SLEEP в NORMAL
-        if old in (PRESET_BOOST, PRESET_SLEEP) and preset_mode == PRESET_NONE:
-            if self._saved_fan_mode is not None:
-                actions.append(
-                    (self.async_set_fan_mode, {"fan_mode": self._saved_fan_mode})
-                )
-                self._saved_fan_mode = None
-            self._is_boost = False
+        # PRESET_NONE: modes already disabled above
 
-        for func, kwargs in actions:
-            await func(**kwargs)
-
-        self._attr_preset_mode = preset_mode
+        self._local_preset = preset_mode if preset_mode == PRESET_BOOST else None
         await self._refresh()
         self.async_write_ha_state()
 
