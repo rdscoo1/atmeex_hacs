@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from math import isfinite
-from typing import Any
+from typing import Any, Callable
 
 from homeassistant.components.sensor import (
     SensorEntity,
@@ -22,8 +23,55 @@ from homeassistant.helpers.update_coordinator import CoordinatorEntity
 from . import AtmeexRuntimeData
 from .api import AtmeexDevice
 from .const import DOMAIN, CONF_ENABLE_CO2, DEFAULT_ENABLE_CO2
-from .entity_base import AtmeexEntityMixin
-from .helpers import deci_to_c
+from .entity_base import AtmeexEntityMixin, setup_dynamic_device_entities
+from .helpers import deci_to_c, serialize_api_error, serialize_api_error_status
+
+
+@dataclass(frozen=True, slots=True)
+class _SensorSpec:
+    key: str
+    unique_suffix: str
+    device_class: SensorDeviceClass
+    unit: str
+    translation_key: str
+    convert: Callable[[Any], Any] = lambda v: int(v) if isinstance(v, (int, float)) else None
+
+
+_DEVICE_SENSOR_SPECS: tuple[_SensorSpec, ...] = (
+    _SensorSpec(
+        key="co2_ppm",
+        unique_suffix="co2",
+        device_class=SensorDeviceClass.CO2,
+        unit=CONCENTRATION_PARTS_PER_MILLION,
+        translation_key="co2",
+    ),
+    _SensorSpec(
+        key="temp_in",
+        unique_suffix="inlet_temp",
+        device_class=SensorDeviceClass.TEMPERATURE,
+        unit=UnitOfTemperature.CELSIUS,
+        translation_key="inlet_temperature",
+        convert=deci_to_c,
+    ),
+    _SensorSpec(
+        key="temp_out",
+        unique_suffix="outdoor_temp",
+        device_class=SensorDeviceClass.TEMPERATURE,
+        unit=UnitOfTemperature.CELSIUS,
+        translation_key="outdoor_temperature",
+        convert=deci_to_c,
+    ),
+    _SensorSpec(
+        key="hum_room",
+        unique_suffix="humidity",
+        device_class=SensorDeviceClass.HUMIDITY,
+        unit=PERCENTAGE,
+        translation_key="humidity",
+    ),
+)
+
+# Convenient lookup by unique_suffix for backward-compatible aliases
+_SPEC_BY_SUFFIX: dict[str, _SensorSpec] = {s.unique_suffix: s for s in _DEVICE_SENSOR_SPECS}
 
 
 async def async_setup_entry(
@@ -36,55 +84,33 @@ async def async_setup_entry(
     runtime: AtmeexRuntimeData = entry.runtime_data
     coordinator = runtime.coordinator
 
-    entities: list[SensorEntity] = []
-
     # Диагностический сенсор интеграции
-    entities.append(AtmeexDiagnosticsSensor(runtime, entry.entry_id))
-
-    # Сенсоры для каждого устройства
-    data = coordinator.data or {}
-    device_map: dict[str, AtmeexDevice] = data.get("device_map", {}) or {}
+    async_add_entities([AtmeexDiagnosticsSensor(runtime, entry.entry_id)])
 
     options = getattr(entry, "options", {}) or {}
     enable_co2 = options.get(CONF_ENABLE_CO2, DEFAULT_ENABLE_CO2)
 
-    for dev in device_map.values():
-        # CO2 sensor (conditional on options toggle)
-        if enable_co2:
+    def _build_entities(dev: AtmeexDevice) -> list[SensorEntity]:
+        entities: list[SensorEntity] = []
+        for spec in _DEVICE_SENSOR_SPECS:
+            if spec.key == "co2_ppm" and not enable_co2:
+                continue
             entities.append(
-                AtmeexCO2Sensor(
+                AtmeexDeviceSensor(
                     coordinator=coordinator,
                     device=dev,
                     entry_id=entry.entry_id,
+                    spec=spec,
                 )
             )
-        # Inlet temperature sensor
-        entities.append(
-            AtmeexInletTempSensor(
-                coordinator=coordinator,
-                device=dev,
-                entry_id=entry.entry_id,
-            )
-        )
-        # Outdoor temperature sensor
-        entities.append(
-            AtmeexOutdoorTempSensor(
-                coordinator=coordinator,
-                device=dev,
-                entry_id=entry.entry_id,
-            )
-        )
-        # Humidity sensor
-        entities.append(
-            AtmeexHumiditySensor(
-                coordinator=coordinator,
-                device=dev,
-                entry_id=entry.entry_id,
-            )
-        )
+        return entities
 
-    if entities:
-        async_add_entities(entities)
+    setup_dynamic_device_entities(
+        entry=entry,
+        coordinator=coordinator,
+        async_add_entities=async_add_entities,
+        build_entities=_build_entities,
+    )
 
 
 class AtmeexDiagnosticsSensor(CoordinatorEntity, SensorEntity):
@@ -156,122 +182,58 @@ class AtmeexDiagnosticsSensor(CoordinatorEntity, SensorEntity):
             "state_entries": len(states) if isinstance(states, dict) else 0,
             "last_success_ts": last_success_ts,
             "last_success_utc": last_success_utc,
-            "last_api_error": last_api_error,
+            "last_api_error": serialize_api_error(last_api_error),
+            "last_api_error_status": serialize_api_error_status(last_api_error),
             "websocket_connected": ws_connected,
             "websocket_last_message_age_sec": ws_last_message_age_sec,
             "domain": DOMAIN,
         }
 
 
-class AtmeexCO2Sensor(AtmeexEntityMixin, CoordinatorEntity, SensorEntity):
-    """Сенсор уровня CO2 в помещении."""
+class AtmeexDeviceSensor(AtmeexEntityMixin, CoordinatorEntity, SensorEntity):
+    """Generic per-device sensor driven by a _SensorSpec."""
 
-    _attr_device_class = SensorDeviceClass.CO2
-    _attr_state_class = SensorStateClass.MEASUREMENT
-    _attr_native_unit_of_measurement = CONCENTRATION_PARTS_PER_MILLION
     _attr_has_entity_name = True
-    _attr_translation_key = "co2"
+    _attr_state_class = SensorStateClass.MEASUREMENT
 
     def __init__(
         self,
         coordinator,
         device: AtmeexDevice,
         entry_id: str,
+        spec: _SensorSpec,
     ) -> None:
-        """Инициализация сенсора CO2."""
         super().__init__(coordinator)
         self._device_meta = device
         self._device_id = device.id
         self._entry_id = entry_id
-        self._attr_unique_id = f"{device.id}_co2"
+        self._spec = spec
+        self._attr_unique_id = f"{device.id}_{spec.unique_suffix}"
+        self._attr_device_class = spec.device_class
+        self._attr_native_unit_of_measurement = spec.unit
+        self._attr_translation_key = spec.translation_key
 
     @property
-    def native_value(self) -> int | None:
-        """Вернуть уровень CO2 в ppm."""
-        val = self._device_state.get("co2_ppm")
-        return int(val) if isinstance(val, (int, float)) else None
+    def native_value(self) -> float | int | None:
+        return self._spec.convert(self._device_state.get(self._spec.key))
 
 
-class AtmeexInletTempSensor(AtmeexEntityMixin, CoordinatorEntity, SensorEntity):
-    """Сенсор температуры входящего воздуха."""
-
-    _attr_device_class = SensorDeviceClass.TEMPERATURE
-    _attr_state_class = SensorStateClass.MEASUREMENT
-    _attr_native_unit_of_measurement = UnitOfTemperature.CELSIUS
-    _attr_has_entity_name = True
-    _attr_translation_key = "inlet_temperature"
-
-    def __init__(
-        self,
-        coordinator,
-        device: AtmeexDevice,
-        entry_id: str,
-    ) -> None:
-        """Инициализация сенсора температуры входящего воздуха."""
-        super().__init__(coordinator)
-        self._device_meta = device
-        self._device_id = device.id
-        self._entry_id = entry_id
-        self._attr_unique_id = f"{device.id}_inlet_temp"
-
-    @property
-    def native_value(self) -> float | None:
-        """Вернуть температуру входящего воздуха в °C."""
-        return deci_to_c(self._device_state.get("temp_in"))
+# Backward-compatible aliases for tests and external consumers
+def AtmeexCO2Sensor(coordinator, device: AtmeexDevice, entry_id: str) -> AtmeexDeviceSensor:
+    """Factory alias for CO2 sensor."""
+    return AtmeexDeviceSensor(coordinator, device, entry_id, _SPEC_BY_SUFFIX["co2"])
 
 
-class AtmeexOutdoorTempSensor(AtmeexEntityMixin, CoordinatorEntity, SensorEntity):
-    """Сенсор температуры наружного воздуха."""
-
-    _attr_device_class = SensorDeviceClass.TEMPERATURE
-    _attr_state_class = SensorStateClass.MEASUREMENT
-    _attr_native_unit_of_measurement = UnitOfTemperature.CELSIUS
-    _attr_has_entity_name = True
-    _attr_translation_key = "outdoor_temperature"
-
-    def __init__(
-        self,
-        coordinator,
-        device: AtmeexDevice,
-        entry_id: str,
-    ) -> None:
-        """Инициализация сенсора наружной температуры."""
-        super().__init__(coordinator)
-        self._device_meta = device
-        self._device_id = device.id
-        self._entry_id = entry_id
-        self._attr_unique_id = f"{device.id}_outdoor_temp"
-
-    @property
-    def native_value(self) -> float | None:
-        """Вернуть температуру наружного воздуха в °C."""
-        return deci_to_c(self._device_state.get("temp_out"))
+def AtmeexInletTempSensor(coordinator, device: AtmeexDevice, entry_id: str) -> AtmeexDeviceSensor:
+    """Factory alias for inlet temperature sensor."""
+    return AtmeexDeviceSensor(coordinator, device, entry_id, _SPEC_BY_SUFFIX["inlet_temp"])
 
 
-class AtmeexHumiditySensor(AtmeexEntityMixin, CoordinatorEntity, SensorEntity):
-    """Сенсор влажности в помещении."""
+def AtmeexOutdoorTempSensor(coordinator, device: AtmeexDevice, entry_id: str) -> AtmeexDeviceSensor:
+    """Factory alias for outdoor temperature sensor."""
+    return AtmeexDeviceSensor(coordinator, device, entry_id, _SPEC_BY_SUFFIX["outdoor_temp"])
 
-    _attr_device_class = SensorDeviceClass.HUMIDITY
-    _attr_state_class = SensorStateClass.MEASUREMENT
-    _attr_native_unit_of_measurement = PERCENTAGE
-    _attr_has_entity_name = True
-    _attr_translation_key = "humidity"
 
-    def __init__(
-        self,
-        coordinator,
-        device: AtmeexDevice,
-        entry_id: str,
-    ) -> None:
-        """Инициализация сенсора влажности."""
-        super().__init__(coordinator)
-        self._device_meta = device
-        self._device_id = device.id
-        self._entry_id = entry_id
-        self._attr_unique_id = f"{device.id}_humidity"
-
-    @property
-    def native_value(self) -> int | None:
-        """Вернуть влажность в %."""
-        val = self._device_state.get("hum_room")
-        return int(val) if isinstance(val, (int, float)) else None
+def AtmeexHumiditySensor(coordinator, device: AtmeexDevice, entry_id: str) -> AtmeexDeviceSensor:
+    """Factory alias for humidity sensor."""
+    return AtmeexDeviceSensor(coordinator, device, entry_id, _SPEC_BY_SUFFIX["humidity"])
