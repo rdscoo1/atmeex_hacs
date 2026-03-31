@@ -3,10 +3,11 @@ from __future__ import annotations
 from functools import cached_property
 from typing import Any, Awaitable, Callable, Iterable
 
+from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.device_registry import DeviceInfo
 
 from .const import DOMAIN
-from .api import AtmeexDevice
+from .api import ApiError, AtmeexDevice
 
 
 class AtmeexEntityMixin:
@@ -75,13 +76,13 @@ class AtmeexEntityMixin:
 
     async def _execute_command(
         self,
-        api_coro,
+        api_coro: Awaitable[None],
         *,
         pending_attr: str | None = None,
         pending_value: Any = None,
         error_message: str = "Command failed",
     ) -> None:
-        """Execute an API command with device lock, pending tracking, and refresh.
+        """Execute an API command with device lock when available, pending tracking, and refresh.
 
         Parameters:
             api_coro: awaitable that performs the API call.
@@ -89,9 +90,6 @@ class AtmeexEntityMixin:
             pending_value: value to record as pending before the call.
             error_message: human-readable message for HomeAssistantError on failure.
         """
-        from homeassistant.exceptions import HomeAssistantError
-        from .api import ApiError
-
         runtime = getattr(self, "_runtime", None)
 
         if pending_attr is not None and runtime is not None:

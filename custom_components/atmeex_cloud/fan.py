@@ -143,19 +143,15 @@ class AtmeexFanEntity(AtmeexEntityMixin, CoordinatorEntity, FanEntity):
         if percentage is None:
             percentage = self.percentage or 100
         speed = self._percentage_to_speed(percentage)
+        # Track fan_speed as a secondary pending before the primary pwr_on command
         if self._runtime is not None:
-            self._runtime.set_pending(self._device_id, "pwr_on", True)
-        try:
-            await self._execute_command(
-                self.api.set_fan_speed(self._device_id, speed),
-                pending_attr="fan_speed",
-                pending_value=speed,
-                error_message="Failed to set fan speed",
-            )
-        except Exception:
-            if self._runtime is not None:
-                self._runtime.clear_pending(self._device_id, "pwr_on")
-            raise
+            self._runtime.set_pending(self._device_id, "fan_speed", speed)
+        await self._execute_command(
+            self.api.set_fan_speed(self._device_id, speed),
+            pending_attr="pwr_on",
+            pending_value=True,
+            error_message="Failed to set fan speed",
+        )
 
     async def async_turn_off(self, **kwargs) -> None:
         await self._execute_command(
