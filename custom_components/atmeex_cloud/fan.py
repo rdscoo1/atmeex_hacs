@@ -5,8 +5,8 @@ from typing import Any, Awaitable, Callable
 
 from .helpers import fan_speed_to_percent, percent_to_fan_speed
 from . import AtmeexRuntimeData
-from .api import ApiError, AtmeexDevice
-from .entity_base import AtmeexEntityMixin
+from .api import AtmeexDevice
+from .entity_base import AtmeexEntityMixin, setup_dynamic_device_entities
 
 from homeassistant.components.fan import (
     FanEntity,
@@ -14,7 +14,6 @@ from homeassistant.components.fan import (
 )
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
-from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.update_coordinator import (
     CoordinatorEntity,
     DataUpdateCoordinator
@@ -32,13 +31,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_e
     coordinator = runtime.coordinator
     api = runtime.api
 
-    data = coordinator.data or {}
-    device_map: dict[str, AtmeexDevice] = data.get("device_map", {}) or {}
-
-    entities: list[AtmeexFanEntity] = []
-
-    for key, dev in device_map.items():
-        entities.append(
+    def _build_entities(dev: AtmeexDevice) -> list[AtmeexFanEntity]:
+        return [
             AtmeexFanEntity(
                 coordinator=coordinator,
                 api=api,
@@ -47,10 +41,14 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_e
                 refresh_device_cb=runtime.refresh_device,
                 runtime=runtime,
             )
-        )
+        ]
 
-    if entities:
-        async_add_entities(entities)
+    setup_dynamic_device_entities(
+        entry=entry,
+        coordinator=coordinator,
+        async_add_entities=async_add_entities,
+        build_entities=_build_entities,
+    )
 
 
 class AtmeexFanEntity(AtmeexEntityMixin, CoordinatorEntity, FanEntity):
@@ -141,89 +139,40 @@ class AtmeexFanEntity(AtmeexEntityMixin, CoordinatorEntity, FanEntity):
 
     # ----- commands -----
 
-    async def _set_fan_speed_with_lock(self, speed: int) -> None:
-        """Set fan speed with race protection.
-        
-        Uses device lock to serialize operations and tracks pending command
-        to prevent stale responses from overwriting newer state.
-        """
-        # Record pending command BEFORE acquiring lock (captures user intent timestamp)
-        if self._runtime is not None:
-            self._runtime.set_pending(self._device_id, "fan_speed", speed)
-        
-        _LOGGER.debug(
-            "Setting fan speed: device=%s speed=%s",
-            self._device_id, speed
-        )
-        
-        # Use device lock to serialize set+refresh operations
-        lock = self._runtime.get_device_lock(self._device_id) if self._runtime else None
-        
-        async def _do_set_and_refresh() -> None:
-            try:
-                await self.api.set_fan_speed(self._device_id, speed)
-            except ApiError as err:
-                _LOGGER.error("Failed to set fan speed for %s: %s", self._device_id, err)
-                # Clear pending on error
-                if self._runtime is not None:
-                    self._runtime.clear_pending(self._device_id, "fan_speed")
-                raise HomeAssistantError("Failed to set fan speed") from err
-            
-            # Immediately refresh to get confirmed state
-            await self._refresh()
-            
-            _LOGGER.debug(
-                "Fan speed set complete: device=%s speed=%s",
-                self._device_id, speed
-            )
-        
-        if lock is not None:
-            async with lock:
-                await _do_set_and_refresh()
-        else:
-            await _do_set_and_refresh()
-
     async def async_turn_on(self, percentage: int | None = None, **kwargs) -> None:
         if percentage is None:
             percentage = self.percentage or 100
         speed = self._percentage_to_speed(percentage)
-        # Set pending pwr_on=True for immediate UI feedback
         if self._runtime is not None:
             self._runtime.set_pending(self._device_id, "pwr_on", True)
         try:
-            await self._set_fan_speed_with_lock(speed)
-        except HomeAssistantError:
+            await self._execute_command(
+                self.api.set_fan_speed(self._device_id, speed),
+                pending_attr="fan_speed",
+                pending_value=speed,
+                error_message="Failed to set fan speed",
+            )
+        except Exception:
             if self._runtime is not None:
                 self._runtime.clear_pending(self._device_id, "pwr_on")
             raise
 
     async def async_turn_off(self, **kwargs) -> None:
-        # Set pending pwr_on=False for immediate UI feedback
-        if self._runtime is not None:
-            self._runtime.set_pending(self._device_id, "pwr_on", False)
-
-        lock = self._runtime.get_device_lock(self._device_id) if self._runtime else None
-
-        async def _do_turn_off() -> None:
-            try:
-                await self.api.set_power(self._device_id, False)
-            except ApiError as err:
-                _LOGGER.error("Failed to turn off fan for %s: %s", self._device_id, err)
-                if self._runtime is not None:
-                    self._runtime.clear_pending(self._device_id, "pwr_on")
-                raise HomeAssistantError("Failed to turn off fan") from err
-
-            await self._refresh()
-
-        if lock is not None:
-            async with lock:
-                await _do_turn_off()
-        else:
-            await _do_turn_off()
+        await self._execute_command(
+            self.api.set_power(self._device_id, False),
+            pending_attr="pwr_on",
+            pending_value=False,
+            error_message="Failed to turn off fan",
+        )
 
     async def async_set_percentage(self, percentage: int) -> None:
         if percentage == 0:
             await self.async_turn_off()
             return
         speed = self._percentage_to_speed(percentage)
-        await self._set_fan_speed_with_lock(speed)
+        await self._execute_command(
+            self.api.set_fan_speed(self._device_id, speed),
+            pending_attr="fan_speed",
+            pending_value=speed,
+            error_message="Failed to set fan speed",
+        )

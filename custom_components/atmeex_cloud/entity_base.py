@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from functools import cached_property
-from typing import Any, Awaitable, Callable
+from typing import Any, Awaitable, Callable, Iterable
 
 from homeassistant.helpers.device_registry import DeviceInfo
 
@@ -73,6 +73,47 @@ class AtmeexEntityMixin:
             return confirmed_value
         return pending.value
 
+    async def _execute_command(
+        self,
+        api_coro,
+        *,
+        pending_attr: str | None = None,
+        pending_value: Any = None,
+        error_message: str = "Command failed",
+    ) -> None:
+        """Execute an API command with device lock, pending tracking, and refresh.
+
+        Parameters:
+            api_coro: awaitable that performs the API call.
+            pending_attr: state attribute name to track as pending (e.g. "fan_speed").
+            pending_value: value to record as pending before the call.
+            error_message: human-readable message for HomeAssistantError on failure.
+        """
+        from homeassistant.exceptions import HomeAssistantError
+        from .api import ApiError
+
+        runtime = getattr(self, "_runtime", None)
+
+        if pending_attr is not None and runtime is not None:
+            runtime.set_pending(self._device_id, pending_attr, pending_value)
+
+        lock = runtime.get_device_lock(self._device_id) if runtime is not None else None
+
+        async def _do() -> None:
+            try:
+                await api_coro
+            except ApiError as err:
+                if pending_attr is not None and runtime is not None:
+                    runtime.clear_pending(self._device_id, pending_attr)
+                raise HomeAssistantError(error_message) from err
+            await self._refresh()
+
+        if lock is not None:
+            async with lock:
+                await _do()
+        else:
+            await _do()
+
     @property
     def available(self) -> bool:
         """Entity is available only when device is reported online."""
@@ -95,3 +136,52 @@ class AtmeexEntityMixin:
             model=getattr(dev, "model", None),
             sw_version=sw_version,
         )
+
+
+def supports_humidifier(state: dict[str, Any] | None) -> bool:
+    """Return True when the current device state exposes humidifier features."""
+    device_state = state or {}
+    return "hum_stg" in device_state or "no_water" in device_state
+
+
+def setup_dynamic_device_entities(
+    *,
+    entry: Any,
+    coordinator: Any,
+    async_add_entities: Callable[[list[Any]], None],
+    build_entities: Callable[[AtmeexDevice], Iterable[Any]],
+) -> None:
+    """Add entities for current devices and discover newly available ones later."""
+    known_unique_ids: set[str] = set()
+
+    def _sync_entities() -> None:
+        data = getattr(coordinator, "data", None) or {}
+        device_map = data.get("device_map", {}) or {}
+        new_entities: list[Any] = []
+
+        for dev in device_map.values():
+            for entity in build_entities(dev):
+                unique_id = getattr(entity, "unique_id", None) or getattr(
+                    entity, "_attr_unique_id", None
+                )
+                if unique_id is None:
+                    continue
+                unique_key = str(unique_id)
+                if unique_key in known_unique_ids:
+                    continue
+                known_unique_ids.add(unique_key)
+                new_entities.append(entity)
+
+        if new_entities:
+            async_add_entities(new_entities)
+
+    _sync_entities()
+
+    add_listener = getattr(coordinator, "async_add_listener", None)
+    if not callable(add_listener):
+        return
+
+    remove_listener = add_listener(_sync_entities)
+    async_on_unload = getattr(entry, "async_on_unload", None)
+    if callable(async_on_unload):
+        async_on_unload(remove_listener)

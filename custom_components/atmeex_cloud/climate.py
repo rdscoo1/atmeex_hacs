@@ -4,7 +4,11 @@ from datetime import datetime, timezone
 import logging
 from typing import Any, Callable, Awaitable
 from .helpers import deci_to_c, quantize_humidity, HUM_ALLOWED
-from .entity_base import AtmeexEntityMixin
+from .entity_base import (
+    AtmeexEntityMixin,
+    setup_dynamic_device_entities,
+    supports_humidifier,
+)
 
 from homeassistant.components.climate import (
     ClimateEntity,
@@ -57,12 +61,8 @@ async def async_setup_entry(
     coordinator = runtime.coordinator
     api = runtime.api
 
-    data = coordinator.data or {}
-    device_map: dict[str, AtmeexDevice] = data.get("device_map", {})
-
-    entities: list[AtmeexClimateEntity] = []
-    for dev in device_map.values():
-        entities.append(
+    def _build_entities(dev: AtmeexDevice) -> list[AtmeexClimateEntity]:
+        return [
             AtmeexClimateEntity(
                 coordinator=coordinator,
                 api=api,
@@ -71,10 +71,14 @@ async def async_setup_entry(
                 refresh_device_cb=runtime.refresh_device,
                 runtime=runtime,
             )
-        )
+        ]
 
-    if entities:
-        async_add_entities(entities)
+    setup_dynamic_device_entities(
+        entry=entry,
+        coordinator=coordinator,
+        async_add_entities=async_add_entities,
+        build_entities=_build_entities,
+    )
 
     platform = async_get_current_platform()
     platform.async_register_entity_service(
@@ -140,8 +144,7 @@ class AtmeexClimateEntity(AtmeexEntityMixin, CoordinatorEntity, ClimateEntity):
 
     def _has_humidifier(self) -> bool:
         """Есть ли у устройства увлажнитель (по наличию hum_stg)."""
-        stg = self._device_state.get("hum_stg")
-        return isinstance(stg, (int, float)) or ("hum_stg" in self._device_state)
+        return supports_humidifier(self._device_state)
 
     @property
     def boost_fan_mode(self) -> str:
@@ -189,47 +192,13 @@ class AtmeexClimateEntity(AtmeexEntityMixin, CoordinatorEntity, ClimateEntity):
         return HVACMode.FAN_ONLY if bool(effective_pwr) else HVACMode.OFF
 
     async def async_set_hvac_mode(self, hvac_mode: HVACMode) -> None:
-        """Включить/выключить устройство по смене режима HVAC.
-        
-        Uses device lock to serialize operations and tracks pending command
-        to prevent stale responses from overwriting newer state.
-        """
         power_on = hvac_mode != HVACMode.OFF
-        
-        # Record pending command BEFORE acquiring lock
-        if self._runtime is not None:
-            self._runtime.set_pending(self._device_id, "pwr_on", power_on)
-        
-        _LOGGER.debug(
-            "Climate: Setting power: device=%s power_on=%s",
-            self._device_id, power_on
+        await self._execute_command(
+            self.api.set_power(self._device_id, power_on),
+            pending_attr="pwr_on",
+            pending_value=power_on,
+            error_message="Failed to set HVAC mode",
         )
-        
-        # Use device lock to serialize set+refresh operations
-        lock = self._runtime.get_device_lock(self._device_id) if self._runtime else None
-        
-        async def _do_set_and_refresh():
-            try:
-                await self.api.set_power(self._device_id, power_on)
-            except ApiError as err:
-                _LOGGER.error("Failed to set HVAC mode for %s: %s", self._device_id, err)
-                # Clear pending on error
-                if self._runtime is not None:
-                    self._runtime.clear_pending(self._device_id, "pwr_on")
-                raise HomeAssistantError("Failed to set HVAC mode") from err
-            
-            await self._refresh()
-            
-            _LOGGER.debug(
-                "Climate: Power set complete: device=%s power_on=%s",
-                self._device_id, power_on
-            )
-        
-        if lock is not None:
-            async with lock:
-                await _do_set_and_refresh()
-        else:
-            await _do_set_and_refresh()
 
     # ---------- температура ----------
 
@@ -246,35 +215,25 @@ class AtmeexClimateEntity(AtmeexEntityMixin, CoordinatorEntity, ClimateEntity):
         return None
 
     async def async_set_temperature(self, **kwargs) -> None:
-        """Установить целевую температуру.
-
-        Если устройство выключено, сначала включаем питание.
-        Затем отправляем целевое значение в API и обновляем состояние.
-        """
         t = kwargs.get(ATTR_TEMPERATURE)
         if t is None:
             return
-    
-        # клампинг температуры к min/max
         try:
             t_float = float(t)
         except (ValueError, TypeError):
             _LOGGER.warning("Invalid temperature value: %s", t)
             return
-
         t_clamped = max(self._attr_min_temp, min(self._attr_max_temp, t_float))
 
-        try:
+        async def _set_temp():
             if not bool(self._device_state.get("pwr_on")):
                 await self.api.set_power(self._device_id, True)
             await self.api.set_target_temperature(self._device_id, t_clamped)
-        except ApiError as err:
-            _LOGGER.error(
-                "Failed to set target temperature for %s: %s", self._device_id, err
-            )
-            raise HomeAssistantError("Failed to set temperature") from err
 
-        await self._refresh()
+        await self._execute_command(
+            _set_temp(),
+            error_message="Failed to set temperature",
+        )
 
     # ---------- влажность ----------
 
@@ -300,23 +259,14 @@ class AtmeexClimateEntity(AtmeexEntityMixin, CoordinatorEntity, ClimateEntity):
         return HUM_ALLOWED[stg]
 
     async def async_set_humidity(self, humidity: int) -> None:
-        """Установить целевую влажность.
-
-        Любое значение квантуется в 0/33/66/100, затем переводится
-        в ступень 0..3 и отправляется в API.
-        """
         if not self._has_humidifier():
             return
         q = quantize_humidity(humidity)
         stage = HUM_ALLOWED.index(q)
-        try:
-            await self.api.set_humid_stage(self._device_id, stage)
-        except ApiError as err:
-            _LOGGER.error(
-                "Failed to set humidity stage for %s: %s", self._device_id, err
-            )
-            raise HomeAssistantError("Failed to set humidity") from err
-        await self._refresh()
+        await self._execute_command(
+            self.api.set_humid_stage(self._device_id, stage),
+            error_message="Failed to set humidity",
+        )
 
     # ---------- вентилятор ----------
 
@@ -349,53 +299,17 @@ class AtmeexClimateEntity(AtmeexEntityMixin, CoordinatorEntity, ClimateEntity):
         return None
 
     async def async_set_fan_mode(self, fan_mode: str) -> None:
-        """Установить скорость вентилятора по выбранному режиму.
-        
-        Uses device lock to serialize operations and tracks pending command
-        to prevent stale responses from overwriting newer state.
-        """
         try:
             speed = int(fan_mode)
         except (ValueError, TypeError):
             _LOGGER.warning("Unsupported fan_mode: %s", fan_mode)
             return
-        
-        # Record pending command BEFORE acquiring lock
-        if self._runtime is not None:
-            self._runtime.set_pending(self._device_id, "fan_speed", speed)
-        
-        _LOGGER.debug(
-            "Climate: Setting fan speed: device=%s speed=%s",
-            self._device_id, speed
+        await self._execute_command(
+            self.api.set_fan_speed(self._device_id, speed),
+            pending_attr="fan_speed",
+            pending_value=speed,
+            error_message="Failed to set fan mode",
         )
-        
-        # Use device lock to serialize set+refresh operations
-        lock = self._runtime.get_device_lock(self._device_id) if self._runtime else None
-        
-        async def _do_set_and_refresh():
-            try:
-                await self.api.set_fan_speed(self._device_id, speed)
-            except ApiError as err:
-                _LOGGER.error(
-                    "Failed to set fan speed for %s: %s", self._device_id, err
-                )
-                # Clear pending on error
-                if self._runtime is not None:
-                    self._runtime.clear_pending(self._device_id, "fan_speed")
-                raise HomeAssistantError("Failed to set fan mode") from err
-            
-            await self._refresh()
-            
-            _LOGGER.debug(
-                "Climate: Fan speed set complete: device=%s speed=%s",
-                self._device_id, speed
-            )
-        
-        if lock is not None:
-            async with lock:
-                await _do_set_and_refresh()
-        else:
-            await _do_set_and_refresh()
 
     # ---------- режим заслонки (swing) ----------
 
@@ -408,35 +322,26 @@ class AtmeexClimateEntity(AtmeexEntityMixin, CoordinatorEntity, ClimateEntity):
         return None
 
     async def async_set_swing_mode(self, swing_mode: str) -> None:
-        """Установить режим заслонки / бризера."""
         if swing_mode not in BREEZER_SWING_MODES:
             _LOGGER.warning("Unsupported swing_mode: %s", swing_mode)
             return
-        try:
-            await self.api.set_breezer_mode(
-                self._device_id, BREEZER_SWING_MODES.index(swing_mode)
-            )
-        except ApiError as err:
-            _LOGGER.error(
-                "Failed to set swing mode for %s: %s", self._device_id, err
-            )
-            raise HomeAssistantError("Failed to set swing mode") from err
-        await self._refresh()
+        await self._execute_command(
+            self.api.set_breezer_mode(self._device_id, BREEZER_SWING_MODES.index(swing_mode)),
+            error_message="Failed to set swing mode",
+        )
 
     async def async_set_breezer_mode(self, mode: str) -> None:
         """Service handler: set damper/breezer mode by name."""
         await self.async_set_swing_mode(mode)
 
     async def async_set_humidifier_stage(self, stage: int) -> None:
-        """Service handler: set humidifier stage directly (0=off, 1-3)."""
         if not self._has_humidifier():
             return
         stage = max(0, min(3, int(stage)))
-        try:
-            await self.api.set_humid_stage(self._device_id, stage)
-        except ApiError as err:
-            raise HomeAssistantError("Failed to set humidifier stage") from err
-        await self._refresh()
+        await self._execute_command(
+            self.api.set_humid_stage(self._device_id, stage),
+            error_message="Failed to set humidifier stage",
+        )
 
     # ---------- пресеты ----------
 
