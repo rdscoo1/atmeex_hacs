@@ -1,9 +1,10 @@
 import pytest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
+from homeassistant.helpers.json import json_dumps
 
 from custom_components.atmeex_cloud import AtmeexRuntimeData
-from custom_components.atmeex_cloud.api import AtmeexDevice
+from custom_components.atmeex_cloud.api import ApiError, AtmeexDevice
 from custom_components.atmeex_cloud.const import DOMAIN
 from custom_components.atmeex_cloud.sensor import (
     AtmeexCO2Sensor,
@@ -33,8 +34,8 @@ async def test_sensor_exposes_basic_attrs(hass):
         data={
             "devices": [{"id": 1}, {"id": 2}],
             "states": {},
-            "last_success_ts": 1234567890.0,
         },
+        last_success_ts=1234567890.0,
         last_api_error="some error",
     )
 
@@ -178,3 +179,41 @@ async def test_diagnostics_sensor_shows_websocket_state(hass):
 
     assert attrs["websocket_connected"] is True
     assert attrs["websocket_last_message_age_sec"] == 12.3
+
+
+@pytest.mark.asyncio
+async def test_diagnostics_sensor_serializes_api_error(hass):
+    coord = DummyCoordinator(
+        data={"devices": [{"id": 1}], "states": {}},
+        last_success_ts=1234567890.0,
+        last_api_error=ApiError("boom", status=500),
+    )
+
+    runtime = AtmeexRuntimeData(
+        api=SimpleNamespace(),
+        coordinator=coord,
+        refresh_device=AsyncMock(),
+    )
+
+    entry = SimpleNamespace(
+        domain=DOMAIN,
+        title="user@example.com",
+        entry_id="entry1",
+        data={},
+        options={},
+        runtime_data=runtime,
+    )
+
+    entities: list = []
+
+    def _add_entities(new_entities):
+        entities.extend(new_entities)
+
+    await async_setup_entry(hass, entry, _add_entities)
+
+    sensor = entities[0]
+    attrs = sensor.extra_state_attributes
+
+    assert attrs["last_api_error"] == "boom"
+    assert attrs["last_api_error_status"] == 500
+    json_dumps(attrs)

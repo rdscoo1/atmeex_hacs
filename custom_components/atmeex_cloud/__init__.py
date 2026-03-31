@@ -811,27 +811,3 @@ async def async_remove_config_entry_device(
     # We allow removal of any device - the device will reappear
     # on next poll if it's still connected to the account
     return True
-
-
-async def async_migrate_entry(hass: HomeAssistant, config_entry: ConfigEntry) -> bool:
-    """Migrate old entry to new version.
-    
-    This function handles config entry version upgrades when the
-    integration schema changes.
-    """
-    _LOGGER.debug("Migrating from version %s", config_entry.version)
-
-    if config_entry.version == 1:
-        # Current version, no migration needed
-        pass
-
-    # Future migrations would go here:
-    # if config_entry.version == 1:
-    #     new_data = {**config_entry.data}
-    #     # ... modify new_data ...
-    #     hass.config_entries.async_update_entry(
-    #         config_entry, data=new_data, version=2
-    #     )
-
-    _LOGGER.debug("Migration to version %s successful", config_entry.version)
-    return True

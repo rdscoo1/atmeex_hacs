@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timezone
 from math import isfinite
 from typing import Any, Callable
 
@@ -23,8 +22,9 @@ from homeassistant.helpers.update_coordinator import CoordinatorEntity
 from . import AtmeexRuntimeData
 from .api import AtmeexDevice
 from .const import DOMAIN, CONF_ENABLE_CO2, DEFAULT_ENABLE_CO2
+from .diagnostics import get_diagnostics_snapshot
 from .entity_base import AtmeexEntityMixin, setup_dynamic_device_entities
-from .helpers import deci_to_c, serialize_api_error, serialize_api_error_status
+from .helpers import deci_to_c
 
 
 @dataclass(frozen=True, slots=True)
@@ -152,22 +152,15 @@ class AtmeexDiagnosticsSensor(CoordinatorEntity, SensorEntity):
 
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
-        """Вернуть дополнительные диагностические атрибуты."""
+        """Return diagnostic attributes."""
+        attrs = get_diagnostics_snapshot(self.coordinator)
+
+        # state_entries is sensor-specific (diagnostics snapshot doesn't include it)
         data: dict[str, Any] = getattr(self.coordinator, "data", {}) or {}
-        devices = data.get("devices") or []
         states = data.get("states") or {}
+        attrs["state_entries"] = len(states) if isinstance(states, dict) else 0
 
-        last_success_ts = data.get("last_success_ts")
-        last_api_error = getattr(self.coordinator, "last_api_error", None)
-
-        if isinstance(last_success_ts, (int, float)):
-            last_success_utc = datetime.fromtimestamp(
-                last_success_ts,
-                tz=timezone.utc,
-            ).isoformat()
-        else:
-            last_success_utc = None
-
+        # WebSocket fields
         ws_manager = getattr(self._runtime, "websocket_manager", None)
         ws_connected = None
         ws_last_message_age_sec = None
@@ -177,17 +170,11 @@ class AtmeexDiagnosticsSensor(CoordinatorEntity, SensorEntity):
             if isinstance(ws_age, (int, float)) and isfinite(float(ws_age)):
                 ws_last_message_age_sec = round(float(ws_age), 1)
 
-        return {
-            "device_count": len(devices) if isinstance(devices, list) else 0,
-            "state_entries": len(states) if isinstance(states, dict) else 0,
-            "last_success_ts": last_success_ts,
-            "last_success_utc": last_success_utc,
-            "last_api_error": serialize_api_error(last_api_error),
-            "last_api_error_status": serialize_api_error_status(last_api_error),
-            "websocket_connected": ws_connected,
-            "websocket_last_message_age_sec": ws_last_message_age_sec,
-            "domain": DOMAIN,
-        }
+        attrs["websocket_connected"] = ws_connected
+        attrs["websocket_last_message_age_sec"] = ws_last_message_age_sec
+        attrs["domain"] = DOMAIN
+
+        return attrs
 
 
 class AtmeexDeviceSensor(AtmeexEntityMixin, CoordinatorEntity, SensorEntity):
