@@ -36,7 +36,7 @@ async def test_sensor_exposes_basic_attrs(hass):
             "states": {},
         },
         last_success_ts=1234567890.0,
-        last_api_error="some error",
+        last_api_error=ApiError("some error"),
     )
 
     runtime = AtmeexRuntimeData(

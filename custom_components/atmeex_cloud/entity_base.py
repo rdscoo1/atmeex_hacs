@@ -104,6 +104,10 @@ class AtmeexEntityMixin:
                 if pending_attr is not None and runtime is not None:
                     runtime.clear_pending(self._device_id, pending_attr)
                 raise HomeAssistantError(error_message) from err
+            except Exception:
+                if pending_attr is not None and runtime is not None:
+                    runtime.clear_pending(self._device_id, pending_attr)
+                raise
             await self._refresh()
 
         if lock is not None:
