@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from typing import Any, Dict, Optional
+from typing import Any
 from dataclasses import dataclass, field
 
 from aiohttp import ClientSession, ClientError, ClientResponse
@@ -28,10 +28,10 @@ class AtmeexDevice:
     name: str
     model: str
     online: bool
-    raw: Dict[str, Any]
+    raw: dict[str, Any]
 
     @classmethod
-    def from_raw(cls, raw: Dict[str, Any]) -> "AtmeexDevice":
+    def from_raw(cls, raw: dict[str, Any]) -> "AtmeexDevice":
         """Собрать устройство из сырого ответа API, с дефолтами."""
         did = int(raw["id"])
         name = str(raw.get("name") or f"Device {did}")
@@ -54,14 +54,14 @@ class AtmeexDevice:
         )
 
     @property
-    def condition(self) -> Dict[str, Any]:
+    def condition(self) -> dict[str, Any]:
         return dict(self.raw.get("condition") or {})
 
     @property
-    def settings(self) -> Dict[str, Any]:
+    def settings(self) -> dict[str, Any]:
         return dict(self.raw.get("settings") or {})
 
-    def to_ha_dict(self) -> Dict[str, Any]:
+    def to_ha_dict(self) -> dict[str, Any]:
         """Форма, в которой coordinator будет хранить устройство."""
         # Важно не потерять лишние поля из raw — поэтому делаем копию
         data = dict(self.raw)
@@ -76,38 +76,19 @@ class AtmeexDevice:
     
 @dataclass(slots=True)
 class AtmeexState:
-    """Нормализованное состояние устройства (condition + settings)."""
+    """Normalized device state (condition + settings merged)."""
+
     id: int
-    online: bool
-    pwr_on: bool
-    fan_speed: int | None
-    damp_pos: int | None
-    hum_stg: int | None
-    u_temp_room: int | None  # деци-°C
-    hum_room: int | None
-    temp_room: int | None
-    raw: Dict[str, Any] = field(repr=False)
+    raw: dict[str, Any] = field(repr=False)
 
     @classmethod
-    def from_device_dict(cls, device: Dict[str, Any]) -> "AtmeexState":
+    def from_device_dict(cls, device: dict[str, Any]) -> "AtmeexState":
         """Build normalized state from raw device payload."""
         normalized = _normalize_device_state(device)
-        did = int(device["id"])
-        return cls(
-            id=did,
-            online=bool(normalized.get("online", True)),
-            pwr_on=bool(normalized.get("pwr_on", False)),
-            fan_speed=normalized.get("fan_speed"),
-            damp_pos=normalized.get("damp_pos"),
-            hum_stg=normalized.get("hum_stg"),
-            u_temp_room=normalized.get("u_temp_room"),
-            hum_room=normalized.get("hum_room"),
-            temp_room=normalized.get("temp_room"),
-            raw=normalized,
-        )
+        return cls(id=int(device["id"]), raw=normalized)
 
-    def to_ha_dict(self) -> Dict[str, Any]:
-        """Форма, которая будет лежать в coordinator.data['states'][id]."""
+    def to_ha_dict(self) -> dict[str, Any]:
+        """State dict stored in coordinator.data['states'][id]."""
         return dict(self.raw)
 
 class AtmeexApi:
@@ -119,11 +100,11 @@ class AtmeexApi:
     def __init__(self, session: ClientSession):
         """Сохранить сессию Home Assistant и проинициализировать состояние."""
         self._session = session
-        self._token: Optional[str] = None
+        self._token: str | None = None
         self._token_type: str = "Bearer"
-        self._refresh_token: Optional[str] = None
-        self._email: Optional[str] = None
-        self._password: Optional[str] = None
+        self._refresh_token: str | None = None
+        self._email: str | None = None
+        self._password: str | None = None
         self._retry_count: int = 0  # суммарное число сетевых ретраев
         self._token_expires_at: float | None = None  # unix-time
         self._lock = asyncio.Lock()
@@ -182,9 +163,9 @@ class AtmeexApi:
 
             await self._sign_in()
 
-    def _headers(self) -> Dict[str, str]:
+    def _headers(self) -> dict[str, str]:
         """Сформировать заголовки запроса с учётом токена авторизации."""
-        headers: Dict[str, str] = {
+        headers: dict[str, str] = {
             "Accept": "application/json",
             "Content-Type": "application/json",
         }
@@ -336,7 +317,7 @@ class AtmeexApi:
         *,
         timeout: int = 20,
         json: Any | None = None,
-        headers: Dict[str, str] | None = None,
+        headers: dict[str, str] | None = None,
     ) -> tuple[int, Any]:
         """Запрос с токеном + 1 auto-relogin по 401/403.
         Возвращает (status, payload), где payload = json (если <400) иначе text.
@@ -430,7 +411,7 @@ class AtmeexApi:
     async def _put_params(
         self,
         device_id: int | str,
-        body: Dict[str, Any],
+        body: dict[str, Any],
         action_name: str,
         timeout: int = 20,
     ) -> None:
