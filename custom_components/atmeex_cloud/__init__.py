@@ -128,17 +128,13 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         await hass.config_entries.async_reload(entry.entry_id)
 
     async def _fetch_devices_safely() -> list[AtmeexDevice]:
-        """Получить список устройств с fallback и дочитыванием по id
+        """Получить список устройств с fallback и дочитыванием по id.
 
-        Важные моменты:
-        * 401/403 не скрываем — они должны привести к re-auth;
-        * сетевые/прочие ошибки → пытаемся fallback=True;
-        * для каждого устройства по возможности вызываем get_device(id),
-          но auth-ошибки опять же не глотаем.
+        Kept as a closure for backward compatibility with DummyCoordinator in tests.
+        AtmeexCoordinator uses its own _fetch_devices_safely method instead.
         """
         devices: list[AtmeexDevice] = []
 
-        # 1. Основной вызов без fallback
         try:
             primary = await api.get_devices(fallback=False)
             if isinstance(primary, list) and primary:
@@ -146,13 +142,11 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         except ApiError as err:
             status = getattr(err, "status", None)
             if status in (401, 403):
-                # Пусть разберётся верхний уровень — он превратит это в ConfigEntryAuthFailed
                 raise
             _LOGGER.debug("Primary get_devices failed: %s", err)
         except Exception as err:
             _LOGGER.debug("Unexpected error in primary get_devices: %s", err)
 
-        # 2. Если ничего не получили — пробуем fallback=True
         if not devices:
             try:
                 fb = await api.get_devices(fallback=True)
@@ -170,8 +164,6 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 _LOGGER.exception("Unexpected error in fallback get_devices: %s", err)
                 devices = []
 
-
-        # 3. Дочитываем по одному устройству
         hydrated: list[AtmeexDevice] = []
         for dev in devices:
             did = dev.id
@@ -185,17 +177,21 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 _LOGGER.debug("get_device(%s) failed: %s", did, err)
                 hydrated.append(dev)
             except Exception as err:  # noqa: BLE001
-                _LOGGER.debug(
-                    "Unexpected error in get_device(%s): %s", did, err)
+                _LOGGER.debug("Unexpected error in get_device(%s): %s", did, err)
                 hydrated.append(dev)
 
         return hydrated
 
-    async def _async_update_data() -> AtmeexCoordinatorData:
-        """Плановый опрос: тянем устройства, при ошибке кидаем UpdateFailed / AuthFailed."""
+    # Per-device monotonic timestamp of last WS state update — used to prevent
+    # polling from overwriting fresher WS data (DummyCoordinator path only;
+    # AtmeexCoordinator uses coordinator._ws_device_update_ts instead).
+    _ws_device_update_ts: dict[str, float] = {}
 
-        # Record monotonic time *before* the network round-trip so we can
-        # detect WS updates that arrived while the poll was in-flight.
+    async def _async_update_data() -> AtmeexCoordinatorData:
+        """Plановый опрос — kept as a closure for DummyCoordinator compat in tests.
+
+        AtmeexCoordinator ignores this (overrides update_method with self._async_update_data).
+        """
         poll_start_mono = time.monotonic()
         start_ts = time.perf_counter()
         try:
@@ -204,14 +200,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             coordinator.last_api_error = err
             status = getattr(err, "status", None)
             _fire_api_error_event(
-                {
-                    "message": str(err),
-                    "status": status,
-                    "source": "coordinator_update",
-                }
+                {"message": str(err), "status": status, "source": "coordinator_update"}
             )
             if status in (401, 403):
-                # токен протух / креды поменяли → re-auth
                 raise ConfigEntryAuthFailed(
                     f"Authentication with Atmeex failed during update: {err}"
                 ) from err
@@ -220,9 +211,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             ) from err
         except Exception as err:
             coordinator.last_api_error = None
-            _fire_api_error_event(
-                {"message": str(err), "source": "coordinator_update"}
-            )
+            _fire_api_error_event({"message": str(err), "source": "coordinator_update"})
             raise UpdateFailed(
                 f"Unexpected error while updating Atmeex data: {err}"
             ) from err
@@ -232,19 +221,12 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         if not isinstance(device_objs, list):
             raise UpdateFailed("Atmeex API returned non-list devices payload")
 
-        # Строим карту id -> AtmeexDevice
-        device_map: dict[str, AtmeexDevice] = {
-            str(d.id): d for d in device_objs}
+        device_map: dict[str, AtmeexDevice] = {str(d.id): d for d in device_objs}
+        devices_raw: list[dict[str, Any]] = [d.to_ha_dict() for d in device_objs]
 
-        # Для обратной совместимости (диагностика, тесты) храним ещё и "плоские" dict’ы
-        devices_raw: list[dict[str, Any]] = [d.to_ha_dict()
-                                             for d in device_objs]
-
-        # Мержим с предыдущими устройствами, чтобы не терять оффлайн-девайсы
         if getattr(coordinator, "last_update_success", False) and isinstance(
             getattr(coordinator, "data", None), dict
         ):
-            # type: ignore[assignment]
             prev: AtmeexCoordinatorData = coordinator.data
             for d_raw in prev.get("devices", []):
                 did = d_raw.get("id")
@@ -252,15 +234,12 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                     continue
                 key = str(did)
                 if key not in device_map:
-                    # Восстанавливаем AtmeexDevice из старого dict — best-effort
                     try:
                         device_map[key] = AtmeexDevice.from_raw(d_raw)
                         devices_raw.append(d_raw)
                     except Exception:
-                        # если совсем всё плохо — хотя бы dict сохраним
                         devices_raw.append(d_raw)
 
-        # --- строим нормализованные состояния через AtmeexState ---
         states: dict[str, dict[str, Any]] = {}
         for did, dev in device_map.items():
             try:
@@ -271,17 +250,15 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 continue
             states[did] = st.to_ha_dict()
 
-
         retry_count = getattr(api, "_retry_count", 0)
 
-        # Preserve WS state for devices that received a fresher WebSocket
-        # update while this poll was in-flight.  Without this, the poll
-        # result (started *before* the WS message) would overwrite the
-        # newer WS-pushed state.
+        # Use coordinator's WS timestamp dict if available (AtmeexCoordinator),
+        # otherwise fall back to the local dict (DummyCoordinator in tests).
+        _ws_ts = getattr(coordinator, "_ws_device_update_ts", _ws_device_update_ts)
         cur_data = coordinator.data
         if cur_data and isinstance(cur_data, dict):
             cur_states = cur_data.get("states") or {}
-            for did, ws_ts in _ws_device_update_ts.items():
+            for did, ws_ts in _ws_ts.items():
                 if ws_ts >= poll_start_mono and did in cur_states and did in states:
                     _LOGGER.debug(
                         "Preserving fresher WS state for device %s "
@@ -299,7 +276,6 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             "request_retries": retry_count,
         }
 
-        # успех — сохраняем timestamp и сбрасываем ошибку
         coordinator.last_success_ts = data["last_success_ts"]
         coordinator.last_api_error = None
 
@@ -312,6 +288,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         update_method=_async_update_data,
         update_interval=timedelta(seconds=update_interval_seconds),
     )
+    # Inject dependencies into the real coordinator (ignored by DummyCoordinator in tests).
+    if hasattr(coordinator, "setup_update"):
+        coordinator.setup_update(api=api, fire_logbook_event=_fire_logbook_event)
 
     await coordinator.async_config_entry_first_refresh()
 
@@ -325,10 +304,6 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     _ws_task_ref: dict[str, asyncio.Task[None] | None] = {"task": None}
     ws_logbook_last_event_ts: float = float("-inf")
     ws_logbook_suppressed_updates = 0
-    # Per-device monotonic timestamp of last WS state update — used to prevent
-    # polling from overwriting fresher WS data.
-    _ws_device_update_ts: dict[str, float] = {}
-
     def _create_background_task(coro: Awaitable[None]) -> asyncio.Task[None]:
         """Create background task via HA scheduler."""
         return hass.async_create_task(coro)
@@ -373,7 +348,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             full: AtmeexDevice = await api.get_device(device_id)
         except ApiError as e:
             _LOGGER.warning("Failed to refresh device %s: %s", device_id, e)
-            _fire_api_error_event(
+            _fire_err = getattr(coordinator, "_fire_api_error_event", _fire_api_error_event)
+            _fire_err(
                 {
                     "message": str(e),
                     "status": getattr(e, "status", None),
@@ -385,7 +361,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         except Exception as e:  # noqa: BLE001
             _LOGGER.warning(
                 "Unexpected error in refresh_device(%s): %s", device_id, e)
-            _fire_api_error_event(
+            _fire_err = getattr(coordinator, "_fire_api_error_event", _fire_api_error_event)
+            _fire_err(
                 {
                     "message": str(e),
                     "source": "refresh_device",
@@ -544,8 +521,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             # Record per-device WS update timestamp so polling knows not to
             # overwrite this fresher state.
             ws_now = time.monotonic()
+            _ws_ts_store = getattr(coordinator, "_ws_device_update_ts", _ws_device_update_ts)
             for did in changed_device_ids:
-                _ws_device_update_ts[did] = ws_now
+                _ws_ts_store[did] = ws_now
 
             coordinator.async_set_updated_data(
                 {
