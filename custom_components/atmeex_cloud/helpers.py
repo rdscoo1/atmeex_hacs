@@ -133,6 +133,19 @@ def to_bool(v: Any) -> bool:
         return bool(v)
 
 
+def serialize_api_error(error: Any) -> str | None:
+    """Return a JSON-safe error message for diagnostics/state attributes."""
+    if error is None:
+        return None
+    return str(error)
+
+
+def serialize_api_error_status(error: Any) -> int | None:
+    """Return the HTTP status for an API error when available."""
+    status = getattr(error, "status", None)
+    return status if isinstance(status, int) else None
+
+
 def _to_int(value: Any) -> int | None:
     """Safe int conversion, returns None on failure."""
     try:

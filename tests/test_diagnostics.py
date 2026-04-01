@@ -3,9 +3,11 @@ import logging
 from types import SimpleNamespace
 
 from homeassistant.const import CONF_EMAIL, CONF_PASSWORD
+from homeassistant.helpers.json import json_dumps
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 from homeassistant.helpers import device_registry as dr
 
+from custom_components.atmeex_cloud.api import ApiError
 from custom_components.atmeex_cloud.const import DOMAIN
 from custom_components.atmeex_cloud.diagnostics import (
     async_get_config_entry_diagnostics,
@@ -63,6 +65,50 @@ async def test_config_entry_diagnostics(hass):
     # и что секреты (email/password) отредактированы
     assert diag["entry"]["data"][CONF_EMAIL] != "user@example.com"
     assert diag["entry"]["data"][CONF_PASSWORD] != "secret"
+
+
+@pytest.mark.asyncio
+async def test_config_entry_diagnostics_serializes_api_error(hass):
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        title="user@example.com",
+        data={CONF_EMAIL: "user@example.com", CONF_PASSWORD: "secret"},
+    )
+    entry.add_to_hass(hass)
+
+    async def _dummy_update():
+        return {"devices": [], "states": {}}
+
+    coordinator: DataUpdateCoordinator[AtmeexCoordinatorData] = DataUpdateCoordinator(
+        hass,
+        logging.getLogger(__name__),
+        name="Test",
+        update_method=_dummy_update,
+    )
+    coordinator.data = {
+        "devices": [{"id": 1, "name": "Dev"}],
+        "states": {"1": {"pwr_on": True}},
+    }
+    coordinator.last_api_error = ApiError("boom", status=500)
+    coordinator.last_success_ts = 1234567890.0
+
+    api = SimpleNamespace(_token="t")
+
+    async def _refresh(_device_id):
+        return None
+
+    runtime = AtmeexRuntimeData(
+        api=api,
+        coordinator=coordinator,
+        refresh_device=_refresh,
+    )
+    entry.runtime_data = runtime
+
+    diag = await async_get_config_entry_diagnostics(hass, entry)
+
+    assert diag["coordinator_diagnostics"]["last_api_error"] == "boom"
+    assert diag["coordinator_diagnostics"]["last_api_error_status"] == 500
+    json_dumps(diag)
 
 
 @pytest.mark.asyncio

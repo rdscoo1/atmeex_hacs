@@ -3,11 +3,13 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 from homeassistant.exceptions import HomeAssistantError
 
+from custom_components.atmeex_cloud import AtmeexRuntimeData
 from custom_components.atmeex_cloud.select import (
     AtmeexHumidificationSelect,
     AtmeexBreezerSelect,
     HUM_OPTIONS,
     BREEZER_OPTIONS,
+    async_setup_entry,
 )
 from custom_components.atmeex_cloud.api import ApiError, AtmeexDevice
 
@@ -118,3 +120,46 @@ async def test_breezer_select_raises_homeassistant_error_on_api_failure():
 
     with pytest.raises(HomeAssistantError, match="Failed to set breezer mode"):
         await breezer.async_select_option(BREEZER_OPTIONS[1])
+
+
+@pytest.mark.asyncio
+async def test_async_setup_entry_skips_hum_entities_until_capability_detected():
+    dev = AtmeexDevice.from_raw(
+        {"id": 1, "name": "Dev1", "model": "m", "online": True}
+    )
+    listeners: list = []
+    coordinator = SimpleNamespace(
+        data={
+            "device_map": {"1": dev},
+            "states": {"1": {"damp_pos": 2}},
+        },
+        async_add_listener=lambda listener: listeners.append(listener) or (lambda: None),
+    )
+    runtime = AtmeexRuntimeData(
+        api=MagicMock(),
+        coordinator=coordinator,
+        refresh_device=AsyncMock(),
+    )
+    entry = SimpleNamespace(
+        entry_id="entry1",
+        runtime_data=runtime,
+        async_on_unload=lambda cb: None,
+    )
+
+    entities: list = []
+
+    def _add_entities(new_entities):
+        entities.extend(new_entities)
+
+    await async_setup_entry(None, entry, _add_entities)
+
+    assert [type(entity) for entity in entities] == [AtmeexBreezerSelect]
+    assert len(listeners) == 1
+
+    coordinator.data["states"]["1"]["hum_stg"] = 1
+    listeners[0]()
+
+    assert {type(entity) for entity in entities} == {
+        AtmeexBreezerSelect,
+        AtmeexHumidificationSelect,
+    }

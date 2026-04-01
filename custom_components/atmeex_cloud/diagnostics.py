@@ -11,6 +11,7 @@ from homeassistant.helpers.device_registry import DeviceEntry
 from .const import DOMAIN, CONF_ENABLE_WEBSOCKET, DEFAULT_ENABLE_WEBSOCKET
 from .coordinator import AtmeexCoordinator, AtmeexCoordinatorData
 from . import AtmeexRuntimeData
+from .helpers import serialize_api_error, serialize_api_error_status
 
 # Поля, которые всегда редактируем (удаляем/маскируем) из diagnostics
 TO_REDACT: set[str] = {
@@ -60,7 +61,8 @@ def get_diagnostics_snapshot(
         "device_count": len(devices),
         "last_success_ts": last_ts,
         "last_success_utc": last_success_utc,
-        "last_api_error": last_error,
+        "last_api_error": serialize_api_error(last_error),
+        "last_api_error_status": serialize_api_error_status(last_error),
     }
 
 

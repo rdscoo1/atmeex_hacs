@@ -14,7 +14,7 @@ from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from . import AtmeexRuntimeData
 from .api import AtmeexDevice
-from .entity_base import AtmeexEntityMixin
+from .entity_base import AtmeexEntityMixin, setup_dynamic_device_entities, supports_humidifier
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -28,12 +28,9 @@ async def async_setup_entry(
     runtime: AtmeexRuntimeData = entry.runtime_data
     coordinator = runtime.coordinator
 
-    data = coordinator.data or {}
-    device_map: dict[str, AtmeexDevice] = data.get("device_map", {}) or {}
-
-    entities: list[BinarySensorEntity] = []
-
-    for dev in device_map.values():
+    def _build_entities(dev: AtmeexDevice) -> list[BinarySensorEntity]:
+        entities: list[BinarySensorEntity] = []
+        state = ((coordinator.data or {}).get("states", {}) or {}).get(str(dev.id), {}) or {}
         # Online status sensor
         entities.append(
             AtmeexOnlineSensor(
@@ -43,16 +40,22 @@ async def async_setup_entry(
             )
         )
         # No water sensor (for humidifier)
-        entities.append(
-            AtmeexNoWaterSensor(
-                coordinator=coordinator,
-                device=dev,
-                entry_id=entry.entry_id,
+        if supports_humidifier(state):
+            entities.append(
+                AtmeexNoWaterSensor(
+                    coordinator=coordinator,
+                    device=dev,
+                    entry_id=entry.entry_id,
+                )
             )
-        )
+        return entities
 
-    if entities:
-        async_add_entities(entities)
+    setup_dynamic_device_entities(
+        entry=entry,
+        coordinator=coordinator,
+        async_add_entities=async_add_entities,
+        build_entities=_build_entities,
+    )
 
 
 class AtmeexOnlineSensor(AtmeexEntityMixin, CoordinatorEntity, BinarySensorEntity):

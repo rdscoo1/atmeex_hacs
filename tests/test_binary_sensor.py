@@ -1,15 +1,18 @@
 """Tests for Atmeex binary sensor entities."""
 from __future__ import annotations
 
+import pytest
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
+from custom_components.atmeex_cloud import AtmeexRuntimeData
 from homeassistant.components.binary_sensor import BinarySensorDeviceClass
 
 from custom_components.atmeex_cloud.api import AtmeexDevice
 from custom_components.atmeex_cloud.binary_sensor import (
     AtmeexNoWaterSensor,
     AtmeexOnlineSensor,
+    async_setup_entry,
 )
 
 
@@ -60,3 +63,44 @@ def test_no_water_sensor_properties():
 def test_no_water_sensor_reports_water_present():
     _, no_water = _make_sensors({"online": True, "no_water": False})
     assert no_water.is_on is False
+
+
+@pytest.mark.asyncio
+async def test_async_setup_entry_skips_no_water_sensor_without_humidifier():
+    dev = AtmeexDevice.from_raw(RAW_DEVICE)
+    listeners: list = []
+    coordinator = SimpleNamespace(
+        data={
+            "device_map": {"7": dev},
+            "states": {"7": {"online": True}},
+        },
+        async_add_listener=lambda listener: listeners.append(listener) or (lambda: None),
+    )
+    runtime = AtmeexRuntimeData(
+        api=MagicMock(),
+        coordinator=coordinator,
+        refresh_device=AsyncMock(),
+    )
+    entry = SimpleNamespace(
+        entry_id="entry1",
+        runtime_data=runtime,
+        async_on_unload=lambda cb: None,
+    )
+
+    entities: list = []
+
+    def _add_entities(new_entities):
+        entities.extend(new_entities)
+
+    await async_setup_entry(None, entry, _add_entities)
+
+    assert [type(entity) for entity in entities] == [AtmeexOnlineSensor]
+    assert len(listeners) == 1
+
+    coordinator.data["states"]["7"]["no_water"] = True
+    listeners[0]()
+
+    assert {type(entity) for entity in entities} == {
+        AtmeexOnlineSensor,
+        AtmeexNoWaterSensor,
+    }

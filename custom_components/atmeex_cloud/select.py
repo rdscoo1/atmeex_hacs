@@ -7,7 +7,7 @@ from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from .api import ApiError, AtmeexDevice
-from .entity_base import AtmeexEntityMixin
+from .entity_base import AtmeexEntityMixin, setup_dynamic_device_entities, supports_humidifier
 
 from .const import BREEZER_MODES, HUMIDIFICATION_OPTIONS
 from . import AtmeexRuntimeData
@@ -21,20 +21,18 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_e
     runtime: AtmeexRuntimeData = entry.runtime_data
     coordinator = runtime.coordinator
 
-    data = coordinator.data or {}
-    device_map: dict[str, AtmeexDevice] = data.get("device_map", {}) or {}
-
-    entities: list[SelectEntity] = []
-
-    for dev in device_map.values():
-        entities.append(
-            AtmeexHumidificationSelect(
-                coordinator=coordinator,
-                api=runtime.api,
-                device=dev,
-                refresh_device_cb=runtime.refresh_device,
+    def _build_entities(dev: AtmeexDevice) -> list[SelectEntity]:
+        entities: list[SelectEntity] = []
+        state = ((coordinator.data or {}).get("states", {}) or {}).get(str(dev.id), {}) or {}
+        if supports_humidifier(state):
+            entities.append(
+                AtmeexHumidificationSelect(
+                    coordinator=coordinator,
+                    api=runtime.api,
+                    device=dev,
+                    refresh_device_cb=runtime.refresh_device,
+                )
             )
-        )
         entities.append(
             AtmeexBreezerSelect(
                 coordinator=coordinator,
@@ -43,9 +41,14 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_e
                 refresh_device_cb=runtime.refresh_device,
             )
         )
+        return entities
 
-    if entities:
-        async_add_entities(entities)
+    setup_dynamic_device_entities(
+        entry=entry,
+        coordinator=coordinator,
+        async_add_entities=async_add_entities,
+        build_entities=_build_entities,
+    )
 
 
 class _BaseSelect(AtmeexEntityMixin, CoordinatorEntity, SelectEntity):

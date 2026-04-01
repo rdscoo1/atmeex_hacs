@@ -5,8 +5,9 @@ from typing import Any
 
 import voluptuous as vol
 from homeassistant import config_entries
-from homeassistant.config_entries import ConfigEntry, ConfigFlowResult
+from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import CONF_EMAIL, CONF_PASSWORD
+from homeassistant.data_entry_flow import FlowResult
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 
 from .api import AtmeexApi, ApiError
@@ -60,7 +61,7 @@ class AtmeexConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         """Return the options flow handler."""
         return AtmeexOptionsFlowHandler()
 
-    async def async_step_user(self, user_input: dict[str, Any] | None = None) -> ConfigFlowResult:
+    async def async_step_user(self, user_input: dict[str, Any] | None = None) -> FlowResult:
         """Первый (и единственный) шаг мастера настройки.
 
         На этом шаге:
@@ -120,7 +121,7 @@ class AtmeexConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 
     async def async_step_reauth(
         self, entry_data: dict[str, Any]
-    ) -> ConfigFlowResult:
+    ) -> FlowResult:
         """Handle re-authentication when credentials become invalid."""
         self._reauth_entry = self.hass.config_entries.async_get_entry(
             self.context["entry_id"]
@@ -129,7 +130,7 @@ class AtmeexConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 
     async def async_step_reauth_confirm(
         self, user_input: dict[str, Any] | None = None
-    ) -> ConfigFlowResult:
+    ) -> FlowResult:
         """Confirm re-authentication with new credentials."""
         errors: dict[str, str] = {}
 
@@ -197,7 +198,7 @@ class AtmeexOptionsFlowHandler(config_entries.OptionsFlow):
     accept it in ``__init__``.
     """
 
-    async def async_step_init(self, user_input: dict[str, Any] | None = None) -> ConfigFlowResult:
+    async def async_step_init(self, user_input: dict[str, Any] | None = None) -> FlowResult:
         if user_input is not None:
             try:
                 interval = int(user_input[CONF_UPDATE_INTERVAL])
