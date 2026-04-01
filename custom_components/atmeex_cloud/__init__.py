@@ -7,13 +7,11 @@ from collections import deque
 from datetime import timedelta
 from typing import Any, Awaitable
 
-import aiohttp
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import ConfigEntryNotReady, ConfigEntryAuthFailed
 from homeassistant.helpers.device_registry import DeviceEntry
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
-from homeassistant.helpers.update_coordinator import UpdateFailed
 from homeassistant.const import CONF_EMAIL, CONF_PASSWORD
 
 from .api import AtmeexApi, ApiError, AtmeexDevice, AtmeexState
@@ -106,191 +104,18 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             return
         bus.async_fire(event_type, data)
 
-    # Throttle API-error logbook events to avoid flooding during outages.
-    _api_error_last_ts: float = float("-inf")
-    _api_error_suppressed: int = 0
-
-    def _fire_api_error_event(data: dict[str, Any]) -> None:
-        nonlocal _api_error_last_ts, _api_error_suppressed
-        now = time.monotonic()
-        if now - _api_error_last_ts < WS_LOGBOOK_MIN_INTERVAL_SEC:
-            _api_error_suppressed += 1
-            return
-        if _api_error_suppressed:
-            data = {**data, "suppressed_errors": _api_error_suppressed}
-            _api_error_suppressed = 0
-        _fire_logbook_event(EVENT_API_ERROR, data)
-        _api_error_last_ts = now
-
     coordinator: AtmeexCoordinator
 
     async def _update_listener(hass: HomeAssistant, entry: ConfigEntry) -> None:
         await hass.config_entries.async_reload(entry.entry_id)
 
-    async def _fetch_devices_safely() -> list[AtmeexDevice]:
-        """Получить список устройств с fallback и дочитыванием по id.
-
-        Kept as a closure for backward compatibility with DummyCoordinator in tests.
-        AtmeexCoordinator uses its own _fetch_devices_safely method instead.
-        """
-        devices: list[AtmeexDevice] = []
-
-        try:
-            primary = await api.get_devices(fallback=False)
-            if isinstance(primary, list) and primary:
-                devices = primary
-        except ApiError as err:
-            status = getattr(err, "status", None)
-            if status in (401, 403):
-                raise
-            _LOGGER.debug("Primary get_devices failed: %s", err)
-        except Exception as err:
-            _LOGGER.debug("Unexpected error in primary get_devices: %s", err)
-
-        if not devices:
-            try:
-                fb = await api.get_devices(fallback=True)
-                if isinstance(fb, list):
-                    devices = fb
-            except ApiError as err:
-                if getattr(err, "status", None) in (401, 403):
-                    raise
-                _LOGGER.warning("Fallback get_devices failed: %s", err)
-                devices = []
-            except (asyncio.TimeoutError, aiohttp.ClientError) as err:
-                _LOGGER.warning("Fallback get_devices network error: %s", err)
-                devices = []
-            except Exception as err:
-                _LOGGER.exception("Unexpected error in fallback get_devices: %s", err)
-                devices = []
-
-        hydrated: list[AtmeexDevice] = []
-        for dev in devices:
-            did = dev.id
-            try:
-                full = await api.get_device(did)
-                hydrated.append(full)
-            except ApiError as err:
-                status = getattr(err, "status", None)
-                if status in (401, 403):
-                    raise
-                _LOGGER.debug("get_device(%s) failed: %s", did, err)
-                hydrated.append(dev)
-            except Exception as err:  # noqa: BLE001
-                _LOGGER.debug("Unexpected error in get_device(%s): %s", did, err)
-                hydrated.append(dev)
-
-        return hydrated
-
-    # Per-device monotonic timestamp of last WS state update — used to prevent
-    # polling from overwriting fresher WS data (DummyCoordinator path only;
-    # AtmeexCoordinator uses coordinator._ws_device_update_ts instead).
-    _ws_device_update_ts: dict[str, float] = {}
-
-    async def _async_update_data() -> AtmeexCoordinatorData:
-        """Plановый опрос — kept as a closure for DummyCoordinator compat in tests.
-
-        AtmeexCoordinator ignores this (overrides update_method with self._async_update_data).
-        """
-        poll_start_mono = time.monotonic()
-        start_ts = time.perf_counter()
-        try:
-            device_objs = await _fetch_devices_safely()
-        except ApiError as err:
-            coordinator.last_api_error = err
-            status = getattr(err, "status", None)
-            _fire_api_error_event(
-                {"message": str(err), "status": status, "source": "coordinator_update"}
-            )
-            if status in (401, 403):
-                raise ConfigEntryAuthFailed(
-                    f"Authentication with Atmeex failed during update: {err}"
-                ) from err
-            raise UpdateFailed(
-                f"Error communicating with Atmeex API: {err}"
-            ) from err
-        except Exception as err:
-            coordinator.last_api_error = None
-            _fire_api_error_event({"message": str(err), "source": "coordinator_update"})
-            raise UpdateFailed(
-                f"Unexpected error while updating Atmeex data: {err}"
-            ) from err
-
-        elapsed_ms = (time.perf_counter() - start_ts) * 1000.0
-
-        if not isinstance(device_objs, list):
-            raise UpdateFailed("Atmeex API returned non-list devices payload")
-
-        device_map: dict[str, AtmeexDevice] = {str(d.id): d for d in device_objs}
-        devices_raw: list[dict[str, Any]] = [d.to_ha_dict() for d in device_objs]
-
-        if getattr(coordinator, "last_update_success", False) and isinstance(
-            getattr(coordinator, "data", None), dict
-        ):
-            prev: AtmeexCoordinatorData = coordinator.data
-            for d_raw in prev.get("devices", []):
-                did = d_raw.get("id")
-                if did is None:
-                    continue
-                key = str(did)
-                if key not in device_map:
-                    try:
-                        device_map[key] = AtmeexDevice.from_raw(d_raw)
-                        devices_raw.append(d_raw)
-                    except Exception:
-                        devices_raw.append(d_raw)
-
-        states: dict[str, dict[str, Any]] = {}
-        for did, dev in device_map.items():
-            try:
-                ha_dict = dev.to_ha_dict()
-                st = AtmeexState.from_device_dict(ha_dict)
-            except Exception as e:
-                _LOGGER.warning("Failed to normalize state for device %s: %s", did, e)
-                continue
-            states[did] = st.to_ha_dict()
-
-        retry_count = getattr(api, "_retry_count", 0)
-
-        # Use coordinator's WS timestamp dict if available (AtmeexCoordinator),
-        # otherwise fall back to the local dict (DummyCoordinator in tests).
-        _ws_ts = getattr(coordinator, "_ws_device_update_ts", _ws_device_update_ts)
-        cur_data = coordinator.data
-        if cur_data and isinstance(cur_data, dict):
-            cur_states = cur_data.get("states") or {}
-            for did, ws_ts in _ws_ts.items():
-                if ws_ts >= poll_start_mono and did in cur_states and did in states:
-                    _LOGGER.debug(
-                        "Preserving fresher WS state for device %s "
-                        "(ws_ts=%.3f >= poll_start=%.3f)",
-                        did, ws_ts, poll_start_mono,
-                    )
-                    states[did] = cur_states[did]
-
-        data: AtmeexCoordinatorData = {
-            "devices": devices_raw,
-            "device_map": device_map,
-            "states": states,
-            "last_success_ts": time.time(),
-            "avg_latency_ms": round(elapsed_ms, 1),
-            "request_retries": retry_count,
-        }
-
-        coordinator.last_success_ts = data["last_success_ts"]
-        coordinator.last_api_error = None
-
-        return data
-
     coordinator = AtmeexCoordinator(
         hass,
         _LOGGER,
         name="Atmeex Cloud",
-        update_method=_async_update_data,
         update_interval=timedelta(seconds=update_interval_seconds),
     )
-    # Inject dependencies into the real coordinator (ignored by DummyCoordinator in tests).
-    if hasattr(coordinator, "setup_update"):
-        coordinator.setup_update(api=api, fire_logbook_event=_fire_logbook_event)
+    coordinator.setup_update(api=api, fire_logbook_event=_fire_logbook_event)
 
     await coordinator.async_config_entry_first_refresh()
 
@@ -348,8 +173,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             full: AtmeexDevice = await api.get_device(device_id)
         except ApiError as e:
             _LOGGER.warning("Failed to refresh device %s: %s", device_id, e)
-            _fire_err = getattr(coordinator, "_fire_api_error_event", _fire_api_error_event)
-            _fire_err(
+            coordinator._fire_api_error_event(
                 {
                     "message": str(e),
                     "status": getattr(e, "status", None),
@@ -361,8 +185,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         except Exception as e:  # noqa: BLE001
             _LOGGER.warning(
                 "Unexpected error in refresh_device(%s): %s", device_id, e)
-            _fire_err = getattr(coordinator, "_fire_api_error_event", _fire_api_error_event)
-            _fire_err(
+            coordinator._fire_api_error_event(
                 {
                     "message": str(e),
                     "source": "refresh_device",
@@ -521,7 +344,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             # Record per-device WS update timestamp so polling knows not to
             # overwrite this fresher state.
             ws_now = time.monotonic()
-            _ws_ts_store = getattr(coordinator, "_ws_device_update_ts", _ws_device_update_ts)
+            _ws_ts_store = coordinator._ws_device_update_ts
             for did in changed_device_ids:
                 _ws_ts_store[did] = ws_now
 

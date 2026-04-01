@@ -63,19 +63,33 @@ async def test_refresh_device_updates_coordinator_data(monkeypatch):
 
     # подменяем DataUpdateCoordinator на простую реализацию, как в test_init
     class DummyCoordinator:
-        def __init__(self, hass, logger, name, update_method, update_interval):
+        def __init__(self, hass, logger, name, update_interval, **kwargs):
             self.hass = hass
-            self.logger = logger
-            self.name = name
-            self.update_method = update_method
-            self.update_interval = update_interval
             self.data = None
+            self.last_update_success = False
+            self.last_api_error = None
+            self.last_success_ts = None
+            self._ws_device_update_ts = {}
+
+        def setup_update(self, *, api, fire_logbook_event):
+            import types
+            from custom_components.atmeex_cloud.coordinator import AtmeexCoordinator as _Real
+            self._api = api
+            self._fire_logbook_event = fire_logbook_event
+            self._api_error_last_ts = float("-inf")
+            self._api_error_suppressed = 0
+            for m in ("_fetch_devices_safely", "_fire_api_error_event", "_async_update_data"):
+                setattr(self, m, types.MethodType(getattr(_Real, m), self))
 
         async def async_config_entry_first_refresh(self):
-            self.data = await self.update_method()
+            self.data = await self._async_update_data()
+            self.last_update_success = True
 
         def async_set_updated_data(self, data):
             self.data = data
+
+        async def async_request_refresh(self):
+            self.data = await self._async_update_data()
 
     monkeypatch.setattr(atmeex_init, "AtmeexCoordinator", DummyCoordinator)
 
