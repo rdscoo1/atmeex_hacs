@@ -334,8 +334,12 @@ class AtmeexApi:
                 method, url, json=json, headers=req_headers, timeout=timeout
             ) as resp:
                 if resp.status in (401, 403) and retry_auth and self._email and self._password:
-                    self._token_expires_at = None
-                    await self._sign_in()
+                    stale_token = self._token
+                    async with self._lock:
+                        # Another coroutine may have already refreshed the token.
+                        if self._token == stale_token:
+                            self._token_expires_at = None
+                            await self._sign_in()
                     return await _do(retry_auth=False)
 
                 if resp.status < 400:
@@ -415,14 +419,14 @@ class AtmeexApi:
         action_name: str,
         timeout: int = 20,
     ) -> None:
-        """Унифицированный помощник для всех PUT-запросов изменения параметров."""
+        """Унифицированный помощник для всех PUT-запросов изменения параметров.
 
-        async def _do_request():
-            status, data = await self._request("PUT", f"/devices/{device_id}/params", json=body, timeout=timeout)
-            if status >= 400:
-                raise ApiError(f"{action_name} {status}: {str(data)[:200]}", status=status)
-
-        await self._with_retries(_do_request, action_name)
+        Set-commands are intentionally NOT retried: the server may have already
+        applied the change before the network error, so retrying could double-fire.
+        """
+        status, data = await self._request("PUT", f"/devices/{device_id}/params", json=body, timeout=timeout)
+        if status >= 400:
+            raise ApiError(f"{action_name} {status}: {str(data)[:200]}", status=status)
 
     async def set_power(self, device_id: int | str, on: bool) -> None:
         """Установить состояние питания (вкл/выкл) через поле u_pwr_on."""

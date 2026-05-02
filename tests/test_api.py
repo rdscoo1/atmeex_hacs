@@ -1,3 +1,4 @@
+import asyncio
 import pytest
 
 from custom_components.atmeex_cloud.api import AtmeexApi, ApiError, API_BASE_URL, AtmeexDevice
@@ -230,3 +231,96 @@ async def test_setter_error_raises():
         await api.set_power(1, True)
 
     assert "set_power 500" in str(exc.value)
+
+
+@pytest.mark.asyncio
+async def test_set_commands_not_retried_on_network_timeout():
+    """PUT set-commands must fail immediately on timeout, not be retried.
+
+    Retrying a non-idempotent command after a timeout can apply the change
+    multiple times or race against a user's next intent.
+    """
+    import aiohttp
+
+    call_count = 0
+
+    class TimeoutSession:
+        def request(self, method, url, json=None, headers=None, timeout=None):
+            nonlocal call_count
+            call_count += 1
+            return self
+
+        async def __aenter__(self):
+            raise asyncio.TimeoutError()
+
+        async def __aexit__(self, *args):
+            pass
+
+        def post(self, url, json=None, headers=None, timeout=None):
+            return self.request("POST", url, json=json, headers=headers, timeout=timeout)
+
+    session = TimeoutSession()
+    api = AtmeexApi(session)
+    await api.async_init()
+    api._token = "t"
+
+    with pytest.raises((ApiError, asyncio.TimeoutError)):
+        await api.set_power(1, True)
+
+    # The critical invariant: the PUT was issued exactly ONCE, not retried
+    assert call_count == 1, f"set_power made {call_count} requests; expected 1 (no retry on network timeout)"
+
+
+@pytest.mark.asyncio
+async def test_concurrent_401_sign_in_called_once():
+    """Concurrent _request() calls that each receive 401 must only trigger _sign_in once.
+
+    Without serialization under self._lock, N concurrent callers each call
+    _sign_in independently — last writer wins, stale token can escape.
+    """
+    sign_in_calls = 0
+    new_token = "new-token"
+
+    class SlowAuthSession:
+        """Returns 401 until sign_in sets a valid token, then returns 200."""
+
+        def __init__(self):
+            self.requests = []
+
+        def request(self, method, url, json=None, headers=None, timeout=None):
+            self.requests.append((method, url, headers))
+            auth = (headers or {}).get("Authorization", "")
+            if new_token in auth:
+                return FakeResponse(200, json_data=[])
+            return FakeResponse(401, text_data="unauthorized")
+
+        def post(self, url, json=None, headers=None, timeout=None):
+            return self.request("POST", url, json=json, headers=headers, timeout=timeout)
+
+    session = SlowAuthSession()
+    api = AtmeexApi(session)
+    await api.async_init()
+    api._token = "old-token"
+    api._email = "u@example.com"
+    api._password = "pw"
+
+    original_sign_in = api._sign_in
+
+    async def _counted_sign_in():
+        nonlocal sign_in_calls
+        sign_in_calls += 1
+        await asyncio.sleep(0)  # yield so other coroutines can proceed
+        api._token = new_token
+
+    api._sign_in = _counted_sign_in
+
+    # Fire 5 concurrent GET /devices calls — all will see 401 with old token
+    tasks = [asyncio.create_task(api._request("GET", "/devices")) for _ in range(5)]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    # All requests should ultimately succeed (200 with new token)
+    for r in results:
+        assert not isinstance(r, Exception), f"Unexpected exception: {r}"
+
+    # The critical invariant: sign-in was called exactly once, not 5 times
+    assert sign_in_calls == 1, f"_sign_in called {sign_in_calls} times, expected 1"
