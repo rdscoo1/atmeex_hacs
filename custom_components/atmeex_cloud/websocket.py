@@ -147,8 +147,8 @@ class WebSocketManager:
             self._ws = None
             return False
 
-        if self._consecutive_auth_failures == 0:
-            self._reconnect_delay = self._config.reconnect_delay_min
+        self._reconnect_delay = self._config.reconnect_delay_min
+        self._consecutive_auth_failures = 0
         await self._cancel_task(self._listen_task)
         self._listen_task = asyncio.create_task(self._listen())
         _LOGGER.info("WebSocket connected successfully")

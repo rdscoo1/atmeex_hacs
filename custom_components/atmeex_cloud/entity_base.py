@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from functools import cached_property
 from typing import Any, Awaitable, Callable, Iterable
 
 from homeassistant.exceptions import HomeAssistantError
@@ -124,7 +123,7 @@ class AtmeexEntityMixin:
             return bool(st["online"])
         return bool(getattr(self._device_meta, "online", False))
 
-    @cached_property
+    @property
     def device_info(self) -> DeviceInfo:
         dev = self._device_meta  # мета фиксирована, не зависит от апдейтов
         # Try to get firmware version from raw device data

@@ -500,3 +500,42 @@ async def test_unauthorized_triggers_reauth_after_max_failures():
     assert manager._consecutive_auth_failures == max_attempts
     # Token refresh was called for attempts 1..max-1 (not on the final one that triggers reauth)
     assert refresh_calls == max_attempts - 1
+
+
+@pytest.mark.asyncio
+async def test_reconnect_backoff_resets_on_success_even_after_prior_auth_failure():
+    """Backoff delay must reset to minimum on every successful connection.
+
+    The bug: `if self._consecutive_auth_failures == 0: reset delay` means
+    that after any auth failure the counter is > 0 and the backoff is never
+    reset — even if subsequent reconnects succeed cleanly.
+    """
+    connected = asyncio.Event()
+
+    class _SuccessfulSession:
+        async def ws_connect(self, *args, **kwargs):
+            connected.set()
+            return _FakeWebSocket()
+
+    cfg = WebSocketConfig(reconnect_delay_min=1.0, reconnect_delay_max=60.0)
+    manager = WebSocketManager(
+        session=_SuccessfulSession(),
+        token_getter=lambda: "token",
+        on_message=AsyncMock(),
+        config=cfg,
+    )
+
+    # Simulate that a prior auth failure bumped the counter and the backoff
+    manager._consecutive_auth_failures = 2
+    manager._reconnect_delay = 30.0  # elevated from prior failures
+
+    result = await manager._connect_once()
+
+    assert result is True
+    # After a successful connection, BOTH counters must reset
+    assert manager._reconnect_delay == cfg.reconnect_delay_min, (
+        f"Backoff not reset: {manager._reconnect_delay} != {cfg.reconnect_delay_min}"
+    )
+    assert manager._consecutive_auth_failures == 0, (
+        f"Auth failure counter not reset after successful connect: {manager._consecutive_auth_failures}"
+    )
