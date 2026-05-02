@@ -1,7 +1,9 @@
 """Binary sensor platform for Atmeex Cloud integration."""
 from __future__ import annotations
 
+import datetime
 import logging
+import time
 
 from homeassistant.components.binary_sensor import (
     BinarySensorDeviceClass,
@@ -9,6 +11,7 @@ from homeassistant.components.binary_sensor import (
 )
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
+from homeassistant.helpers.entity import EntityCategory
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
@@ -62,6 +65,7 @@ class AtmeexOnlineSensor(AtmeexEntityMixin, CoordinatorEntity, BinarySensorEntit
     """Binary sensor indicating device online status."""
 
     _attr_device_class = BinarySensorDeviceClass.CONNECTIVITY
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
     _attr_has_entity_name = True
     _attr_translation_key = "online"
 
@@ -80,7 +84,16 @@ class AtmeexOnlineSensor(AtmeexEntityMixin, CoordinatorEntity, BinarySensorEntit
 
     @property
     def available(self) -> bool:
-        """Online sensor is always available so it can report offline state."""
+        """Available unless the coordinator has been silent for more than 3× update_interval."""
+        last_ts = getattr(self.coordinator, "last_success_ts", None)
+        update_interval = getattr(self.coordinator, "update_interval", None)
+        if (
+            last_ts is not None
+            and isinstance(update_interval, datetime.timedelta)
+            and update_interval.total_seconds() > 0
+        ):
+            if time.time() - last_ts > update_interval.total_seconds() * 3:
+                return False
         return True
 
     @property

@@ -1,12 +1,16 @@
 """Tests for Atmeex binary sensor entities."""
 from __future__ import annotations
 
+import datetime
+import time
+
 import pytest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 from custom_components.atmeex_cloud import AtmeexRuntimeData
 from homeassistant.components.binary_sensor import BinarySensorDeviceClass
+from homeassistant.helpers.entity import EntityCategory
 
 from custom_components.atmeex_cloud.api import AtmeexDevice
 from custom_components.atmeex_cloud.binary_sensor import (
@@ -104,3 +108,39 @@ async def test_async_setup_entry_skips_no_water_sensor_without_humidifier():
         AtmeexOnlineSensor,
         AtmeexNoWaterSensor,
     }
+
+
+def test_online_sensor_has_diagnostic_entity_category():
+    """Online sensor should carry EntityCategory.DIAGNOSTIC so it's hidden from the main card."""
+    online, _ = _make_sensors()
+    assert online._attr_entity_category == EntityCategory.DIAGNOSTIC
+
+
+def test_online_sensor_not_available_when_coordinator_stale():
+    """available must return False when the coordinator hasn't updated for > 3× interval."""
+    dev = AtmeexDevice.from_raw(RAW_DEVICE)
+    coordinator = SimpleNamespace(
+        data={"device_map": {"7": dev}, "states": {"7": {"online": True}}},
+        last_update_success=True,
+        last_success_ts=time.time() - 500,           # 500 s ago
+        update_interval=datetime.timedelta(seconds=30),  # 3× = 90 s
+        async_request_refresh=AsyncMock(),
+        async_add_listener=lambda cb: (lambda: None),
+    )
+    online = AtmeexOnlineSensor(coordinator=coordinator, device=dev, entry_id="e")
+    assert online.available is False
+
+
+def test_online_sensor_available_when_coordinator_fresh():
+    """available must return True when last_success_ts is recent."""
+    dev = AtmeexDevice.from_raw(RAW_DEVICE)
+    coordinator = SimpleNamespace(
+        data={"device_map": {"7": dev}, "states": {"7": {"online": True}}},
+        last_update_success=True,
+        last_success_ts=time.time() - 10,
+        update_interval=datetime.timedelta(seconds=30),
+        async_request_refresh=AsyncMock(),
+        async_add_listener=lambda cb: (lambda: None),
+    )
+    online = AtmeexOnlineSensor(coordinator=coordinator, device=dev, entry_id="e")
+    assert online.available is True

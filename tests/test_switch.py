@@ -12,12 +12,13 @@ from custom_components.atmeex_cloud.switch import (
     AtmeexAutoNannySwitch,
     AtmeexSleepModeSwitch,
 )
+from custom_components.atmeex_cloud import AtmeexRuntimeData
 
 
 RAW_DEVICE = {"id": 42, "name": "Test Breezer", "model": "X200", "online": True}
 
 
-def _make_switches(state: dict | None = None):
+def _make_switches(state: dict | None = None, *, with_runtime: bool = False):
     dev = AtmeexDevice.from_raw(RAW_DEVICE)
 
     coordinator = SimpleNamespace(
@@ -38,18 +39,27 @@ def _make_switches(state: dict | None = None):
     api.set_sleep_mode = AsyncMock()
 
     refresh_cb = AsyncMock()
+    runtime = None
+    if with_runtime:
+        runtime = AtmeexRuntimeData(
+            api=api,
+            coordinator=coordinator,
+            refresh_device=refresh_cb,
+        )
 
     auto = AtmeexAutoNannySwitch(
         coordinator=coordinator,
         api=api,
         device=dev,
         refresh_device_cb=refresh_cb,
+        runtime=runtime,
     )
     sleep = AtmeexSleepModeSwitch(
         coordinator=coordinator,
         api=api,
         device=dev,
         refresh_device_cb=refresh_cb,
+        runtime=runtime,
     )
     return auto, sleep, api, refresh_cb
 
@@ -106,3 +116,18 @@ async def test_sleep_mode_turn_off_calls_api_and_refresh():
 
     api.set_sleep_mode.assert_awaited_once_with(42, False)
     refresh_cb.assert_awaited_once_with(42)
+
+
+def test_auto_nanny_is_on_reflects_pending_before_confirmation():
+    """is_on must return True immediately after pending is set, even before the API confirms."""
+    auto, _, _, _ = _make_switches({"online": True, "u_auto": False}, with_runtime=True)
+    # Simulate what _execute_command does before the API call
+    auto._runtime.set_pending(42, "u_auto", True)
+    assert auto.is_on is True
+
+
+def test_sleep_mode_is_on_reflects_pending_before_confirmation():
+    """is_on must return True immediately after pending is set, even before the API confirms."""
+    _, sleep, _, _ = _make_switches({"online": True, "u_night": False}, with_runtime=True)
+    sleep._runtime.set_pending(42, "u_night", True)
+    assert sleep.is_on is True

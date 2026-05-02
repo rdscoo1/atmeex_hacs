@@ -117,10 +117,21 @@ def quantize_humidity(val: int | float | None) -> int:
         return 0
     if not isfinite(v):
         return 0
-    
+
     v_clamped = max(0, min(100, v))
     v_int = int(round(v_clamped))
     return min(HUM_ALLOWED, key=lambda x: abs(x - v_int))
+
+
+def humidity_to_stage(val: int | float | None) -> int:
+    """Return the HUM_ALLOWED stage index (0–3) for val.
+
+    Always safe — avoids the ValueError that HUM_ALLOWED.index() would raise
+    if quantize_humidity ever returned an off-list value.
+    """
+    q = quantize_humidity(val)
+    # quantize_humidity guarantees a value in HUM_ALLOWED, so index() is safe here.
+    return HUM_ALLOWED.index(q)
 
 
 def to_bool(v: Any) -> bool:
