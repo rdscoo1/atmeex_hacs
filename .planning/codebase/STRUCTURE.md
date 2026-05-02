@@ -1,38 +1,39 @@
 # Codebase Structure
 
-**Analysis Date:** 2026-03-28
+**Analysis Date:** 2026-05-02
 
 ## Directory Layout
 
 ```
 atmeex_hacs/
 ├── custom_components/atmeex_cloud/    # Main integration package
-│   ├── __init__.py                    # Setup/unload entry points, runtime data
-│   ├── api.py                         # API client and data classes
-│   ├── coordinator.py                 # Typed coordinator subclass
-│   ├── entity_base.py                 # Shared entity mixin
-│   ├── config_flow.py                 # User setup and options flow
-│   ├── helpers.py                     # Conversion and normalization utilities
-│   ├── const.py                       # Constants and configuration keys
-│   ├── websocket.py                   # WebSocket manager for real-time updates
-│   ├── diagnostics.py                 # Diagnostic data provider
+│   ├── __init__.py                    # async_setup_entry, async_unload_entry, refresh_device closure
+│   ├── runtime.py                     # PendingCommand + AtmeexRuntimeData dataclasses
+│   ├── api.py                         # AtmeexApi HTTP client, AtmeexDevice, AtmeexState, ApiError
+│   ├── coordinator.py                 # AtmeexCoordinator, AtmeexCoordinatorData TypedDict
+│   ├── entity_base.py                 # AtmeexEntityMixin, setup_dynamic_device_entities, supports_humidifier
+│   ├── config_flow.py                 # AtmeexConfigFlow, AtmeexOptionsFlowHandler
+│   ├── helpers.py                     # Conversion utils: fan speed, temp, humidity_to_stage, WS state merge
+│   ├── const.py                       # DOMAIN, PLATFORMS, API URLs, event names, option keys
+│   ├── websocket.py                   # WebSocketManager, WebSocketConfig
+│   ├── diagnostics.py                 # Diagnostic data provider (redacted snapshots)
 │   ├── logbook.py                     # Custom event logging
-│   ├── manifest.json                  # Integration metadata
+│   ├── manifest.json                  # Integration metadata and dependencies
 │   ├── services.yaml                  # Custom service definitions
-│   ├── strings.json                   # UI strings and schema
-│   ├── sensor.py                      # Sensor entities
-│   ├── switch.py                      # Switch entities
-│   ├── fan.py                         # Fan entities
-│   ├── climate.py                     # Climate/thermostat entities
-│   ├── binary_sensor.py               # Binary sensor entities
-│   ├── select.py                      # Select entities
-│   ├── brands/                        # Brand/icon assets
-│   ├── translations/                  # Localization files
-│   └── __pycache__/                   # Python cache
-├── tests/                             # Test suite (73+ tests)
-│   ├── conftest.py                    # Pytest fixtures and setup
-│   ├── test_api.py                    # API client tests
-│   ├── test_init.py                   # Setup/unload tests
+│   ├── strings.json                   # UI strings and config schema
+│   ├── sensor.py                      # Sensor entities (CO2, temperature, humidity, diagnostic)
+│   ├── switch.py                      # Switch entities (AtmeexAutoNannySwitch, AtmeexSleepModeSwitch)
+│   ├── fan.py                         # Fan entity (AtmeexFanEntity, speed 1-7 ↔ percentage)
+│   ├── climate.py                     # Climate/thermostat entity with humidifier support
+│   ├── binary_sensor.py               # AtmeexOnlineSensor (DIAGNOSTIC), AtmeexNoWaterSensor
+│   ├── select.py                      # Select entity (breezer mode)
+│   ├── brands/                        # Brand/icon assets for HACS
+│   ├── translations/                  # Localization files (en.json, ru.json, …)
+│   └── __pycache__/                   # Python bytecode cache (not committed)
+├── tests/                             # Pytest test suite
+│   ├── conftest.py                    # Fixtures, mocks, DummyCoordinator, shared setup
+│   ├── test_api.py                    # AtmeexApi client tests
+│   ├── test_init.py                   # Setup/unload, runtime data initialization
 │   ├── test_config_flow.py            # Config flow tests
 │   ├── test_sensor.py                 # Sensor entity tests
 │   ├── test_switch.py                 # Switch entity tests
@@ -40,26 +41,25 @@ atmeex_hacs/
 │   ├── test_climate.py                # Climate entity tests
 │   ├── test_binary_sensor.py          # Binary sensor tests
 │   ├── test_select.py                 # Select entity tests
-│   ├── test_websocket_manager.py      # WebSocket connection tests
-│   ├── test_refresh_device.py         # Device refresh logic tests
-│   ├── test_race_protection.py        # Pending command race condition tests
-│   ├── test_api_fallback_extra.py     # API fallback scenarios
+│   ├── test_websocket_manager.py      # WebSocket connection lifecycle tests
+│   ├── test_refresh_device.py         # Device refresh coalescing tests
+│   ├── test_race_protection.py        # Pending command / race condition tests
+│   ├── test_api_fallback_extra.py     # API fallback scenario tests
 │   ├── test_diagnostics.py            # Diagnostics provider tests
 │   ├── test_logbook.py                # Event logging tests
-│   └── __pycache__/                   # Python cache
-├── scripts/                           # Development/manual testing scripts
-│   ├── test_api_interactive.py        # Interactive API testing
-│   ├── test_api_manual.py             # Manual API validation
-│   ├── test_websocket_connection.py   # WebSocket debugging
-│   ├── test_websocket_debug.py        # Extended WebSocket tests
-│   └── test_websocket_live.py         # Live WebSocket testing
+│   └── __pycache__/                   # Not committed
+├── scripts/                           # Manual development/debugging utilities
+│   ├── test_api_interactive.py
+│   ├── test_api_manual.py
+│   ├── test_websocket_connection.py
+│   ├── test_websocket_debug.py
+│   └── test_websocket_live.py
 ├── pytest.ini                         # Pytest configuration
 ├── requirements-dev.txt               # Development dependencies
 ├── README.en.md                       # English documentation
 ├── README.md                          # Russian documentation
 ├── HACS_SETUP.md                      # HACS installation guide
 ├── LICENSE                            # MIT license
-├── manifest.json (root)               # NOT USED - ignore
 └── hacs.json                          # HACS metadata
 ```
 
@@ -67,178 +67,168 @@ atmeex_hacs/
 
 **`custom_components/atmeex_cloud/`:**
 - Purpose: Main Home Assistant integration package containing all source code
-- Contains: API client, coordinator, entities, configuration flow, WebSocket handler
-- Key files: `__init__.py` (entry point), `api.py` (HTTP client), `websocket.py` (real-time updates)
+- Contains: API client, coordinator, runtime data, entities, config flow, WebSocket handler
+- Key files: `__init__.py` (lifecycle), `runtime.py` (state container), `coordinator.py` (polling), `api.py` (HTTP)
 
 **`tests/`:**
-- Purpose: Comprehensive pytest test suite with 73+ automated tests
-- Contains: Unit tests, integration tests for all entity types and API functionality
-- Key files: `conftest.py` (fixtures), `test_race_protection.py` (concurrency tests)
+- Purpose: Comprehensive pytest test suite
+- Contains: Unit and integration tests for all entity types, API, refresh coalescing, race conditions
+- Key files: `conftest.py` (fixtures + `DummyCoordinator`), `test_race_protection.py`, `test_refresh_device.py`
 
 **`scripts/`:**
-- Purpose: Manual testing and debugging utilities for development
-- Contains: Interactive API testing and WebSocket debugging scripts
-- NOT imported by main integration - development only
+- Purpose: Manual testing and debugging utilities; NOT imported by the main integration
+- Contains: Interactive API and WebSocket debugging scripts for development only
 
-**`brands/`:**
-- Purpose: Integration branding assets (icons, logos)
-- Contains: Atmeex brand configuration and SVG assets
-- Key path: `brands/atmeex_cloud/`
+**`brands/atmeex_cloud/`:**
+- Purpose: Integration branding assets (icons/logos) for HACS visibility
+- Generated: No (manual)
+- Committed: Yes
 
 **`translations/`:**
-- Purpose: Localization files for different languages
-- Contains: Language-specific UI strings
-- Key path: `translations/{language}.json`
+- Purpose: UI localization strings per language
+- Generated: No (manual)
+- Committed: Yes
 
 ## Key File Locations
 
 **Entry Points:**
-- `custom_components/atmeex_cloud/__init__.py`: `async_setup_entry()`, `async_unload_entry()` - integration lifecycle
-- `custom_components/atmeex_cloud/config_flow.py`: `AtmeexConfigFlow.async_step_user()` - user setup
-- Platform entries: `sensor.py`, `switch.py`, `fan.py`, etc. - entity creation per platform
+- `custom_components/atmeex_cloud/__init__.py`: `async_setup_entry()`, `async_unload_entry()` — integration lifecycle
+- `custom_components/atmeex_cloud/config_flow.py`: `AtmeexConfigFlow.async_step_user()` — user setup
+- Platform entries: `sensor.py`, `switch.py`, `fan.py`, `climate.py`, `binary_sensor.py`, `select.py` — entity creation per platform
 
 **Configuration:**
-- `custom_components/atmeex_cloud/const.py`: Domain name, platforms, API URLs, constants
+- `custom_components/atmeex_cloud/const.py`: `DOMAIN`, `PLATFORMS`, `API_BASE_URL`, event names, option keys, retry constants
 - `custom_components/atmeex_cloud/strings.json`: UI schema and translatable strings
 - `custom_components/atmeex_cloud/manifest.json`: Integration metadata, dependencies, version
 - `custom_components/atmeex_cloud/services.yaml`: Custom service definitions
 
 **Core Logic:**
-- `custom_components/atmeex_cloud/api.py`: `AtmeexApi` client, `AtmeexDevice`, `AtmeexState` data classes
-- `custom_components/atmeex_cloud/coordinator.py`: `AtmeexCoordinator`, `AtmeexCoordinatorData` TypedDict
-- `custom_components/atmeex_cloud/__init__.py`: `AtmeexRuntimeData`, update logic, WebSocket integration
+- `custom_components/atmeex_cloud/runtime.py`: `PendingCommand`, `AtmeexRuntimeData` — moved from `__init__.py`; pure data, no HA deps
+- `custom_components/atmeex_cloud/api.py`: `AtmeexApi`, `AtmeexDevice`, `AtmeexState`, `ApiError`
+- `custom_components/atmeex_cloud/coordinator.py`: `AtmeexCoordinator`, `AtmeexCoordinatorData`, `_ws_device_update_ts`, `_refresh_device_update_ts`
+- `custom_components/atmeex_cloud/__init__.py`: `refresh_device()` closure (coalescing, 65 s timeout), WebSocket plumbing, `ws_reauth_last_ts` float throttle
 
 **Entity Implementations:**
 - `custom_components/atmeex_cloud/sensor.py`: Diagnostic sensor, CO2, inlet temp, humidity sensors
-- `custom_components/atmeex_cloud/switch.py`: Power on/off, sleep mode switches
-- `custom_components/atmeex_cloud/fan.py`: Fan speed control (0-7 with percentage conversion)
-- `custom_components/atmeex_cloud/climate.py`: Thermostat with temperature control
-- `custom_components/atmeex_cloud/binary_sensor.py`: Online/offline status indicator
-- `custom_components/atmeex_cloud/select.py`: Mode selection (supply_ventilation, recirculation, etc.)
+- `custom_components/atmeex_cloud/switch.py`: `AtmeexAutoNannySwitch`, `AtmeexSleepModeSwitch` — use `_execute_command` with `pending_attr`/`pending_value`; `is_on` uses `_state_with_pending`
+- `custom_components/atmeex_cloud/fan.py`: `AtmeexFanEntity` — fan speed 1–7 ↔ percentage, optimistic `is_on` and `percentage` via `_state_with_pending`
+- `custom_components/atmeex_cloud/climate.py`: Thermostat with optional humidifier support
+- `custom_components/atmeex_cloud/binary_sensor.py`: `AtmeexOnlineSensor` (`EntityCategory.DIAGNOSTIC`; `available` checks `last_success_ts` vs `update_interval*3`), `AtmeexNoWaterSensor`
+- `custom_components/atmeex_cloud/select.py`: Breezer mode selection
 
 **Utilities:**
-- `custom_components/atmeex_cloud/entity_base.py`: `AtmeexEntityMixin` for shared entity logic
-- `custom_components/atmeex_cloud/helpers.py`: Unit conversion (fan speed, temperature, humidity)
-- `custom_components/atmeex_cloud/websocket.py`: `WebSocketManager` for real-time updates
-- `custom_components/atmeex_cloud/diagnostics.py`: Diagnostic data snapshots
-- `custom_components/atmeex_cloud/logbook.py`: Custom event logging
+- `custom_components/atmeex_cloud/entity_base.py`: `AtmeexEntityMixin` (`device_info` is plain `@property`), `setup_dynamic_device_entities`, `supports_humidifier`
+- `custom_components/atmeex_cloud/helpers.py`: `fan_speed_to_percent`, `api_to_fan_speed`, `fan_speed_to_api`, `deci_to_c`, `c_to_deci`, `quantize_humidity`, `humidity_to_stage` (new — returns HUM_ALLOWED stage index 0–3), `apply_condition_update`, `apply_settings_update`, `_normalize_device_state`
+- `custom_components/atmeex_cloud/websocket.py`: `WebSocketManager`, `WebSocketConfig`
+- `custom_components/atmeex_cloud/diagnostics.py`: Redacted diagnostic snapshots
+- `custom_components/atmeex_cloud/logbook.py`: Custom logbook event helpers
 
 **Testing:**
-- `tests/conftest.py`: Fixtures, mocks, setup for all tests
-- `tests/test_init.py`: Setup/unload, runtime data initialization
-- `tests/test_api.py`: API client methods, error handling, retries
+- `tests/conftest.py`: Fixtures, mocks, `DummyCoordinator` helper
+- `tests/test_init.py`: Setup/unload, runtime data initialization, task cancellation
+- `tests/test_api.py`: API client methods, error handling, retry logic
 - `tests/test_race_protection.py`: Pending commands, device locks, state consistency
-- `tests/test_websocket_manager.py`: Connection lifecycle, auth, message handling
+- `tests/test_refresh_device.py`: Coalescing, timeout, `_refresh_device_update_ts` recording
+- `tests/test_websocket_manager.py`: Connection lifecycle, auth, reconnect backoff
 
 ## Naming Conventions
 
 **Files:**
-- Entity modules: lowercase with underscores (`sensor.py`, `switch.py`, `fan.py`)
-- Utilities: lowercase with underscores (`helpers.py`, `websocket.py`)
-- Tests: `test_{module_name}.py` (e.g., `test_sensor.py`, `test_api.py`)
-- Configuration: constants in lowercase (`const.py`, `config_flow.py`)
+- Entity modules: lowercase with underscores (`sensor.py`, `binary_sensor.py`)
+- Utilities: lowercase with underscores (`helpers.py`, `websocket.py`, `runtime.py`)
+- Tests: `test_{module_name}.py` (e.g. `test_sensor.py`, `test_refresh_device.py`)
 
 **Directories:**
 - Package directory: lowercase domain name (`atmeex_cloud`)
-- Asset directories: lowercase plural (`brands/`, `translations/`, `tests/`)
+- Asset directories: lowercase plural (`brands/`, `translations/`)
 
 **Classes:**
-- CamelCase with domain prefix: `AtmeexApi`, `AtmeexDevice`, `AtmeexState`, `AtmeexCoordinator`, `AtmeexEntityMixin`
-- Flow classes: `AtmeexConfigFlow`, `AtmeexOptionsFlowHandler`
-- Entity classes: Specific to type: `AtmeexCO2Sensor`, `AtmeexPowerSwitch`, `AtmeexFanEntity`, etc.
+- CamelCase with domain prefix: `AtmeexApi`, `AtmeexDevice`, `AtmeexState`, `AtmeexCoordinator`, `AtmeexRuntimeData`, `AtmeexEntityMixin`
+- Entity classes: `AtmeexCO2Sensor`, `AtmeexAutoNannySwitch`, `AtmeexFanEntity`, `AtmeexOnlineSensor`, `_BaseSwitch` (private base)
 
 **Functions/Methods:**
-- Private functions: Leading underscore `_async_update_data()`, `_refresh_device_once()`, `_apply_websocket_message()`
-- Async functions: `async_` prefix (`async_setup_entry()`, `async_turn_on()`)
-- Conversion helpers: Descriptive names (`api_to_fan_speed()`, `deci_to_c()`, `c_to_deci()`)
+- Private: leading underscore (`_async_update_data`, `_refresh_device_once`, `_apply_websocket_message`, `_connect_once`)
+- Async: `async_` prefix (`async_setup_entry`, `async_turn_on`)
+- Conversion helpers: descriptive names (`api_to_fan_speed`, `deci_to_c`, `humidity_to_stage`)
 
 **Variables:**
-- Instance attributes: Underscore prefix for "private" (`_api`, `_token`, `_lock`)
-- Dict keys: Lowercase with underscores (`"device_map"`, `"fan_speed"`, `"pwr_on"`)
-- Constants: UPPERCASE (`DOMAIN`, `PLATFORMS`, `API_BASE_URL`)
+- Instance attributes: underscore prefix for private (`_api`, `_token`, `_lock`)
+- Dict keys: lowercase with underscores (`"device_map"`, `"fan_speed"`, `"pwr_on"`)
+- Constants: UPPERCASE (`DOMAIN`, `PLATFORMS`, `API_BASE_URL`, `_REFRESH_TASK_TIMEOUT_SEC`)
 
 ## Where to Add New Code
 
-**New Sensor/Switch/Entity:**
-- Primary code: `custom_components/atmeex_cloud/{sensor|switch|fan|climate}.py`
-  - Create entity class inheriting `CoordinatorEntity` + `AtmeexEntityMixin`
-  - Implement `@property` for state/value from `_device_state` dict
-  - Use `async_turn_on()`, `async_set_percentage()` etc. for commands
-  - Call `_refresh()` after command to fetch updated state
-  - Add to `async_setup_entry()` to register with coordinator
+**New Entity Type:**
+- Primary code: `custom_components/atmeex_cloud/{entity_type}.py`
+  - Inherit from `CoordinatorEntity` + `AtmeexEntityMixin`
+  - Accept `runtime: AtmeexRuntimeData` as constructor param and store as `self._runtime`
+  - Read state from `self._device_state` dict
+  - Use `await self._execute_command(self.api.set_*(…), pending_attr=…, pending_value=…)` for all commands
+  - Use `self._state_with_pending(attribute, confirmed, tolerance=_PENDING_TTL)` for optimistic display
+  - Register via `setup_dynamic_device_entities()` in `async_setup_entry`
 - Tests: `tests/test_{entity_type}.py`
-  - Create fixtures in conftest
-  - Test state reading, state changes, error handling
-  - Use mocked coordinator with test data
 
 **New API Method:**
-- Implementation: `custom_components/atmeex_cloud/api.py`
-  - Add method to `AtmeexApi` class
-  - Use `self._session.post()/get()` with error handling
-  - Distinguish 401/403 auth errors from other errors
-  - Raise `ApiError` with optional status code
-- Tests: `tests/test_api.py`
-  - Mock `aiohttp.ClientSession`
-  - Test success, auth failure, network failure cases
+- Location: `custom_components/atmeex_cloud/api.py` in `AtmeexApi` class
+  - GET/list: use `self._with_retries(lambda: self._request(…), "action_name")`
+  - SET/PUT: use `await self._put_params(device_id, body, "action_name")` directly — do NOT wrap in `_with_retries`
+  - Raise `ApiError` with `status=` for HTTP errors; caller distinguishes 401/403
 
 **New Conversion/Helper:**
 - Location: `custom_components/atmeex_cloud/helpers.py`
-  - Add function near related conversions
-  - Document with docstring including example values
-  - Add validation for edge cases (None, invalid types)
-- Tests: In relevant entity test file or as standalone test
+  - Add near related conversions
+  - Include docstring with example values and edge cases (None, invalid types)
+  - If used in WebSocket incremental updates, also add to `apply_condition_update` and/or `apply_settings_update`
 
 **New Configuration Option:**
-- Constants: `custom_components/atmeex_cloud/const.py`
-  - Add `CONF_*` and `DEFAULT_*` constants
-- Schema: `custom_components/atmeex_cloud/strings.json`
-  - Add schema entry under `config` → `step` → `options`
+- Constants: `custom_components/atmeex_cloud/const.py` — add `CONF_*` and `DEFAULT_*`
+- Schema: `custom_components/atmeex_cloud/strings.json` — add under `config` → `step` → `options`
 - Implementation: `custom_components/atmeex_cloud/config_flow.py`
-  - Add to `_resolve_*_option()` function or add new function
-  - Use in `async_setup_entry()` to apply option value
+- Apply in: `custom_components/atmeex_cloud/__init__.py` `async_setup_entry()`
 
 **New Integration Feature (Service/Event):**
 - Service definition: `custom_components/atmeex_cloud/services.yaml`
-  - Define service with parameters and description
-- Implementation: `custom_components/atmeex_cloud/__init__.py`
-  - Add handler function in `async_setup_entry()`
-  - Register via `hass.services.async_register()`
-- Events: Fire via `hass.bus.async_fire(EVENT_TYPE, data)`
-  - Define event constant in `const.py`
-  - Fire from coordinator updates or WebSocket messages
+- Handler: `custom_components/atmeex_cloud/__init__.py` — register via `hass.services.async_register()`
+- Event constants: `custom_components/atmeex_cloud/const.py`
+- Fire via `_fire_logbook_event(EVENT_TYPE, data)` local helper
+
+**New Runtime Data Field:**
+- Location: `custom_components/atmeex_cloud/runtime.py`
+- Add to `AtmeexRuntimeData` dataclass with `field(default=…)` or `field(default_factory=…)`
+- No HA imports in this module — keep it pure data
 
 ## Special Directories
 
 **`__pycache__/`:**
 - Purpose: Python bytecode cache
-- Generated: Yes (automatic)
-- Committed: No (.gitignore)
+- Generated: Yes
+- Committed: No
 
 **`brands/atmeex_cloud/`:**
-- Purpose: Brand assets for HACS visibility
-- Generated: No (manual)
+- Purpose: Brand assets for HACS
+- Generated: No
 - Committed: Yes
 
 **`translations/`:**
-- Purpose: UI localization (en.json, ru.json, etc.)
-- Generated: No (manual)
+- Purpose: UI localization (en.json, ru.json, …)
+- Generated: No
 - Committed: Yes
 
 **`.venv/`:**
 - Purpose: Python virtual environment
-- Generated: Yes (via `python -m venv .venv`)
-- Committed: No (.gitignore)
+- Generated: Yes
+- Committed: No
 
 **`.pytest_cache/`:**
-- Purpose: Pytest cache for test discovery
-- Generated: Yes (automatic)
-- Committed: No (.gitignore)
+- Purpose: Pytest test cache
+- Generated: Yes
+- Committed: No
 
-**`.coverage`:**
-- Purpose: Test coverage data
-- Generated: Yes (via pytest-cov)
-- Committed: No (.gitignore)
+**`.planning/codebase/`:**
+- Purpose: GSD codebase map documents (ARCHITECTURE.md, STRUCTURE.md, etc.)
+- Generated: Yes (by `/gsd-map-codebase`)
+- Committed: Yes
 
 ---
 
-*Structure analysis: 2026-03-28*
+*Structure analysis: 2026-05-02*

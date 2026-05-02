@@ -1,6 +1,6 @@
 # Technology Stack
 
-**Analysis Date:** 2026-03-28
+**Analysis Date:** 2026-05-02
 
 ## Languages
 
@@ -10,7 +10,7 @@
 ## Runtime
 
 **Environment:**
-- Home Assistant 2024.8.0+ (minimum version requirement from `manifest.json`)
+- Home Assistant 2024.8.0+ (minimum version requirement from `custom_components/atmeex_cloud/manifest.json`)
 - Runs as custom component within Home Assistant Python environment
 
 **Package Manager:**
@@ -38,53 +38,69 @@
 ## Key Dependencies
 
 **Critical:**
-- aiohttp 3.9.0+ - Why it matters: Handles all REST API and WebSocket communication to Atmeex Cloud API. Essential for device control and real-time state updates.
+- aiohttp 3.9.0+ - Handles all REST API and WebSocket communication to Atmeex Cloud API. Essential for device control and real-time state updates.
 
 **Infrastructure:**
 - asyncio (stdlib) - Enables concurrent handling of multiple devices, WebSocket connections, and API retries
-- voluptuous (inferred from config_flow.py) - Schema validation for configuration UI input
+- dataclasses (stdlib) - Used for `AtmeexDevice` (`slots=True`), `AtmeexState`, `WebSocketConfig`, `PendingCommand`, and `AtmeexRuntimeData` typed data classes
+- collections.deque (stdlib) - Bounded websocket message queue (maxlen=500) in `__init__.py`
 
 **Home Assistant Helpers:**
-- homeassistant.helpers.aiohttp_client - Provides shared HTTP session for entire HA instance
-- homeassistant.helpers.update_coordinator - DataUpdateCoordinator pattern for periodic polling
-- homeassistant.helpers.device_registry - Device management across HA
-- homeassistant.config_entries - Configuration flow and entry management
+- `homeassistant.helpers.aiohttp_client` - Provides shared HTTP session for entire HA instance
+- `homeassistant.helpers.update_coordinator` - `DataUpdateCoordinator` pattern for periodic polling
+- `homeassistant.helpers.device_registry` - Device management across HA
+- `homeassistant.helpers.entity` - `EntityCategory.DIAGNOSTIC` used in `binary_sensor.py`
+- `homeassistant.config_entries` - Configuration flow and entry management
 
 ## Configuration
 
 **Environment:**
 - Credentials stored in Home Assistant config entry (email/password for Atmeex Cloud API)
 - No `.env` file used (Home Assistant handles secrets natively)
-- Configuration options:
-  - `CONF_UPDATE_INTERVAL` (default: 30 seconds, range: 10-300)
+- Configuration options (all in `custom_components/atmeex_cloud/const.py`):
+  - `CONF_UPDATE_INTERVAL` (default: 30 seconds, range: 10–300)
   - `CONF_ENABLE_WEBSOCKET` (default: True)
+  - `CONF_ENABLE_CO2` (default: True)
 
 **Build:**
 - No build step required
 - Component loaded directly from `custom_components/atmeex_cloud/`
 - Entry point: `custom_components/atmeex_cloud/__init__.py`
 
+## Integration Version
+
+- Current version: `0.8.5` (`manifest.json`)
+- Integration type: `hub`
+- IoT class: `cloud_polling`
+
 ## API & External Service Configuration
 
 **Atmeex Cloud API:**
-- Base URL: `https://api.iot.atmeex.com` (from `const.py`)
-- Auth: Bearer token-based (OAuth 2.0 flow, obtained via email/password login)
-- Timeout: 20 seconds (default, adjustable)
-- Retry strategy: Exponential backoff (base 1.0s, max 32.0s, up to 3 attempts)
-- Token refresh buffer: 60 seconds before expiration
+- Base URL: `https://api.iot.atmeex.com` (constant `API_BASE_URL` in `const.py`)
+- Auth: Bearer token-based (OAuth 2.0 flow, obtained via email/password login, with refresh token support)
+- Timeout: 20 seconds (default, per-request in `api.py`)
+- Retry strategy: Exponential backoff (base 1.0s, max 32.0s, up to 3 attempts) — network errors only; PUT commands intentionally not retried
+- Token refresh buffer: 60 seconds before expiration (`TOKEN_REFRESH_BUFFER_SEC` in `const.py`)
 
 **WebSocket:**
-- Base URL: `wss://ws.iot.atmeex.com`
+- Base URL: `wss://ws.iot.atmeex.com` (`WS_BASE_URL` in `websocket.py`)
 - Purpose: Real-time device state updates (optional, falls back to HTTP polling)
-- Reconnect: Exponential backoff (min 1.0s, max 60.0s)
-- Ping interval: 30 seconds
+- Reconnect: Exponential backoff (min 1.0s, max 60.0s); backoff **unconditionally resets to min** on successful connection
+- Ping interval: 30 seconds; ping timeout: 10 seconds
+- Auth failure threshold: 5 consecutive `{"type":"unauthorized"}` messages trigger reauth flow
+- Reauth cooldown: `_WS_REAUTH_COOLDOWN_SEC = 300.0` (5 minutes) defined in `__init__.py` — limits how often the WS auth failure triggers a config-entry reauth prompt
+
+**Task lifecycle constants (module-level in `__init__.py` for testability):**
+- `_UNLOAD_TASK_TIMEOUT_SEC = 5.0` — max wait for WS tasks to cancel during entry unload
+- `_REFRESH_TASK_TIMEOUT_SEC = 65.0` — max wait for a coalesced in-flight `refresh_device` task (covers 3 retries × 20s + headroom)
 
 ## Platform Requirements
 
 **Development:**
 - Python 3.12 with Home Assistant development environment
-- Git for repository management
-- Test environment: pytest with Home Assistant testing helpers
+- Test dependencies: `pytest`, `pytest-asyncio`, `pytest-homeassistant-custom-component`, `aiohttp` (see `requirements-dev.txt`)
+- `pythonpath = .` set in `pytest.ini` so `custom_components` is importable as a package
+- Test suite: 166 test functions across 18 test files in `tests/`
 
 **Production:**
 - Home Assistant installation (Docker, QEMU, native, etc.)
@@ -93,4 +109,4 @@
 
 ---
 
-*Stack analysis: 2026-03-28*
+*Stack analysis: 2026-05-02*
