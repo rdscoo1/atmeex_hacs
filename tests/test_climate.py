@@ -18,6 +18,7 @@ from custom_components.atmeex_cloud.climate import (
     HUM_ALLOWED,
     BREEZER_SWING_MODES,
 )
+from custom_components.atmeex_cloud.helpers import humidity_to_stage
 from custom_components.atmeex_cloud.const import DOMAIN, BREEZER_MODES
 from custom_components.atmeex_cloud.api import AtmeexDevice
 
@@ -198,6 +199,50 @@ async def test_async_set_temperature_turns_on_if_needed():
     api.set_power.assert_awaited_once_with(1, True)
     api.set_target_temperature.assert_awaited_once_with(1, 23.0)
     ent._refresh.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_set_temperature_on_off_device_tracks_pwr_on_pending():
+    """Implicit power-on in async_set_temperature must be tracked as pending.
+
+    Without pending tracking a coordinator poll arriving between set_power()
+    and the refresh can show the device as OFF — breaking optimistic UI state.
+    """
+    ent, cond, api, runtime = _make_entity_with_runtime({"pwr_on": False})
+    ent._refresh_device_cb = AsyncMock()
+
+    await ent.async_set_temperature(**{ATTR_TEMPERATURE: 22.0})
+
+    api.set_power.assert_awaited_once_with(1, True)
+    api.set_target_temperature.assert_awaited_once_with(1, 22.0)
+    # pwr_on=True must be pending so hvac_mode returns FAN_ONLY immediately
+    assert ent.hvac_mode == HVACMode.FAN_ONLY
+
+
+def test_device_info_reflects_name_updates():
+    """device_info must use the live coordinator data, not a cached-at-init snapshot.
+
+    @cached_property freezes name/model for the entity's lifetime; a rename in
+    the Atmeex app would not show up in HA until the entry is reloaded.
+    """
+    ent, cond, api = _make_entity()
+    # Confirm initial name
+    assert ent.device_info["name"] == "Test Device"
+
+    # Simulate the device being renamed in coordinator data
+    updated_dev = AtmeexDevice.from_raw({
+        "id": 1,
+        "name": "Renamed Device",
+        "model": "new-model",
+        "online": True,
+        "condition": {},
+        "settings": {},
+    })
+    ent.coordinator.data["device_map"]["1"] = updated_dev
+    ent._device_meta = updated_dev  # _device_meta drives device_info
+
+    # device_info must reflect the new name immediately (no cache hit)
+    assert ent.device_info["name"] == "Renamed Device"
 
 
 @pytest.mark.asyncio
@@ -514,3 +559,19 @@ async def test_service_set_humidifier_stage_raises_on_api_error():
     api.set_humid_stage.side_effect = ApiError("timeout", status=None)
     with pytest.raises(HomeAssistantError):
         await ent.async_set_humidifier_stage(1)
+
+
+@pytest.mark.parametrize("val,expected_stage", [
+    (0, 0),
+    (16, 0),    # midpoint is 16.5, so 16 rounds to stage 0
+    (17, 1),    # 17 is closer to 33 than to 0
+    (33, 1),
+    (50, 2),    # closest to 66
+    (66, 2),
+    (84, 3),    # closest to 100
+    (100, 3),
+    (None, 0),
+])
+def test_humidity_to_stage_returns_index(val, expected_stage):
+    """humidity_to_stage must return the HUM_ALLOWED index, never raise ValueError."""
+    assert humidity_to_stage(val) == expected_stage

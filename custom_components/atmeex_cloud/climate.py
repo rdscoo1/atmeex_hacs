@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 import logging
 from typing import Any, Callable, Awaitable
-from .helpers import deci_to_c, quantize_humidity, HUM_ALLOWED
+from .helpers import deci_to_c, quantize_humidity, humidity_to_stage, HUM_ALLOWED
 from .entity_base import (
     AtmeexEntityMixin,
     setup_dynamic_device_entities,
@@ -225,13 +225,17 @@ class AtmeexClimateEntity(AtmeexEntityMixin, CoordinatorEntity, ClimateEntity):
             return
         t_clamped = max(self._attr_min_temp, min(self._attr_max_temp, t_float))
 
+        device_is_off = not bool(self._device_state.get("pwr_on"))
+
         async def _set_temp():
-            if not bool(self._device_state.get("pwr_on")):
+            if device_is_off:
                 await self.api.set_power(self._device_id, True)
             await self.api.set_target_temperature(self._device_id, t_clamped)
 
         await self._execute_command(
             _set_temp(),
+            pending_attr="pwr_on" if device_is_off else None,
+            pending_value=True if device_is_off else None,
             error_message="Failed to set temperature",
         )
 
@@ -261,8 +265,7 @@ class AtmeexClimateEntity(AtmeexEntityMixin, CoordinatorEntity, ClimateEntity):
     async def async_set_humidity(self, humidity: int) -> None:
         if not self._has_humidifier():
             return
-        q = quantize_humidity(humidity)
-        stage = HUM_ALLOWED.index(q)
+        stage = humidity_to_stage(humidity)
         await self._execute_command(
             self.api.set_humid_stage(self._device_id, stage),
             error_message="Failed to set humidity",
