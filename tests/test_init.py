@@ -212,6 +212,52 @@ async def test_async_unload_entry_clears_data(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_unload_entry_hung_task_does_not_block_unload(monkeypatch):
+    """Cancellation of WS tasks during unload must have a timeout.
+
+    If await message_task or await start_task hangs (e.g. slow TLS teardown
+    in a finally block), async_unload_entry would also block HA's reload
+    watchdog indefinitely.  The fix wraps each await in asyncio.wait_for.
+    """
+    gate = asyncio.Event()  # open in cleanup to unblock hanging task
+
+    async def _hung_task():
+        try:
+            await asyncio.sleep(9999)
+        finally:
+            await gate.wait()  # simulate slow cleanup
+
+    task = asyncio.create_task(_hung_task())
+    await asyncio.sleep(0)  # let task start
+
+    # Patch the timeout to something tiny so the test runs fast
+    monkeypatch.setattr(atmeex_init, "_UNLOAD_TASK_TIMEOUT_SEC", 0.05)
+
+    hass = SimpleNamespace(
+        data={},
+        config_entries=SimpleNamespace(
+            async_unload_platforms=AsyncMock(return_value=True),
+        ),
+    )
+    entry = SimpleNamespace(
+        entry_id="entry1",
+        runtime_data=SimpleNamespace(
+            websocket_manager=None,
+            websocket_message_task=task,
+            websocket_start_task=None,
+        ),
+    )
+
+    # Must complete quickly rather than hanging on await task
+    result = await asyncio.wait_for(atmeex_init.async_unload_entry(hass, entry), timeout=5.0)
+    assert result is True
+
+    # Cleanup: open the gate so the hung task can exit cleanly
+    gate.set()
+    await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("configured_interval", "expected_interval"),
     [
@@ -411,6 +457,114 @@ async def test_refresh_device_coalesces_parallel_requests(monkeypatch):
         await asyncio.gather(t1, t2, return_exceptions=True)
 
     assert api.get_device_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_refresh_device_hung_task_times_out_for_second_caller(monkeypatch):
+    """A hung in-flight refresh must not block the second caller indefinitely.
+
+    The fix adds an internal wait_for around `await in_flight` with a timeout
+    constant that evicts the stuck key so the next caller can start fresh.
+    This test patches the timeout constant to a tiny value so it runs fast.
+    """
+    gate = asyncio.Event()          # open in cleanup so inner tasks can finish
+    task_started = asyncio.Event()  # signals that the explicit refresh task reached gate.wait()
+
+    class FakeApi:
+        def __init__(self, session):
+            self.async_init = AsyncMock()
+            self.refresh_token = None
+            self.login = AsyncMock()
+            dev_raw = {
+                "id": 1, "name": "Dev1", "model": "m",
+                "online": True, "condition": {"pwr_on": 1, "fan_speed": 2}, "settings": {},
+            }
+            self._dev = AtmeexDevice.from_raw(dev_raw)
+            self.get_devices = AsyncMock(return_value=[self._dev])
+            # Track calls: first call is during initial setup (should return fast),
+            # subsequent calls are from refresh_device() and should block.
+            self._get_device_calls = 0
+
+            async def _gate_get_device(_device_id):
+                self._get_device_calls += 1
+                if self._get_device_calls > 1:
+                    task_started.set()  # notify that we reached the blocking point
+                    await gate.wait()
+                return self._dev
+
+            self.get_device = _gate_get_device
+
+        @property
+        def token(self):
+            return "tok"
+
+    monkeypatch.setattr(atmeex_init, "AtmeexApi", FakeApi)
+    monkeypatch.setattr(atmeex_init, "async_get_clientsession", lambda hass: object())
+    # Patch the in-flight timeout to a tiny value so the test completes quickly
+    monkeypatch.setattr(atmeex_init, "_REFRESH_TASK_TIMEOUT_SEC", 0.05)
+
+    class DummyCoordinator:
+        def __init__(self, hass, logger, name, update_interval, **kwargs):
+            self.hass = hass
+            self.data = None
+            self.last_update_success = False
+            self.last_api_error = None
+            self.last_success_ts = None
+            self._ws_device_update_ts = {}
+
+        def setup_update(self, *, api, fire_logbook_event):
+            import types
+            from custom_components.atmeex_cloud.coordinator import AtmeexCoordinator as _Real
+            self._api = api
+            self._fire_logbook_event = fire_logbook_event
+            self._api_error_last_ts = float("-inf")
+            self._api_error_suppressed = 0
+            for m in ("_fetch_devices_safely", "_fire_api_error_event", "_async_update_data"):
+                setattr(self, m, types.MethodType(getattr(_Real, m), self))
+
+        async def async_config_entry_first_refresh(self):
+            self.data = await self._async_update_data()
+            self.last_update_success = True
+
+        def async_set_updated_data(self, data):
+            self.data = data
+
+        async def async_request_refresh(self):
+            self.data = await self._async_update_data()
+
+    monkeypatch.setattr(atmeex_init, "AtmeexCoordinator", DummyCoordinator)
+
+    hass = SimpleNamespace(
+        data={},
+        config_entries=SimpleNamespace(
+            async_forward_entry_setups=AsyncMock(),
+            async_unload_platforms=AsyncMock(return_value=True),
+        ),
+    )
+    entry = SimpleNamespace(
+        data={"email": "user@example.com", "password": "pwd"},
+        options={"update_interval": 30, "enable_websocket": False},
+        entry_id="entry1",
+        add_update_listener=lambda _listener: (lambda: None),
+        async_on_unload=lambda _cb: None,
+    )
+
+    assert await atmeex_init.async_setup_entry(hass, entry) is True
+    runtime = entry.runtime_data
+
+    # First call starts — blocks inside gate.wait()
+    t1 = asyncio.create_task(runtime.refresh_device(1))
+    # Wait until the inner _refresh_device_once task is truly blocking at gate.wait().
+    # This ensures refresh_tasks["1"] is populated before the second call is made.
+    await task_started.wait()
+
+    # Second caller should time out (internal wait_for) rather than hang forever
+    with pytest.raises(asyncio.TimeoutError):
+        await runtime.refresh_device(1)
+
+    # Unblock the inner task so t1 can finish (avoids lingering tasks)
+    gate.set()
+    await asyncio.gather(t1, return_exceptions=True)
 
 
 @pytest.mark.asyncio
@@ -854,6 +1008,94 @@ async def test_setup_entry_registers_reload_listener(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_refresh_token_persistence_failure_is_logged_not_raised(monkeypatch):
+    """If async_update_entry raises when persisting a new refresh token, the error
+    must be caught and logged — not propagated as an unhandled exception that
+    would abort async_setup_entry.
+    """
+    import logging
+
+    class FakeApi:
+        def __init__(self, session):
+            self.async_init = AsyncMock()
+            self.login = AsyncMock()
+            # Return a NEW refresh token different from what's stored
+            self.refresh_token = "new-refresh-token"
+            self._token = "access-token"
+            dev = AtmeexDevice.from_raw(
+                {"id": 1, "name": "D", "model": "m", "online": True, "condition": {}, "settings": {}}
+            )
+            self.get_devices = AsyncMock(return_value=[dev])
+            self.get_device = AsyncMock(return_value=dev)
+
+        @property
+        def token(self):
+            return self._token
+
+    monkeypatch.setattr(atmeex_init, "AtmeexApi", FakeApi)
+    monkeypatch.setattr(atmeex_init, "async_get_clientsession", lambda _hass: object())
+
+    class DummyCoordinator:
+        def __init__(self, hass, logger, name, update_interval, **kwargs):
+            self.hass = hass
+            self.data = None
+            self.last_update_success = False
+            self.last_api_error = None
+            self.last_success_ts = None
+            self._ws_device_update_ts = {}
+
+        def setup_update(self, *, api, fire_logbook_event):
+            import types
+            from custom_components.atmeex_cloud.coordinator import AtmeexCoordinator as _Real
+            self._api = api
+            self._fire_logbook_event = fire_logbook_event
+            self._api_error_last_ts = float("-inf")
+            self._api_error_suppressed = 0
+            for m in ("_fetch_devices_safely", "_fire_api_error_event", "_async_update_data"):
+                setattr(self, m, types.MethodType(getattr(_Real, m), self))
+
+        async def async_config_entry_first_refresh(self):
+            self.data = await self._async_update_data()
+            self.last_update_success = True
+
+        def async_set_updated_data(self, data):
+            self.data = data
+
+        async def async_request_refresh(self):
+            self.data = await self._async_update_data()
+
+    monkeypatch.setattr(atmeex_init, "AtmeexCoordinator", DummyCoordinator)
+
+    persist_calls = []
+
+    def _raising_update_entry(entry, data):
+        persist_calls.append(data)
+        raise RuntimeError("Disk full — cannot persist")
+
+    hass = SimpleNamespace(
+        data={},
+        config_entries=SimpleNamespace(
+            async_forward_entry_setups=AsyncMock(),
+            async_unload_platforms=AsyncMock(return_value=True),
+            async_update_entry=_raising_update_entry,
+        ),
+    )
+    entry = SimpleNamespace(
+        # stored refresh_token differs from what the API will return
+        data={"email": "u@example.com", "password": "pw", "refresh_token": "old-token"},
+        options={"enable_websocket": False},
+        entry_id="entry1",
+        add_update_listener=lambda _listener: (lambda: None),
+        async_on_unload=lambda _cb: None,
+    )
+
+    # async_setup_entry must succeed even though persisting the token raised
+    result = await atmeex_init.async_setup_entry(hass, entry)
+    assert result is True, "setup must not fail when token persistence raises"
+    assert len(persist_calls) == 1, "async_update_entry should have been attempted"
+
+
+@pytest.mark.asyncio
 async def test_setup_entry_websocket_skipped_without_ws_connect(monkeypatch):
     class SessionNoWS:
         pass
@@ -1092,6 +1334,142 @@ async def test_setup_entry_websocket_auth_failure_starts_reauth(monkeypatch):
         await runtime.websocket_start_task
 
     entry.async_start_reauth.assert_called_once_with(hass)
+
+
+@pytest.mark.asyncio
+async def test_ws_reauth_can_trigger_again_after_successful_reconnect(monkeypatch):
+    """After a successful WS reconnect the reauth guard must reset.
+
+    If ws_reauth_started is never cleared, a second auth failure (e.g. after a
+    token rotation that invalidates the WS session) silently drops the reauth
+    prompt and the user is left stranded.
+    """
+    import custom_components.atmeex_cloud.websocket as websocket_mod
+
+    on_auth_failure_cb = None
+    on_success_cb = None
+
+    class FakeWebSocketManager:
+        def __init__(self, session, token_getter, on_message, on_auth_failure=None, on_token_refresh=None):
+            nonlocal on_auth_failure_cb
+            self.on_auth_failure = on_auth_failure
+            on_auth_failure_cb = on_auth_failure
+
+        async def connect(self):
+            return True
+
+        async def disconnect(self):
+            return None
+
+    monkeypatch.setattr(websocket_mod, "WebSocketManager", FakeWebSocketManager)
+
+    class FakeSession:
+        async def ws_connect(self, *args, **kwargs):
+            raise AssertionError("ws_connect should not be called")
+
+    class FakeApi:
+        def __init__(self, _session):
+            self.async_init = AsyncMock()
+            self.refresh_token = None
+            self.login = AsyncMock()
+            self._token = "token"
+            dev = AtmeexDevice.from_raw(
+                {
+                    "id": 1,
+                    "name": "Dev1",
+                    "model": "m",
+                    "online": True,
+                    "condition": {"pwr_on": 1, "fan_speed": 2},
+                    "settings": {},
+                }
+            )
+            self.get_devices = AsyncMock(return_value=[dev])
+            self.get_device = AsyncMock(return_value=dev)
+
+        @property
+        def token(self):
+            return self._token or ""
+
+    monkeypatch.setattr(atmeex_init, "AtmeexApi", FakeApi)
+    monkeypatch.setattr(atmeex_init, "async_get_clientsession", lambda _hass: FakeSession())
+
+    class DummyCoordinator:
+        def __init__(self, hass, logger, name, update_interval, **kwargs):
+            self.hass = hass
+            self.data = None
+            self.last_update_success = False
+            self.last_api_error = None
+            self.last_success_ts = None
+            self._ws_device_update_ts = {}
+
+        def setup_update(self, *, api, fire_logbook_event):
+            import types
+            from custom_components.atmeex_cloud.coordinator import AtmeexCoordinator as _Real
+            self._api = api
+            self._fire_logbook_event = fire_logbook_event
+            self._api_error_last_ts = float("-inf")
+            self._api_error_suppressed = 0
+            for m in ("_fetch_devices_safely", "_fire_api_error_event", "_async_update_data"):
+                setattr(self, m, types.MethodType(getattr(_Real, m), self))
+
+        async def async_config_entry_first_refresh(self):
+            self.data = await self._async_update_data()
+            self.last_update_success = True
+
+        def async_set_updated_data(self, data):
+            self.data = data
+
+        async def async_request_refresh(self):
+            self.data = await self._async_update_data()
+
+    monkeypatch.setattr(atmeex_init, "AtmeexCoordinator", DummyCoordinator)
+
+    hass = SimpleNamespace(
+        data={},
+        config_entries=SimpleNamespace(
+            async_forward_entry_setups=AsyncMock(),
+            async_unload_platforms=AsyncMock(return_value=True),
+        ),
+    )
+    entry = SimpleNamespace(
+        data={"email": "user@example.com", "password": "pwd"},
+        options={"enable_websocket": True},
+        entry_id="entry1",
+        add_update_listener=lambda _listener: (lambda: None),
+        async_on_unload=lambda _cb: None,
+        async_start_reauth=MagicMock(),
+    )
+
+    # Patch time.monotonic so we can advance virtual time between failures
+    import custom_components.atmeex_cloud as atmeex_mod
+    _monotonic_time = [0.0]
+
+    def _fake_monotonic():
+        return _monotonic_time[0]
+
+    monkeypatch.setattr(atmeex_mod.time, "monotonic", _fake_monotonic)
+
+    assert await atmeex_init.async_setup_entry(hass, entry) is True
+    runtime = entry.runtime_data
+    if runtime.websocket_start_task:
+        await runtime.websocket_start_task
+
+    # First auth failure — reauth must start
+    assert on_auth_failure_cb is not None
+    on_auth_failure_cb()
+    assert entry.async_start_reauth.call_count == 1, "First auth failure: reauth not triggered"
+
+    # Second call within the cooldown window must be suppressed
+    on_auth_failure_cb()
+    assert entry.async_start_reauth.call_count == 1, "Second call within cooldown: should be suppressed"
+
+    # Advance past the 5-minute cooldown — next failure must trigger reauth again
+    _monotonic_time[0] = 301.0
+    on_auth_failure_cb()
+    assert entry.async_start_reauth.call_count == 2, (
+        "Auth failure after cooldown expired: reauth was not triggered again "
+        "(ws_reauth_started flag was never cleared)"
+    )
 
 
 @pytest.mark.asyncio

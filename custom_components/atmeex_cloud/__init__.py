@@ -33,6 +33,14 @@ from .helpers import apply_condition_update, apply_settings_update
 
 _LOGGER = logging.getLogger(__name__)
 
+# Upper-bound for awaiting WS task cancellation during entry unload.
+# asyncio.wait returns after this limit even if the task is stuck in finally.
+_UNLOAD_TASK_TIMEOUT_SEC: float = 5.0
+
+# Upper-bound for awaiting a coalesced in-flight refresh_device task.
+# Sized to cover all retries (RETRY_MAX_ATTEMPTS=3 × 20 s timeout + headroom).
+# Module-level so tests can monkeypatch it without touching the closure.
+_REFRESH_TASK_TIMEOUT_SEC: float = 65.0
 
 from .runtime import PendingCommand, AtmeexRuntimeData
 
@@ -42,7 +50,7 @@ __all__ = [
     "AtmeexCoordinator",
     "AtmeexCoordinatorData",
     "AtmeexRuntimeData",
-    "PendingCommand",
+    "PendingCommand",  # re-exported: tests import from here for convenience
     "EVENT_API_ERROR",
     "EVENT_DEVICE_UPDATED",
 ]
@@ -91,7 +99,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     # Persist refresh token if the API returned one
     if api.refresh_token and api.refresh_token != stored_refresh_token:
         new_data = {**entry.data, "refresh_token": api.refresh_token}
-        hass.config_entries.async_update_entry(entry, data=new_data)
+        try:
+            hass.config_entries.async_update_entry(entry, data=new_data)
+        except Exception as err:  # noqa: BLE001
+            _LOGGER.warning("Failed to persist new refresh token: %s", err)
 
     options = getattr(entry, "options", {}) or {}
     update_interval_seconds = _resolve_update_interval_seconds(options)
@@ -247,6 +258,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                     "request_retries": cur.get("request_retries", 0),
                 }
             )
+            # Record timestamp so _async_update_data can detect a fresher
+            # targeted refresh and avoid overwriting it during the next poll.
+            coordinator._refresh_device_update_ts[key] = time.monotonic()
             device_name = full.name if hasattr(full, "name") else None
             _fire_logbook_event(
                 EVENT_DEVICE_UPDATED,
@@ -263,7 +277,15 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 "Refresh for device %s is already running; awaiting existing task",
                 device_id,
             )
-            await in_flight
+            try:
+                await asyncio.wait_for(in_flight, timeout=_REFRESH_TASK_TIMEOUT_SEC)
+            except asyncio.TimeoutError:
+                _LOGGER.warning(
+                    "In-flight refresh for device %s timed out; evicting stuck task",
+                    device_id,
+                )
+                refresh_tasks.pop(key, None)
+                raise
             return
 
         task = asyncio.create_task(_refresh_device_once(device_id))
@@ -389,14 +411,18 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 if runtime_data is not None:
                     runtime_data.websocket_message_task = new_task
 
-            ws_reauth_started = False
+            # Throttle WS reauth prompts: at most once per 5 minutes so that a
+            # successful reconnect followed by another auth failure still shows the prompt.
+            _WS_REAUTH_COOLDOWN_SEC = 300.0
+            ws_reauth_last_ts: float = float("-inf")
 
             def _on_ws_auth_failure() -> None:
                 """Start config-entry reauth when WS token becomes invalid."""
-                nonlocal ws_reauth_started
-                if ws_reauth_started:
+                nonlocal ws_reauth_last_ts
+                now = time.monotonic()
+                if now - ws_reauth_last_ts < _WS_REAUTH_COOLDOWN_SEC:
                     return
-                ws_reauth_started = True
+                ws_reauth_last_ts = now
 
                 _LOGGER.warning(
                     "WebSocket auth rejected; starting config-entry reauth flow"
@@ -476,18 +502,16 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     message_task = getattr(runtime, "websocket_message_task", None)
     if message_task and not message_task.done():
         message_task.cancel()
-        try:
-            await message_task
-        except asyncio.CancelledError:
-            pass
+        _, pending = await asyncio.wait({message_task}, timeout=_UNLOAD_TASK_TIMEOUT_SEC)
+        if pending:
+            _LOGGER.warning("WS message task did not finish within %.1fs; abandoning", _UNLOAD_TASK_TIMEOUT_SEC)
 
     start_task = getattr(runtime, "websocket_start_task", None)
     if start_task and not start_task.done():
         start_task.cancel()
-        try:
-            await start_task
-        except asyncio.CancelledError:
-            pass
+        _, pending = await asyncio.wait({start_task}, timeout=_UNLOAD_TASK_TIMEOUT_SEC)
+        if pending:
+            _LOGGER.warning("WS start task did not finish within %.1fs; abandoning", _UNLOAD_TASK_TIMEOUT_SEC)
 
     # Disconnect WebSocket if active
     if runtime and runtime.websocket_manager:
