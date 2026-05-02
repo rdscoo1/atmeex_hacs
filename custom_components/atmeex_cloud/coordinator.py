@@ -55,6 +55,8 @@ class AtmeexCoordinator(DataUpdateCoordinator[AtmeexCoordinatorData]):
         self._api_error_suppressed: int = 0
         # Per-device monotonic timestamp of last WS state update
         self._ws_device_update_ts: dict[str, float] = {}
+        # Per-device monotonic timestamp of last targeted refresh (refresh_device)
+        self._refresh_device_update_ts: dict[str, float] = {}
 
     def setup_update(
         self,
@@ -103,7 +105,7 @@ class AtmeexCoordinator(DataUpdateCoordinator[AtmeexCoordinatorData]):
             if status in (401, 403):
                 raise
             _LOGGER.debug("Primary get_devices failed: %s", err)
-        except Exception as err:
+        except (asyncio.TimeoutError, aiohttp.ClientError) as err:
             _LOGGER.debug("Unexpected error in primary get_devices: %s", err)
 
         # 2. Если ничего не получили — пробуем fallback=True
@@ -232,6 +234,17 @@ class AtmeexCoordinator(DataUpdateCoordinator[AtmeexCoordinatorData]):
                         "Preserving fresher WS state for device %s "
                         "(ws_ts=%.3f >= poll_start=%.3f)",
                         did, ws_ts, poll_start_mono,
+                    )
+                    states[did] = cur_states[did]
+
+            # Preserve targeted-refresh state for devices whose per-device
+            # refresh completed after this poll started.
+            for did, ref_ts in self._refresh_device_update_ts.items():
+                if ref_ts >= poll_start_mono and did in cur_states and did in states:
+                    _LOGGER.debug(
+                        "Preserving fresher targeted-refresh state for device %s "
+                        "(ref_ts=%.3f >= poll_start=%.3f)",
+                        did, ref_ts, poll_start_mono,
                     )
                     states[did] = cur_states[did]
 

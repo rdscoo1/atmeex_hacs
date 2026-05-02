@@ -70,6 +70,7 @@ async def test_refresh_device_updates_coordinator_data(monkeypatch):
             self.last_api_error = None
             self.last_success_ts = None
             self._ws_device_update_ts = {}
+            self._refresh_device_update_ts = {}
 
         def setup_update(self, *, api, fire_logbook_event):
             import types

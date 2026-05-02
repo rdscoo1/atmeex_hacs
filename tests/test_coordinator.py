@@ -1,7 +1,9 @@
 """Unit tests for AtmeexCoordinator._async_update_data."""
+import asyncio
 import logging
 import time
 
+import aiohttp
 import pytest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
@@ -84,3 +86,63 @@ async def test_update_data_preserves_offline_devices():
     data2 = await coord._async_update_data()
     # dev2 should still be in device_map from merge
     assert "2" in data2["device_map"]
+
+
+@pytest.mark.asyncio
+async def test_fetch_devices_primary_network_error_falls_back():
+    """asyncio.TimeoutError on the primary get_devices call must be caught and
+    fall through to the fallback path — not propagate as an unhandled exception.
+    """
+    coord, api = _make_coordinator()
+    api.get_devices = AsyncMock(side_effect=asyncio.TimeoutError())
+    api.get_device = AsyncMock(side_effect=asyncio.TimeoutError())
+
+    # Both primary and fallback time out → empty list (no devices)
+    devices = await coord._fetch_devices_safely()
+    assert devices == []
+
+
+@pytest.mark.asyncio
+async def test_poll_does_not_overwrite_fresher_targeted_refresh_state():
+    """A targeted device refresh recorded after poll_start_mono must not be overwritten.
+
+    Mirrors the _ws_device_update_ts guard but for _refresh_device_update_ts.
+    """
+    coord, api = _make_coordinator()
+
+    # First poll to establish coordinator.data
+    data1 = await coord._async_update_data()
+    coord.data = data1
+    coord.last_update_success = True
+
+    # Simulate a targeted refresh that wrote a fresher state after the poll began
+    fresh_state = dict(data1["states"]["1"])
+    fresh_state["fan_speed"] = 99  # sentinel value the poll can never produce
+    coord.data["states"]["1"] = fresh_state
+    coord._refresh_device_update_ts["1"] = float("inf")  # always newer than any poll
+
+    # Second poll — API still returns original stale data
+    data2 = await coord._async_update_data()
+
+    # The targeted-refresh state must be preserved, not overwritten by stale poll
+    assert data2["states"]["1"]["fan_speed"] == 99
+
+
+@pytest.mark.asyncio
+async def test_fetch_devices_primary_unexpected_exception_propagates():
+    """A non-network exception from the primary get_devices call must propagate.
+
+    The over-broad `except Exception` swallows programming errors (e.g., a
+    NameError inside the API code) and makes them hard to diagnose.
+    After the fix, only network exceptions (TimeoutError, aiohttp.ClientError)
+    are caught; everything else propagates to the coordinator's error handler.
+    """
+    coord, api = _make_coordinator()
+
+    class _UnexpectedBug(RuntimeError):
+        pass
+
+    api.get_devices = AsyncMock(side_effect=_UnexpectedBug("programming bug"))
+
+    with pytest.raises(_UnexpectedBug):
+        await coord._fetch_devices_safely()
