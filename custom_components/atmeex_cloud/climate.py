@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 import logging
 from typing import Any, Callable, Awaitable
-from .helpers import deci_to_c, quantize_humidity, humidity_to_stage, HUM_ALLOWED
+from .helpers import c_to_deci, deci_to_c, quantize_humidity, humidity_to_stage, HUM_ALLOWED
 from .entity_base import (
     AtmeexEntityMixin,
     setup_dynamic_device_entities,
@@ -103,7 +103,7 @@ class AtmeexClimateEntity(AtmeexEntityMixin, CoordinatorEntity, ClimateEntity):
     * целевой влажностью (если есть увлажнитель).
     """
 
-    _attr_hvac_modes = [HVACMode.FAN_ONLY, HVACMode.OFF]
+    _attr_hvac_modes = [HVACMode.HEAT, HVACMode.FAN_ONLY, HVACMode.OFF]
     _attr_temperature_unit = UnitOfTemperature.CELSIUS
     _attr_precision = PRECISION_HALVES
     _attr_target_temperature_step = 0.5
@@ -139,6 +139,7 @@ class AtmeexClimateEntity(AtmeexEntityMixin, CoordinatorEntity, ClimateEntity):
         self._saved_fan_mode: str | None = None
         self._is_boost = False
         self._local_preset: str | None = None  # tracks BOOST (client-side only)
+        self._last_heat_temp: float | None = None  # last known valid target °C; lost on restart
 
     # ---------- вспомогательные свойства ----------
 
@@ -172,10 +173,9 @@ class AtmeexClimateEntity(AtmeexEntityMixin, CoordinatorEntity, ClimateEntity):
 
     @property
     def hvac_mode(self) -> HVACMode:
-        """Возвращает текущий режим: FAN_ONLY или OFF.
-        
-        Uses pending command value if a recent command was sent and not yet
-        confirmed by the device, to prevent UI regression.
+        """Return current HVAC mode: HEAT, FAN_ONLY, or OFF.
+
+        Uses pending command values so the UI doesn't flicker after a set command.
         """
         confirmed_pwr = bool(self._device_state.get("pwr_on"))
         effective_pwr = self._state_with_pending(
@@ -183,22 +183,61 @@ class AtmeexClimateEntity(AtmeexEntityMixin, CoordinatorEntity, ClimateEntity):
             confirmed_pwr,
             tolerance=PENDING_COMMAND_TTL,
         )
-        if effective_pwr != confirmed_pwr:
-            _LOGGER.debug(
-                "Climate: using pending pwr_on=%s instead of confirmed=%s",
-                effective_pwr,
-                confirmed_pwr,
-            )
-        return HVACMode.FAN_ONLY if bool(effective_pwr) else HVACMode.OFF
+        if not bool(effective_pwr):
+            return HVACMode.OFF
+
+        # Device is on — determine HEAT vs FAN_ONLY
+        confirmed_temp = self._device_state.get("u_temp_room")
+        effective_temp = self._state_with_pending(
+            "u_temp_room",
+            confirmed_temp,
+            tolerance=PENDING_COMMAND_TTL,
+        )
+        temp_valid = isinstance(effective_temp, (int, float)) and effective_temp >= 100
+        damp_pos = self._device_state.get("damp_pos")
+        recirculation = damp_pos == 1
+        if temp_valid and not recirculation:
+            return HVACMode.HEAT
+        return HVACMode.FAN_ONLY
 
     async def async_set_hvac_mode(self, hvac_mode: HVACMode) -> None:
-        power_on = hvac_mode != HVACMode.OFF
-        await self._execute_command(
-            self.api.set_power(self._device_id, power_on),
-            pending_attr="pwr_on",
-            pending_value=power_on,
-            error_message="Failed to set HVAC mode",
-        )
+        if hvac_mode == HVACMode.OFF:
+            await self._execute_command(
+                self.api.set_power(self._device_id, False),
+                pending_attr="pwr_on",
+                pending_value=False,
+                error_message="Failed to turn off",
+            )
+        elif hvac_mode == HVACMode.FAN_ONLY:
+            device_off = not bool(self._device_state.get("pwr_on"))
+            if device_off:
+                await self._execute_command(
+                    self.api.set_power_and_heat(self._device_id, True, None),
+                    pending_attr="pwr_on",
+                    pending_value=True,
+                    error_message="Failed to enter fan-only mode",
+                )
+                if self._runtime is not None:
+                    self._runtime.set_pending(self._device_id, "u_temp_room", -1000)
+            else:
+                await self._execute_command(
+                    self.api.set_heater_off(self._device_id),
+                    pending_attr="u_temp_room",
+                    pending_value=-1000,
+                    error_message="Failed to disable heater",
+                )
+        elif hvac_mode == HVACMode.HEAT:
+            target_c = self._resolve_heat_target()
+            await self._execute_command(
+                self.api.set_power_and_heat(self._device_id, True, target_c),
+                pending_attr="pwr_on",
+                pending_value=True,
+                error_message="Failed to enter heat mode",
+            )
+            if self._runtime is not None:
+                self._runtime.set_pending(
+                    self._device_id, "u_temp_room", c_to_deci(target_c)
+                )
 
     # ---------- температура ----------
 
@@ -211,8 +250,21 @@ class AtmeexClimateEntity(AtmeexEntityMixin, CoordinatorEntity, ClimateEntity):
         v = self._device_state.get("u_temp_room")
         t = deci_to_c(v)
         if t is not None and self._attr_min_temp <= t <= self._attr_max_temp:
+            self._last_heat_temp = t
             return t
         return None
+
+    def _resolve_heat_target(self) -> float:
+        """Return the best target temperature for entering HEAT mode.
+
+        Priority: current u_temp_room → _last_heat_temp → 20.0 default.
+        """
+        v = self._device_state.get("u_temp_room")
+        if isinstance(v, (int, float)) and 100 <= v <= 300:
+            return v / 10.0
+        if self._last_heat_temp is not None:
+            return self._last_heat_temp
+        return 20.0
 
     async def async_set_temperature(self, **kwargs) -> None:
         t = kwargs.get(ATTR_TEMPERATURE)

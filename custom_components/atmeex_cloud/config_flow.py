@@ -21,18 +21,40 @@ from .const import (
     DEFAULT_ENABLE_CO2,
     MIN_UPDATE_INTERVAL,
     MAX_UPDATE_INTERVAL,
+    CONF_AUTH_METHOD,
+    CONF_PHONE,
+    CONF_PHONE_CODE,
+    AUTH_METHOD_EMAIL,
+    AUTH_METHOD_PHONE,
 )
 
 _LOGGER = logging.getLogger(__name__)
 
-# Схема формы первого шага конфиг-флоу:
-# пользователь вводит email и пароль от облака Atmeex.
-DATA_SCHEMA = vol.Schema(
+# Email auth schema (step "email" + reauth_confirm for email accounts).
+DATA_SCHEMA_EMAIL = vol.Schema(
     {
         vol.Required(CONF_EMAIL): str,
         vol.Required(CONF_PASSWORD): str,
     }
 )
+
+# Phone number entry — step "phone".
+DATA_SCHEMA_PHONE = vol.Schema(
+    {
+        vol.Required(CONF_PHONE): str,
+    }
+)
+
+# SMS code entry — step "phone_code".
+DATA_SCHEMA_PHONE_CODE = vol.Schema(
+    {
+        vol.Required(CONF_PHONE_CODE): str,
+    }
+)
+
+# Reauth confirmation for phone accounts has no fields — submitting the
+# empty form authorizes us to re-request an SMS code.
+DATA_SCHEMA_REAUTH_PHONE_CONFIRM = vol.Schema({})
 
 
 def _clean_email(email: str) -> str:
@@ -45,6 +67,21 @@ def _email_unique_id(email: str) -> str:
     return _clean_email(email).casefold()
 
 
+def _clean_phone(phone: str) -> str:
+    """Strip everything except leading + and digits.
+
+    The cloud accepts whatever it gets; we just normalize so cosmetic
+    differences (spaces, dashes, parentheses) don't create duplicate entries.
+    """
+    cleaned = "".join(c for c in phone.strip() if c == "+" or c.isdigit())
+    return cleaned
+
+
+def _phone_unique_id(phone: str) -> str:
+    """Stable unique_id for phone accounts."""
+    return _clean_phone(phone)
+
+
 class AtmeexConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     """Config flow для интеграции Atmeex Cloud."""
 
@@ -53,6 +90,8 @@ class AtmeexConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     def __init__(self) -> None:
         """Initialize the config flow."""
         self._reauth_entry: ConfigEntry | None = None
+        # Carries the phone number across phone → phone_code steps.
+        self._pending_phone: str | None = None
 
     @staticmethod
     def async_get_options_flow(
@@ -61,14 +100,21 @@ class AtmeexConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         """Return the options flow handler."""
         return AtmeexOptionsFlowHandler()
 
-    async def async_step_user(self, user_input: dict[str, Any] | None = None) -> FlowResult:
-        """Первый (и единственный) шаг мастера настройки.
+    # ---------- step routing ----------
 
-        На этом шаге:
-        * запрашиваем логин/пароль;
-        * проверяем, что авторизация удачна и API отвечает;
-        * создаём ConfigEntry с указанным email в качестве title.
-        """
+    async def async_step_user(self, user_input: dict[str, Any] | None = None) -> FlowResult:
+        """Entry point: pick auth method (email vs phone)."""
+        return self.async_show_menu(
+            step_id="user",
+            menu_options=[AUTH_METHOD_EMAIL, AUTH_METHOD_PHONE],
+        )
+
+    # ---------- email path ----------
+
+    async def async_step_email(
+        self, user_input: dict[str, Any] | None = None
+    ) -> FlowResult:
+        """Email/password sign-in for initial setup."""
         errors: dict[str, str] = {}
 
         if user_input is not None:
@@ -81,43 +127,151 @@ class AtmeexConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 await api.async_init()
 
             try:
-                # 1. Проверяем логин/пароль и получаем токен.
                 await api.login(email, password)
-
-                # 2. Делаем небольшой sanity-check: хотя бы один успешный вызов API.
                 await api.get_devices()
 
-                # 3. Делаем email уникальным идентификатором конфигурации,
-                #    чтобы не создавать дубликаты интеграции для одного и того же аккаунта.
                 await self.async_set_unique_id(_email_unique_id(email))
                 self._abort_if_unique_id_configured()
 
-                # 4. Создаём конфигурационную запись.
                 return self.async_create_entry(
                     title=email,
                     data={
+                        CONF_AUTH_METHOD: AUTH_METHOD_EMAIL,
                         CONF_EMAIL: email,
                         CONF_PASSWORD: password,
                     },
                 )
 
             except ApiError as err:
-                # Ошибка авторизации / сети → показываем стандартную ошибку cannot_connect.
                 status = getattr(err, "status", None)
                 errors["base"] = "invalid_auth" if status in (401, 403) else "cannot_connect"
-            except Exception as err:  # noqa: BLE001 — хотим залогировать вообще всё
+            except Exception as err:  # noqa: BLE001
                 _LOGGER.exception(
-                    "Unexpected error during Atmeex config flow: %s",
-                    err,
+                    "Unexpected error during Atmeex email config flow: %s", err
                 )
                 errors["base"] = "unknown"
 
-        # Если это первый заход или произошла ошибка — показываем форму снова.
         return self.async_show_form(
-            step_id="user",
-            data_schema=DATA_SCHEMA,
+            step_id="email",
+            data_schema=DATA_SCHEMA_EMAIL,
             errors=errors,
         )
+
+    # ---------- phone path ----------
+
+    async def async_step_phone(
+        self, user_input: dict[str, Any] | None = None
+    ) -> FlowResult:
+        """Step 1 of phone flow: collect phone, request SMS code."""
+        errors: dict[str, str] = {}
+
+        if user_input is not None:
+            phone = _clean_phone(user_input[CONF_PHONE])
+            session = async_get_clientsession(self.hass)
+            api = AtmeexApi(session)
+
+            if hasattr(api, "async_init"):
+                await api.async_init()
+
+            try:
+                await api.request_sms_code(phone)
+            except ApiError as err:
+                status = getattr(err, "status", None)
+                errors["base"] = (
+                    "invalid_auth" if status in (401, 403) else "cannot_connect"
+                )
+            except Exception as err:  # noqa: BLE001
+                _LOGGER.exception(
+                    "Unexpected error requesting SMS code: %s", err
+                )
+                errors["base"] = "unknown"
+            else:
+                self._pending_phone = phone
+                return await self.async_step_phone_code()
+
+        suggested_phone = self._pending_phone or (
+            _clean_phone(user_input[CONF_PHONE]) if user_input else ""
+        )
+        schema = vol.Schema(
+            {vol.Required(CONF_PHONE, default=suggested_phone): str}
+        )
+        return self.async_show_form(
+            step_id="phone",
+            data_schema=schema,
+            errors=errors,
+        )
+
+    async def async_step_phone_code(
+        self, user_input: dict[str, Any] | None = None
+    ) -> FlowResult:
+        """Step 2 of phone flow: verify SMS code, create or update entry."""
+        errors: dict[str, str] = {}
+
+        if not self._pending_phone:
+            # Defensive: should never happen — phone step always sets this
+            # before advancing here.
+            return self.async_abort(reason="phone_state_lost")
+
+        if user_input is not None:
+            code = str(user_input[CONF_PHONE_CODE]).strip()
+            session = async_get_clientsession(self.hass)
+            api = AtmeexApi(session)
+
+            if hasattr(api, "async_init"):
+                await api.async_init()
+
+            try:
+                await api.login_phone(self._pending_phone, code)
+                await api.get_devices()
+
+                entry_data: dict[str, Any] = {
+                    CONF_AUTH_METHOD: AUTH_METHOD_PHONE,
+                    CONF_PHONE: self._pending_phone,
+                }
+                # Only the refresh_token survives between sessions for phone
+                # accounts — there are no replayable creds to fall back on.
+                if api.refresh_token:
+                    entry_data["refresh_token"] = api.refresh_token
+
+                if self._reauth_entry:
+                    await self.async_set_unique_id(
+                        _phone_unique_id(self._pending_phone)
+                    )
+                    self._abort_if_unique_id_mismatch()
+                    return self.async_update_reload_and_abort(
+                        self._reauth_entry,
+                        data_updates=entry_data,
+                        reason="reauth_successful",
+                    )
+
+                await self.async_set_unique_id(
+                    _phone_unique_id(self._pending_phone)
+                )
+                self._abort_if_unique_id_configured()
+                return self.async_create_entry(
+                    title=self._pending_phone,
+                    data=entry_data,
+                )
+
+            except ApiError as err:
+                status = getattr(err, "status", None)
+                errors["base"] = (
+                    "invalid_auth" if status in (401, 403) else "cannot_connect"
+                )
+            except Exception as err:  # noqa: BLE001
+                _LOGGER.exception(
+                    "Unexpected error verifying SMS code: %s", err
+                )
+                errors["base"] = "unknown"
+
+        return self.async_show_form(
+            step_id="phone_code",
+            data_schema=DATA_SCHEMA_PHONE_CODE,
+            errors=errors,
+            description_placeholders={"phone": self._pending_phone},
+        )
+
+    # ---------- reauth ----------
 
     async def async_step_reauth(
         self, entry_data: dict[str, Any]
@@ -131,7 +285,20 @@ class AtmeexConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     async def async_step_reauth_confirm(
         self, user_input: dict[str, Any] | None = None
     ) -> FlowResult:
-        """Confirm re-authentication with new credentials."""
+        """Branch reauth based on the entry's stored auth method."""
+        if self._reauth_entry is not None:
+            auth_method = self._reauth_entry.data.get(
+                CONF_AUTH_METHOD, AUTH_METHOD_EMAIL
+            )
+            if auth_method == AUTH_METHOD_PHONE:
+                return await self.async_step_reauth_phone_confirm(user_input)
+
+        return await self._async_step_reauth_email(user_input)
+
+    async def _async_step_reauth_email(
+        self, user_input: dict[str, Any] | None = None
+    ) -> FlowResult:
+        """Reauth for email accounts — same form as initial email setup."""
         errors: dict[str, str] = {}
 
         if user_input is not None:
@@ -154,6 +321,7 @@ class AtmeexConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                     return self.async_update_reload_and_abort(
                         self._reauth_entry,
                         data_updates={
+                            CONF_AUTH_METHOD: AUTH_METHOD_EMAIL,
                             CONF_EMAIL: email,
                             CONF_PASSWORD: password,
                         },
@@ -167,12 +335,10 @@ class AtmeexConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 errors["base"] = "invalid_auth" if status in (401, 403) else "cannot_connect"
             except Exception as err:  # noqa: BLE001
                 _LOGGER.exception(
-                    "Unexpected error during Atmeex reauth flow: %s",
-                    err,
+                    "Unexpected error during Atmeex reauth flow: %s", err
                 )
                 errors["base"] = "unknown"
 
-        # Pre-fill email from existing entry if available
         suggested_email = ""
         if self._reauth_entry:
             suggested_email = self._reauth_entry.data.get(CONF_EMAIL, "")
@@ -188,6 +354,51 @@ class AtmeexConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             step_id="reauth_confirm",
             data_schema=reauth_schema,
             errors=errors,
+        )
+
+    async def async_step_reauth_phone_confirm(
+        self, user_input: dict[str, Any] | None = None
+    ) -> FlowResult:
+        """Phone reauth: explicit confirm before re-sending SMS.
+
+        Avoids surprise SMS messages when reauth fires unexpectedly during a
+        transient outage.
+        """
+        errors: dict[str, str] = {}
+        phone = (
+            self._reauth_entry.data.get(CONF_PHONE, "")
+            if self._reauth_entry
+            else ""
+        )
+
+        if user_input is not None:
+            session = async_get_clientsession(self.hass)
+            api = AtmeexApi(session)
+
+            if hasattr(api, "async_init"):
+                await api.async_init()
+
+            try:
+                await api.request_sms_code(phone)
+            except ApiError as err:
+                status = getattr(err, "status", None)
+                errors["base"] = (
+                    "invalid_auth" if status in (401, 403) else "cannot_connect"
+                )
+            except Exception as err:  # noqa: BLE001
+                _LOGGER.exception(
+                    "Unexpected error sending reauth SMS: %s", err
+                )
+                errors["base"] = "unknown"
+            else:
+                self._pending_phone = phone
+                return await self.async_step_phone_code()
+
+        return self.async_show_form(
+            step_id="reauth_phone_confirm",
+            data_schema=DATA_SCHEMA_REAUTH_PHONE_CONFIRM,
+            errors=errors,
+            description_placeholders={"phone": phone},
         )
 
 

@@ -14,6 +14,11 @@ from custom_components.atmeex_cloud.const import (
     DEFAULT_UPDATE_INTERVAL,
     MAX_UPDATE_INTERVAL,
     MIN_UPDATE_INTERVAL,
+    CONF_AUTH_METHOD,
+    CONF_PHONE,
+    CONF_PHONE_CODE,
+    AUTH_METHOD_EMAIL,
+    AUTH_METHOD_PHONE,
 )
 
 
@@ -39,9 +44,31 @@ def _make_reauth_flow(entry_data: dict | None = None) -> AtmeexConfigFlow:
     return flow
 
 
+def _make_phone_reauth_flow(phone: str = "+79991234567") -> AtmeexConfigFlow:
+    """Reauth flow targeting a phone-account config entry."""
+    return _make_reauth_flow(
+        entry_data={
+            CONF_AUTH_METHOD: AUTH_METHOD_PHONE,
+            CONF_PHONE: phone,
+        }
+    )
+
+
 @pytest.mark.asyncio
-async def test_config_flow_success():
-    """Успешный проход конфиг-флоу с созданием config entry."""
+async def test_user_step_shows_email_phone_menu():
+    """async_step_user routes to a menu picking email vs phone."""
+    flow = _make_flow()
+    result = await flow.async_step_user(user_input=None)
+
+    assert result["type"] == data_entry_flow.FlowResultType.MENU
+    assert result["step_id"] == "user"
+    assert AUTH_METHOD_EMAIL in result["menu_options"]
+    assert AUTH_METHOD_PHONE in result["menu_options"]
+
+
+@pytest.mark.asyncio
+async def test_email_step_success_creates_entry_with_auth_method():
+    """Email step creates an entry tagged with CONF_AUTH_METHOD=email."""
     flow = _make_flow()
 
     user_input = {CONF_EMAIL: "user@example.com", CONF_PASSWORD: "pwd"}
@@ -55,9 +82,7 @@ async def test_config_flow_success():
     ) as mock_set_uid, patch.object(
         flow, "_abort_if_unique_id_configured"
     ) as mock_abort:
-        # Сессия нам не важна, просто возвращаем объект-заглушку
         get_session.return_value = object()
-        # Не прерывать флоу из-за уже существующей интеграции
         mock_abort.return_value = None
 
         api = api_cls.return_value
@@ -65,19 +90,23 @@ async def test_config_flow_success():
         api.login = AsyncMock()
         api.get_devices = AsyncMock(return_value=[])
 
-        result = await flow.async_step_user(user_input=user_input)
+        result = await flow.async_step_email(user_input=user_input)
 
     assert result["type"] == data_entry_flow.FlowResultType.CREATE_ENTRY
     assert result["title"] == user_input[CONF_EMAIL]
-    assert result["data"] == user_input
+    assert result["data"] == {
+        CONF_AUTH_METHOD: AUTH_METHOD_EMAIL,
+        CONF_EMAIL: user_input[CONF_EMAIL],
+        CONF_PASSWORD: user_input[CONF_PASSWORD],
+    }
 
     mock_set_uid.assert_awaited_once_with(user_input[CONF_EMAIL])
     mock_abort.assert_called_once()
 
 
 @pytest.mark.asyncio
-async def test_config_flow_cannot_connect():
-    """ApiError → cannot_connect и форма с ошибкой."""
+async def test_email_step_cannot_connect():
+    """Network ApiError → cannot_connect on the email form."""
     flow = _make_flow()
 
     user_input = {CONF_EMAIL: "user@example.com", CONF_PASSWORD: "pwd"}
@@ -93,14 +122,15 @@ async def test_config_flow_cannot_connect():
         api.async_init = AsyncMock()
         api.login.side_effect = ApiError("fail")
 
-        result = await flow.async_step_user(user_input=user_input)
+        result = await flow.async_step_email(user_input=user_input)
 
     assert result["type"] == data_entry_flow.FlowResultType.FORM
+    assert result["step_id"] == "email"
     assert result["errors"]["base"] == "cannot_connect"
 
 
 @pytest.mark.asyncio
-async def test_config_flow_invalid_auth():
+async def test_email_step_invalid_auth():
     flow = _make_flow()
     user_input = {CONF_EMAIL: "user@example.com", CONF_PASSWORD: "pwd"}
 
@@ -114,15 +144,14 @@ async def test_config_flow_invalid_auth():
         api.async_init = AsyncMock()
         api.login.side_effect = ApiError("invalid", status=401)
 
-        result = await flow.async_step_user(user_input=user_input)
+        result = await flow.async_step_email(user_input=user_input)
 
     assert result["type"] == data_entry_flow.FlowResultType.FORM
     assert result["errors"]["base"] == "invalid_auth"
 
 
 @pytest.mark.asyncio
-async def test_config_flow_unknown_error():
-    """Любая неожиданная ошибка → base=unknown и форма."""
+async def test_email_step_unknown_error():
     flow = _make_flow()
 
     user_input = {CONF_EMAIL: "user@example.com", CONF_PASSWORD: "pwd"}
@@ -138,19 +167,137 @@ async def test_config_flow_unknown_error():
         api.async_init = AsyncMock()
         api.login.side_effect = RuntimeError("boom")
 
-        result = await flow.async_step_user(user_input=user_input)
+        result = await flow.async_step_email(user_input=user_input)
 
     assert result["type"] == data_entry_flow.FlowResultType.FORM
     assert result["errors"]["base"] == "unknown"
 
 
 @pytest.mark.asyncio
-async def test_config_flow_show_form_without_input():
+async def test_phone_step_sends_sms_then_advances_to_phone_code():
+    """Submitting a phone number requests an SMS and advances to phone_code."""
     flow = _make_flow()
-    result = await flow.async_step_user(user_input=None)
+
+    with patch(
+        "custom_components.atmeex_cloud.config_flow.async_get_clientsession"
+    ) as get_session, patch(
+        "custom_components.atmeex_cloud.config_flow.AtmeexApi"
+    ) as api_cls:
+        get_session.return_value = object()
+        api = api_cls.return_value
+        api.async_init = AsyncMock()
+        api.request_sms_code = AsyncMock()
+
+        result = await flow.async_step_phone(
+            user_input={CONF_PHONE: " +7 (999) 123-45-67 "}
+        )
+
+    # Phone is normalized for storage and SMS request
+    api.request_sms_code.assert_awaited_once_with("+79991234567")
+    # Flow advances to the phone_code form
+    assert result["type"] == data_entry_flow.FlowResultType.FORM
+    assert result["step_id"] == "phone_code"
+    assert flow._pending_phone == "+79991234567"
+
+
+@pytest.mark.asyncio
+async def test_phone_step_sms_request_failure_shows_error_on_phone_form():
+    flow = _make_flow()
+
+    with patch(
+        "custom_components.atmeex_cloud.config_flow.async_get_clientsession"
+    ) as get_session, patch(
+        "custom_components.atmeex_cloud.config_flow.AtmeexApi"
+    ) as api_cls:
+        get_session.return_value = object()
+        api = api_cls.return_value
+        api.async_init = AsyncMock()
+        api.request_sms_code = AsyncMock(side_effect=ApiError("rate limited", status=429))
+
+        result = await flow.async_step_phone(user_input={CONF_PHONE: "+79991234567"})
 
     assert result["type"] == data_entry_flow.FlowResultType.FORM
-    assert result["step_id"] == "user"
+    assert result["step_id"] == "phone"
+    assert result["errors"]["base"] == "cannot_connect"
+    # Don't advance until SMS succeeds
+    assert flow._pending_phone is None
+
+
+@pytest.mark.asyncio
+async def test_phone_code_step_success_creates_entry_with_phone_auth():
+    """Submitting a valid SMS code creates a CONF_AUTH_METHOD=phone entry."""
+    flow = _make_flow()
+    flow._pending_phone = "+79991234567"
+
+    with patch(
+        "custom_components.atmeex_cloud.config_flow.async_get_clientsession"
+    ) as get_session, patch(
+        "custom_components.atmeex_cloud.config_flow.AtmeexApi"
+    ) as api_cls, patch.object(
+        flow, "async_set_unique_id", AsyncMock()
+    ) as mock_set_uid, patch.object(
+        flow, "_abort_if_unique_id_configured"
+    ) as mock_abort:
+        get_session.return_value = object()
+        mock_abort.return_value = None
+
+        api = api_cls.return_value
+        api.async_init = AsyncMock()
+        api.login_phone = AsyncMock()
+        api.get_devices = AsyncMock(return_value=[])
+        # The flow persists refresh_token if available
+        type(api).refresh_token = property(lambda _self: "rt-from-login")
+
+        result = await flow.async_step_phone_code(
+            user_input={CONF_PHONE_CODE: "1234"}
+        )
+
+    api.login_phone.assert_awaited_once_with("+79991234567", "1234")
+    assert result["type"] == data_entry_flow.FlowResultType.CREATE_ENTRY
+    assert result["title"] == "+79991234567"
+    assert result["data"] == {
+        CONF_AUTH_METHOD: AUTH_METHOD_PHONE,
+        CONF_PHONE: "+79991234567",
+        "refresh_token": "rt-from-login",
+    }
+    mock_set_uid.assert_awaited_once_with("+79991234567")
+    mock_abort.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_phone_code_step_invalid_code():
+    flow = _make_flow()
+    flow._pending_phone = "+79991234567"
+
+    with patch(
+        "custom_components.atmeex_cloud.config_flow.async_get_clientsession"
+    ) as get_session, patch(
+        "custom_components.atmeex_cloud.config_flow.AtmeexApi"
+    ) as api_cls:
+        get_session.return_value = object()
+        api = api_cls.return_value
+        api.async_init = AsyncMock()
+        api.login_phone = AsyncMock(side_effect=ApiError("bad code", status=401))
+
+        result = await flow.async_step_phone_code(
+            user_input={CONF_PHONE_CODE: "wrong"}
+        )
+
+    assert result["type"] == data_entry_flow.FlowResultType.FORM
+    assert result["step_id"] == "phone_code"
+    assert result["errors"]["base"] == "invalid_auth"
+
+
+@pytest.mark.asyncio
+async def test_phone_code_step_aborts_when_state_lost():
+    """Defensive: directly hitting phone_code without _pending_phone aborts."""
+    flow = _make_flow()
+    assert flow._pending_phone is None
+
+    result = await flow.async_step_phone_code(user_input=None)
+
+    assert result["type"] == data_entry_flow.FlowResultType.ABORT
+    assert result["reason"] == "phone_state_lost"
 
 
 @pytest.mark.asyncio
@@ -298,6 +445,107 @@ async def test_reauth_confirm_unknown_error():
 
     assert result["type"] == data_entry_flow.FlowResultType.FORM
     assert result["errors"]["base"] == "unknown"
+
+
+@pytest.mark.asyncio
+async def test_phone_reauth_routes_to_phone_confirm_step():
+    """Reauth on a phone-account entry shows the phone confirm form, not email."""
+    flow = _make_phone_reauth_flow()
+    result = await flow.async_step_reauth(entry_data={})
+
+    assert result["type"] == data_entry_flow.FlowResultType.FORM
+    assert result["step_id"] == "reauth_phone_confirm"
+
+
+@pytest.mark.asyncio
+async def test_phone_reauth_does_not_send_sms_until_user_confirms():
+    """The phone reauth confirm step must NOT request an SMS just by being shown."""
+    flow = _make_phone_reauth_flow()
+
+    with patch(
+        "custom_components.atmeex_cloud.config_flow.async_get_clientsession"
+    ) as get_session, patch(
+        "custom_components.atmeex_cloud.config_flow.AtmeexApi"
+    ) as api_cls:
+        get_session.return_value = object()
+        api = api_cls.return_value
+        api.async_init = AsyncMock()
+        api.request_sms_code = AsyncMock()
+
+        # Just showing the form (no user_input) must not hit the network.
+        await flow.async_step_reauth(entry_data={})
+
+    api.request_sms_code.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_phone_reauth_sends_sms_when_user_submits_confirmation():
+    """After the user submits the confirm form, SMS is requested and we advance."""
+    flow = _make_phone_reauth_flow()
+    await flow.async_step_reauth(entry_data={})
+
+    with patch(
+        "custom_components.atmeex_cloud.config_flow.async_get_clientsession"
+    ) as get_session, patch(
+        "custom_components.atmeex_cloud.config_flow.AtmeexApi"
+    ) as api_cls:
+        get_session.return_value = object()
+        api = api_cls.return_value
+        api.async_init = AsyncMock()
+        api.request_sms_code = AsyncMock()
+
+        result = await flow.async_step_reauth_phone_confirm(user_input={})
+
+    api.request_sms_code.assert_awaited_once_with("+79991234567")
+    assert result["type"] == data_entry_flow.FlowResultType.FORM
+    assert result["step_id"] == "phone_code"
+    assert flow._pending_phone == "+79991234567"
+
+
+@pytest.mark.asyncio
+async def test_phone_reauth_code_step_updates_entry_with_new_refresh_token():
+    """Successful phone reauth code submission updates the entry."""
+    flow = _make_phone_reauth_flow()
+    await flow.async_step_reauth(entry_data={})
+    flow._pending_phone = "+79991234567"
+
+    with patch(
+        "custom_components.atmeex_cloud.config_flow.async_get_clientsession"
+    ) as get_session, patch(
+        "custom_components.atmeex_cloud.config_flow.AtmeexApi"
+    ) as api_cls, patch.object(
+        flow, "async_set_unique_id", AsyncMock()
+    ) as mock_set_uid, patch.object(
+        flow, "_abort_if_unique_id_mismatch"
+    ) as mock_abort_mismatch, patch.object(
+        flow, "async_update_reload_and_abort"
+    ) as mock_update_reload:
+        get_session.return_value = object()
+        api = api_cls.return_value
+        api.async_init = AsyncMock()
+        api.login_phone = AsyncMock()
+        api.get_devices = AsyncMock(return_value=[])
+        type(api).refresh_token = property(lambda _self: "new-rt")
+
+        mock_update_reload.return_value = {
+            "type": data_entry_flow.FlowResultType.ABORT,
+            "reason": "reauth_successful",
+        }
+
+        result = await flow.async_step_phone_code(
+            user_input={CONF_PHONE_CODE: "5678"}
+        )
+
+    assert result["type"] == data_entry_flow.FlowResultType.ABORT
+    assert result["reason"] == "reauth_successful"
+    mock_set_uid.assert_awaited_once_with("+79991234567")
+    mock_abort_mismatch.assert_called_once()
+    update_call = mock_update_reload.call_args
+    assert update_call.kwargs["data_updates"] == {
+        CONF_AUTH_METHOD: AUTH_METHOD_PHONE,
+        CONF_PHONE: "+79991234567",
+        "refresh_token": "new-rt",
+    }
 
 
 @pytest.mark.asyncio

@@ -3,10 +3,32 @@
     "step": {
       "user": {
         "title": "Atmeex Cloud",
-        "description": "Введите данные вашей учётной записи Atmeex Cloud для подключения устройств.",
+        "description": "Выберите способ входа в учётную запись Atmeex Cloud.",
+        "menu_options": {
+          "email": "Войти по email и паролю",
+          "phone": "Войти по телефону и SMS-коду"
+        }
+      },
+      "email": {
+        "title": "Atmeex Cloud — Email",
+        "description": "Введите email и пароль от Atmeex Cloud.",
         "data": {
           "email": "Email",
           "password": "Пароль"
+        }
+      },
+      "phone": {
+        "title": "Atmeex Cloud — Телефон",
+        "description": "Введите номер телефона, привязанный к учётной записи Atmeex. Мы отправим SMS-код для подтверждения.",
+        "data": {
+          "phone": "Номер телефона"
+        }
+      },
+      "phone_code": {
+        "title": "Atmeex Cloud — SMS-код",
+        "description": "Введите SMS-код, отправленный на {phone}.",
+        "data": {
+          "phone_code": "SMS-код"
         }
       },
       "reauth_confirm": {
@@ -16,16 +38,22 @@
           "email": "Email",
           "password": "Пароль"
         }
+      },
+      "reauth_phone_confirm": {
+        "title": "Повторная авторизация Atmeex Cloud",
+        "description": "Сессия для {phone} истекла. Нажмите, чтобы получить новый SMS-код.",
+        "data": {}
       }
     },
     "error": {
       "cannot_connect": "Не удалось подключиться к Atmeex Cloud. Проверьте интернет-соединение.",
-      "invalid_auth": "Неверный email или пароль.",
+      "invalid_auth": "Неверные учётные данные или SMS-код.",
       "unknown": "Произошла непредвиденная ошибка."
     },
     "abort": {
       "already_configured": "Эта учётная запись уже настроена.",
-      "reauth_successful": "Повторная авторизация успешна."
+      "reauth_successful": "Повторная авторизация успешна.",
+      "phone_state_lost": "Состояние верификации телефона потеряно. Начните заново."
     }
   },
   "options": {
@@ -109,12 +137,23 @@
         }
       }
     },
+    "switch": {
+      "auto_nanny": {
+        "name": "AutoNanny"
+      },
+      "sleep_mode": {
+        "name": "Ночной режим"
+      },
+      "power": {
+        "name": "Питание"
+      }
+    },
     "binary_sensor": {
       "online": {
         "name": "В сети"
       },
       "no_water": {
-        "name": "Нет воды"
+        "name": "Вода"
       }
     },
     "sensor": {

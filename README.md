@@ -8,7 +8,7 @@
 
 Atmeex Cloud — это пользовательская интеграция для [Home Assistant](https://www.home-assistant.io/), которая подключает ваши приточные комплексы **Atmeex (AirNanny)** к экосистеме Home Assistant. Интеграция использует официальный REST API Atmeex Cloud для надёжного управления и мониторинга бризеров прямо из панелей управления и автоматизаций Home Assistant.
 
-> 🧩 Изначально основана на открытой интеграции [@anpavlov](https://github.com/anpavlov), значительно переработана [Sergei Polunovskii](https://github.com/pols1), и полностью рефакторена под современные стандарты HA [Романом Ходукиным](https://github.com/rdscoo1) с защитой от race condition, комплексной диагностикой и 73+ автоматическими тестами.
+> 🧩 Изначально основана на открытой интеграции [@anpavlov](https://github.com/anpavlov), значительно переработана [Sergei Polunovskii](https://github.com/pols1), и полностью рефакторена под современные стандарты HA [@rdscoo1](https://github.com/rdscoo1) с защитой от race condition, комплексной диагностикой и 73+ автоматическими тестами.
 
 ## Возможности
 

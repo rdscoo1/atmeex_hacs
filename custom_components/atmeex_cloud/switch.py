@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from homeassistant.components.switch import SwitchEntity
+from homeassistant.components.switch import SwitchDeviceClass, SwitchEntity
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
@@ -35,7 +35,14 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_e
                 device=dev,
                 refresh_device_cb=runtime.refresh_device,
                 runtime=runtime,
-            )
+            ),
+            AtmeexPowerSwitch(
+                coordinator=coordinator,
+                api=runtime.api,
+                device=dev,
+                refresh_device_cb=runtime.refresh_device,
+                runtime=runtime,
+            ),
         ]
 
     setup_dynamic_device_entities(
@@ -126,4 +133,41 @@ class AtmeexSleepModeSwitch(_BaseSwitch):
             pending_attr="u_night",
             pending_value=False,
             error_message="Failed to disable Sleep Mode",
+        )
+
+
+class AtmeexPowerSwitch(_BaseSwitch):
+    _attr_translation_key = "power"
+    _attr_device_class = SwitchDeviceClass.SWITCH
+
+    def __init__(
+        self,
+        coordinator,
+        api,
+        device: AtmeexDevice,
+        refresh_device_cb=None,
+        runtime=None,
+    ) -> None:
+        super().__init__(coordinator, api, device, refresh_device_cb, runtime)
+        self._attr_unique_id = f"{device.id}_power"
+
+    @property
+    def is_on(self) -> bool | None:
+        confirmed = self._device_state.get("pwr_on", False)
+        return bool(self._state_with_pending("pwr_on", confirmed, tolerance=_PENDING_TTL))
+
+    async def async_turn_on(self, **kwargs: Any) -> None:
+        await self._execute_command(
+            self.api.set_power(self._device_id, True),
+            pending_attr="pwr_on",
+            pending_value=True,
+            error_message="Failed to turn on",
+        )
+
+    async def async_turn_off(self, **kwargs: Any) -> None:
+        await self._execute_command(
+            self.api.set_power(self._device_id, False),
+            pending_attr="pwr_on",
+            pending_value=False,
+            error_message="Failed to turn off",
         )

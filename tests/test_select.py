@@ -1,6 +1,6 @@
 import pytest
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 from homeassistant.exceptions import HomeAssistantError
 
 from custom_components.atmeex_cloud import AtmeexRuntimeData
@@ -118,7 +118,7 @@ async def test_breezer_select_raises_homeassistant_error_on_api_failure():
     hum, breezer, cond, api, coord = _make_selects()
     api.set_breezer_mode.side_effect = ApiError("boom", status=500)
 
-    with pytest.raises(HomeAssistantError, match="Failed to set breezer mode"):
+    with pytest.raises(HomeAssistantError, match="Failed to set work mode"):
         await breezer.async_select_option(BREEZER_OPTIONS[1])
 
 
@@ -163,3 +163,75 @@ async def test_async_setup_entry_skips_hum_entities_until_capability_detected():
         AtmeexBreezerSelect,
         AtmeexHumidificationSelect,
     }
+
+
+# ---------------------------------------------------------------------------
+# current_option truth table (new pwr_on-aware logic)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize(
+    "pwr_on, damp_pos, expected_option",
+    [
+        (True, 0, BREEZER_OPTIONS[0]),   # forced_ventilation
+        (True, 1, BREEZER_OPTIONS[1]),   # recirculation
+        (True, 2, BREEZER_OPTIONS[2]),   # mixed_mode
+        (False, 0, BREEZER_OPTIONS[3]),  # supply_valve
+        (False, 1, BREEZER_OPTIONS[1]),  # recirculation (shows damper's actual position)
+    ],
+)
+def test_breezer_current_option_truth_table(pwr_on, damp_pos, expected_option):
+    _, breezer, cond, _, _ = _make_selects({"pwr_on": pwr_on, "damp_pos": damp_pos})
+    assert breezer.current_option == expected_option
+
+
+# ---------------------------------------------------------------------------
+# async_select_option — pending tracking
+# ---------------------------------------------------------------------------
+
+def _make_breezer_with_runtime(state_overrides: dict | None = None):
+    state = {"online": True, "pwr_on": True, "damp_pos": 0}
+    if state_overrides:
+        state.update(state_overrides)
+
+    dev = AtmeexDevice.from_raw({"id": 1, "name": "Dev1", "model": "m", "online": True})
+    coordinator = SimpleNamespace(
+        data={"device_map": {"1": dev}, "states": {"1": state}},
+        last_update_success=True,
+        async_request_refresh=AsyncMock(),
+        async_add_listener=lambda cb: (lambda: None),
+    )
+    api = MagicMock()
+    api.set_breezer_mode = AsyncMock()
+    refresh_cb = AsyncMock()
+    runtime = AtmeexRuntimeData(api=api, coordinator=coordinator, refresh_device=refresh_cb)
+    from custom_components.atmeex_cloud.select import AtmeexBreezerSelect as BreezerCls
+    breezer = BreezerCls(
+        coordinator=coordinator,
+        api=api,
+        device=dev,
+        refresh_device_cb=refresh_cb,
+        runtime=runtime,
+    )
+    return breezer, api, refresh_cb, runtime
+
+
+@pytest.mark.asyncio
+async def test_breezer_select_supply_valve_sets_pending():
+    breezer, api, refresh_cb, runtime = _make_breezer_with_runtime()
+    await breezer.async_select_option(BREEZER_OPTIONS[3])  # supply_valve
+
+    api.set_breezer_mode.assert_awaited_once_with(1, 3)
+    pending_pwr = runtime.get_pending(1, "pwr_on")
+    pending_damp = runtime.get_pending(1, "damp_pos")
+    assert pending_pwr is None or pending_pwr.value is False
+    assert pending_damp is None or pending_damp.value == 0
+
+
+@pytest.mark.asyncio
+async def test_breezer_select_recirculation_sets_pending():
+    breezer, api, refresh_cb, runtime = _make_breezer_with_runtime()
+    await breezer.async_select_option(BREEZER_OPTIONS[1])  # recirculation
+
+    api.set_breezer_mode.assert_awaited_once_with(1, 1)
+    pending_damp = runtime.get_pending(1, "damp_pos")
+    assert pending_damp is None or pending_damp.value == 1

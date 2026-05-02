@@ -39,6 +39,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_e
                 api=runtime.api,
                 device=dev,
                 refresh_device_cb=runtime.refresh_device,
+                runtime=runtime,
             )
         )
         return entities
@@ -52,13 +53,14 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_e
 
 
 class _BaseSelect(AtmeexEntityMixin, CoordinatorEntity, SelectEntity):
-    def __init__(self, coordinator, api, device: AtmeexDevice, refresh_device_cb=None):
+    def __init__(self, coordinator, api, device: AtmeexDevice, refresh_device_cb=None, runtime=None):
         super().__init__(coordinator)
         self.api = api
         self._device_meta = device
         self._device_id = device.id
         self._attr_has_entity_name = True
         self._refresh_device_cb = refresh_device_cb
+        self._runtime = runtime
 
 
 class AtmeexHumidificationSelect(_BaseSelect):
@@ -106,14 +108,18 @@ class AtmeexBreezerSelect(_BaseSelect):
         api,
         device: AtmeexDevice,
         refresh_device_cb=None,
+        runtime=None,
     ) -> None:
-        super().__init__(coordinator, api, device, refresh_device_cb)
+        super().__init__(coordinator, api, device, refresh_device_cb, runtime)
         self._attr_unique_id = f"{device.id}_breezer_mode"
 
     @property
     def current_option(self) -> str | None:
         pos = self._device_state.get("damp_pos")
-        if isinstance(pos, int) and 0 <= pos < len(BREEZER_OPTIONS):
+        pwr = self._device_state.get("pwr_on")
+        if pos == 0 and not pwr:
+            return BREEZER_OPTIONS[3]  # supply_valve
+        if isinstance(pos, int) and 0 <= pos < 3:
             return BREEZER_OPTIONS[pos]
         return getattr(self, "_attr_current_option", BREEZER_OPTIONS[0])
 
@@ -121,9 +127,15 @@ class AtmeexBreezerSelect(_BaseSelect):
         if option not in BREEZER_OPTIONS:
             return
         pos = BREEZER_OPTIONS.index(option)
-        try:
-            await self.api.set_breezer_mode(self._device_id, pos)
-        except ApiError as err:
-            raise HomeAssistantError(f"Failed to set breezer mode: {err}") from err
+        target_pwr = pos != 3
+        target_damp = 0 if pos == 3 else pos
+
+        if self._runtime is not None:
+            self._runtime.set_pending(self._device_id, "damp_pos", target_damp)
+        await self._execute_command(
+            self.api.set_breezer_mode(self._device_id, pos),
+            pending_attr="pwr_on",
+            pending_value=target_pwr,
+            error_message="Failed to set work mode",
+        )
         self._attr_current_option = option
-        await self._refresh()

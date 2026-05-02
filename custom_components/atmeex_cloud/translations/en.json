@@ -3,10 +3,32 @@
     "step": {
       "user": {
         "title": "Atmeex Cloud",
-        "description": "Enter your Atmeex Cloud account credentials to connect your devices.",
+        "description": "Choose how to sign in to your Atmeex Cloud account.",
+        "menu_options": {
+          "email": "Sign in with email and password",
+          "phone": "Sign in with phone and SMS code"
+        }
+      },
+      "email": {
+        "title": "Atmeex Cloud — Email",
+        "description": "Enter your Atmeex Cloud email and password.",
         "data": {
           "email": "Email",
           "password": "Password"
+        }
+      },
+      "phone": {
+        "title": "Atmeex Cloud — Phone",
+        "description": "Enter the phone number registered with your Atmeex account. We'll send you an SMS code to confirm.",
+        "data": {
+          "phone": "Phone number"
+        }
+      },
+      "phone_code": {
+        "title": "Atmeex Cloud — SMS Code",
+        "description": "Enter the SMS code sent to {phone}.",
+        "data": {
+          "phone_code": "SMS code"
         }
       },
       "reauth_confirm": {
@@ -16,16 +38,22 @@
           "email": "Email",
           "password": "Password"
         }
+      },
+      "reauth_phone_confirm": {
+        "title": "Re-authenticate Atmeex Cloud",
+        "description": "Your session for {phone} has expired. Submit to receive a new SMS code.",
+        "data": {}
       }
     },
     "error": {
       "cannot_connect": "Failed to connect to Atmeex Cloud. Please check your internet connection.",
-      "invalid_auth": "Invalid email or password.",
+      "invalid_auth": "Invalid credentials or SMS code.",
       "unknown": "An unexpected error occurred."
     },
     "abort": {
       "already_configured": "This account is already configured.",
-      "reauth_successful": "Re-authentication successful."
+      "reauth_successful": "Re-authentication successful.",
+      "phone_state_lost": "Phone verification state was lost. Please start again."
     }
   },
   "options": {
@@ -114,7 +142,7 @@
         "name": "Online"
       },
       "no_water": {
-        "name": "No water"
+        "name": "Water"
       }
     },
     "sensor": {
@@ -140,6 +168,9 @@
       },
       "sleep_mode": {
         "name": "Sleep Mode"
+      },
+      "power": {
+        "name": "Power"
       }
     }
   },

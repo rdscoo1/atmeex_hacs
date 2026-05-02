@@ -9,7 +9,7 @@ from dataclasses import dataclass, field
 from aiohttp import ClientSession, ClientError, ClientResponse
 
 from .helpers import _normalize_device_state, c_to_deci, fan_speed_to_api
-from .const import API_BASE_URL, RETRY_MAX_DELAY_SEC, RETRY_MAX_ATTEMPTS, RETRY_BASE_DELAY_SEC
+from .const import API_BASE_URL, RETRY_MAX_DELAY_SEC, RETRY_MAX_ATTEMPTS, RETRY_BASE_DELAY_SEC, USER_AGENT
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -103,8 +103,15 @@ class AtmeexApi:
         self._token: str | None = None
         self._token_type: str = "Bearer"
         self._refresh_token: str | None = None
+        # Two credential kinds are supported:
+        #   email/password — `grant_type=basic` (long-lived: re-login on token expiry)
+        #   phone/phone_code — `grant_type=phone_code` (short-lived: SMS code can't be
+        #     reused, so once tokens expire and refresh fails, we surface ConfigEntryAuthFailed
+        #     and let the user re-request SMS via reauth)
         self._email: str | None = None
         self._password: str | None = None
+        self._phone: str | None = None
+        self._phone_code: str | None = None
         self._retry_count: int = 0  # суммарное число сетевых ретраев
         self._token_expires_at: float | None = None  # unix-time
         self._lock = asyncio.Lock()
@@ -136,6 +143,14 @@ class AtmeexApi:
         # обновляем токен чуть заранее — за 60 секунд до истечения
         return time.time() < self._token_expires_at - 60
 
+    def _has_replayable_credentials(self) -> bool:
+        """True if we can re-acquire a token without user interaction.
+
+        Email/password can be replayed indefinitely; phone_code is single-use,
+        so phone accounts must rely on refresh_token alone.
+        """
+        return bool(self._email and self._password)
+
     async def _ensure_token(self) -> None:
         """Гарантировать, что у нас есть валидный токен.
 
@@ -158,17 +173,23 @@ class AtmeexApi:
                 except ApiError:
                     _LOGGER.debug("Refresh token failed, falling back to basic login")
 
-            if not self._email or not self._password:
+            if not self._has_replayable_credentials():
                 raise ApiError("login: credentials not set")
 
             await self._sign_in()
 
-    def _headers(self) -> dict[str, str]:
-        """Сформировать заголовки запроса с учётом токена авторизации."""
-        headers: dict[str, str] = {
+    @staticmethod
+    def _unauth_headers() -> dict[str, str]:
+        """Headers for endpoints that don't carry a bearer token (auth calls)."""
+        return {
             "Accept": "application/json",
             "Content-Type": "application/json",
+            "User-Agent": USER_AGENT,
         }
+
+    def _headers(self) -> dict[str, str]:
+        """Сформировать заголовки запроса с учётом токена авторизации."""
+        headers = self._unauth_headers()
         if self._token:
             headers["Authorization"] = f"{self._token_type} {self._token}"
         return headers
@@ -252,7 +273,11 @@ class AtmeexApi:
             self._token_expires_at = None
 
     async def _sign_in(self) -> None:
-        """Выполнить логин по уже сохранённым email/паролю и сохранить токен доступа."""
+        """Выполнить логин по уже сохранённым email/паролю и сохранить токен доступа.
+
+        Only email/password is replayable — phone_code is single-use and must
+        be supplied through ``login_phone()`` from the config flow.
+        """
         if not self._email or not self._password:
             raise ApiError("login: credentials not set")
 
@@ -264,10 +289,7 @@ class AtmeexApi:
                     "email": self._email,
                     "password": self._password,
                 },
-                headers={
-                    "Accept": "application/json",
-                    "Content-Type": "application/json",
-                },
+                headers=self._unauth_headers(),
             ) as resp:
                 text = await resp.text()
                 if resp.status >= 400:
@@ -279,6 +301,32 @@ class AtmeexApi:
                 self._apply_token_response(data)
 
         await self._with_retries(_do_login, "login")
+
+    async def _sign_in_phone(self) -> None:
+        """Exchange a phone + SMS code for tokens (single-use)."""
+        if not self._phone or not self._phone_code:
+            raise ApiError("login: phone credentials not set")
+
+        async def _do_login():
+            async with self._session.post(
+                f"{API_BASE_URL}/auth/signin",
+                json={
+                    "grant_type": "phone_code",
+                    "phone": self._phone,
+                    "phone_code": self._phone_code,
+                },
+                headers=self._unauth_headers(),
+            ) as resp:
+                text = await resp.text()
+                if resp.status >= 400:
+                    raise ApiError(
+                        f"Auth failed {resp.status}: {text[:200]}",
+                        status=resp.status,
+                    )
+                data = await self._json(resp)
+                self._apply_token_response(data)
+
+        await self._with_retries(_do_login, "login_phone")
 
     async def _signin_refresh(self) -> None:
         """Authenticate using the refresh token (cheaper than full login)."""
@@ -292,10 +340,7 @@ class AtmeexApi:
                     "grant_type": "refresh_token",
                     "refresh_token": self._refresh_token,
                 },
-                headers={
-                    "Accept": "application/json",
-                    "Content-Type": "application/json",
-                },
+                headers=self._unauth_headers(),
             ) as resp:
                 text = await resp.text()
                 if resp.status >= 400:
@@ -333,7 +378,7 @@ class AtmeexApi:
             async with self._session.request(
                 method, url, json=json, headers=req_headers, timeout=timeout
             ) as resp:
-                if resp.status in (401, 403) and retry_auth and self._email and self._password:
+                if resp.status in (401, 403) and retry_auth and self._has_replayable_credentials():
                     stale_token = self._token
                     async with self._lock:
                         # Another coroutine may have already refreshed the token.
@@ -355,7 +400,50 @@ class AtmeexApi:
         """Выполнить логин по email/паролю и сохранить токен доступа."""
         self._email = email
         self._password = password
+        # Clear any stale phone credentials so _ensure_token doesn't get confused
+        # if a single AtmeexApi instance is repurposed across login methods.
+        self._phone = None
+        self._phone_code = None
         await self._sign_in()
+
+    async def request_sms_code(self, phone: str) -> None:
+        """Ask the server to send an SMS verification code to ``phone``."""
+        async def _do():
+            async with self._session.post(
+                f"{API_BASE_URL}/auth/signup",
+                json={"grant_type": "phone_code", "phone": phone},
+                headers=self._unauth_headers(),
+            ) as resp:
+                text = await resp.text()
+                if resp.status >= 400:
+                    raise ApiError(
+                        f"request_sms_code failed {resp.status}: {text[:200]}",
+                        status=resp.status,
+                    )
+
+        await self._with_retries(_do, "request_sms_code")
+
+    async def login_phone(self, phone: str, phone_code: str) -> None:
+        """Exchange a phone + SMS code for tokens (single-use code)."""
+        self._phone = phone
+        self._phone_code = phone_code
+        # Clear any stale email/password so a previous email login on this
+        # instance can't accidentally resurrect itself as a fallback.
+        self._email = None
+        self._password = None
+        await self._sign_in_phone()
+
+    async def authenticate_phone(self) -> None:
+        """Boot-time auth for phone accounts: refresh the access token only.
+
+        Phone accounts cannot replay a sign-in (SMS codes are single-use), so
+        the refresh_token persisted on the config entry is the only way to
+        re-acquire an access token across restarts. If the refresh fails or
+        no token is stored, the caller must surface a reauth prompt.
+        """
+        if not self._refresh_token:
+            raise ApiError("authenticate_phone: no refresh token", status=401)
+        await self._signin_refresh()
 
     async def get_devices(self, fallback: bool = False) -> list[AtmeexDevice]:
         """Получить список устройств.
@@ -459,10 +547,42 @@ class AtmeexApi:
         body = {"u_fan_speed": api_speed}
         await self._put_params(device_id, body, "set_fan_speed")
 
-    async def set_breezer_mode(self, device_id: int | str, damp_pos: int) -> None:
-        """Установить режим бризера (положение заслонки) 0..3."""
-        body = {"u_damp_pos": int(damp_pos)}
+    async def set_breezer_mode(self, device_id: int | str, mode_index: int) -> None:
+        """Set work mode 0..3.
+
+        Modes 0/1/2 are physical damper positions and force u_pwr_on=True.
+        Mode 3 (supply_valve) is a virtual mode: u_pwr_on=False + u_damp_pos=0.
+        Matches the official mobile app's behavior.
+        """
+        mode = int(mode_index)
+        if mode == 3:
+            body: dict[str, Any] = {"u_pwr_on": False, "u_damp_pos": 0}
+        elif mode in (0, 1, 2):
+            body = {"u_pwr_on": True, "u_damp_pos": mode}
+        else:
+            raise ApiError(f"set_breezer_mode: invalid mode {mode}")
         await self._put_params(device_id, body, "set_breezer_mode")
+
+    async def set_heater_off(self, device_id: int | str) -> None:
+        """Disable the heater by sending the device's off-sentinel target temp."""
+        await self._put_params(device_id, {"u_temp_room": -1000}, "set_heater_off")
+
+    async def set_power_and_heat(
+        self, device_id: int | str, pwr_on: bool, temp_c: float | None
+    ) -> None:
+        """Atomic multi-field PUT for HEAT entry/exit transitions.
+
+        temp_c=None means heater off (sends -1000).
+        """
+        body: dict[str, Any] = {"u_pwr_on": bool(pwr_on)}
+        if temp_c is None:
+            body["u_temp_room"] = -1000
+        else:
+            value = c_to_deci(temp_c)
+            if value is None:
+                raise ApiError(f"set_power_and_heat: invalid temperature {temp_c!r}")
+            body["u_temp_room"] = value
+        await self._put_params(device_id, body, "set_power_and_heat")
 
     async def set_humid_stage(self, device_id: int | str, stage: int) -> None:
         """Установить ступень работы увлажнителя 0..3."""

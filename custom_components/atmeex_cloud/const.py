@@ -10,6 +10,9 @@ BREEZER_MODES = [
 HUMIDIFICATION_OPTIONS = ["off", "1", "2", "3"]
 
 API_BASE_URL = "https://api.iot.atmeex.com"
+# Match the official Atmeex mobile app's User-Agent so the cloud doesn't
+# single us out as a non-native client. atmeexpy uses the same value.
+USER_AGENT = "okhttp/3.14.9"
 API_TIMEOUT_DEFAULT = 20
 RETRY_MAX_ATTEMPTS = 3
 RETRY_BASE_DELAY_SEC = 1.0
@@ -24,6 +27,14 @@ WS_LOGBOOK_MIN_INTERVAL_SEC = 5.0
 CONF_UPDATE_INTERVAL = "update_interval"
 CONF_ENABLE_WEBSOCKET = "enable_websocket"
 CONF_ENABLE_CO2 = "enable_co2"
+
+# Auth method discriminator stored on the config entry.
+# Existing entries without this key are email accounts (only path before phone login landed).
+CONF_AUTH_METHOD = "auth_method"
+CONF_PHONE = "phone"
+CONF_PHONE_CODE = "phone_code"
+AUTH_METHOD_EMAIL = "email"
+AUTH_METHOD_PHONE = "phone"
 DEFAULT_UPDATE_INTERVAL = 30
 DEFAULT_ENABLE_WEBSOCKET = True
 DEFAULT_ENABLE_CO2 = True

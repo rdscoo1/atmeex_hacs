@@ -65,6 +65,8 @@ def _make_entity(overrides: dict[str, Any] | None = None):
         set_breezer_mode=AsyncMock(),
         set_sleep_mode=AsyncMock(),
         set_auto_mode=AsyncMock(),
+        set_heater_off=AsyncMock(),
+        set_power_and_heat=AsyncMock(),
     )
 
     # Минимальный raw для устройства
@@ -116,7 +118,8 @@ def test_climate_basic_properties():
     # поддерживаем TARGET_HUMIDITY при наличии hum_stg
     assert ent.supported_features & ClimateEntityFeature.TARGET_HUMIDITY
 
-    assert ent.hvac_mode == HVACMode.FAN_ONLY
+    # pwr_on=True, u_temp_room=225 (valid), damp_pos=2 → HEAT
+    assert ent.hvac_mode == HVACMode.HEAT
 
     assert ent.current_temperature == pytest.approx(21.5)
     assert ent.target_temperature == pytest.approx(22.5)
@@ -172,20 +175,33 @@ def test_climate_swing_mode_invalid():
 
 
 @pytest.mark.asyncio
-async def test_async_set_hvac_mode_calls_api_and_refresh():
+async def test_async_set_hvac_mode_off_calls_set_power():
     ent, cond, api = _make_entity()
     ent._refresh = AsyncMock()
-
-    await ent.async_set_hvac_mode(HVACMode.FAN_ONLY)
-    api.set_power.assert_awaited_once_with(1, True)
-    ent._refresh.assert_awaited_once()
-
-    ent._refresh.reset_mock()
-    api.set_power.reset_mock()
 
     await ent.async_set_hvac_mode(HVACMode.OFF)
     api.set_power.assert_awaited_once_with(1, False)
     ent._refresh.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_async_set_hvac_mode_fan_only_when_on_calls_heater_off():
+    ent, cond, api = _make_entity({"pwr_on": True})
+    ent._refresh = AsyncMock()
+
+    await ent.async_set_hvac_mode(HVACMode.FAN_ONLY)
+    api.set_heater_off.assert_awaited_once_with(1)
+    api.set_power.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_async_set_hvac_mode_fan_only_when_off_calls_power_and_heat():
+    ent, cond, api = _make_entity({"pwr_on": False})
+    ent._refresh = AsyncMock()
+
+    await ent.async_set_hvac_mode(HVACMode.FAN_ONLY)
+    api.set_power_and_heat.assert_awaited_once_with(1, True, None)
+    api.set_power.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -215,8 +231,9 @@ async def test_set_temperature_on_off_device_tracks_pwr_on_pending():
 
     api.set_power.assert_awaited_once_with(1, True)
     api.set_target_temperature.assert_awaited_once_with(1, 22.0)
-    # pwr_on=True must be pending so hvac_mode returns FAN_ONLY immediately
-    assert ent.hvac_mode == HVACMode.FAN_ONLY
+    # pwr_on=True must be pending so hvac_mode shows device as on (not OFF)
+    # u_temp_room=225 (valid) + damp_pos=2 → HEAT
+    assert ent.hvac_mode == HVACMode.HEAT
 
 
 def test_device_info_reflects_name_updates():
@@ -323,7 +340,8 @@ def test_climate_hvac_mode_uses_pending_value():
     ent, cond, api, runtime = _make_entity_with_runtime({"pwr_on": False})
     runtime.set_pending(1, "pwr_on", True)
 
-    assert ent.hvac_mode == HVACMode.FAN_ONLY
+    # pwr_on=True (pending), u_temp_room=225 (valid), damp_pos=2 → HEAT
+    assert ent.hvac_mode == HVACMode.HEAT
 
 
 def test_climate_hvac_mode_clears_expired_pending():
@@ -346,12 +364,12 @@ def test_climate_hvac_mode_uses_runtime_helper():
         wraps=runtime.clear_pending_if_confirmed
     )
 
-    assert ent.hvac_mode == HVACMode.FAN_ONLY
-    runtime.clear_pending_if_confirmed.assert_called_once_with(
-        1,
-        "pwr_on",
-        True,
-        tolerance=8.0,
+    # pwr_on=True, u_temp_room=225 (valid), damp_pos=2 → HEAT
+    assert ent.hvac_mode == HVACMode.HEAT
+    # hvac_mode checks pending for pwr_on first, then u_temp_room
+    calls = runtime.clear_pending_if_confirmed.call_args_list
+    assert any(
+        c == ((1, "pwr_on", True), {"tolerance": 8.0}) for c in calls
     )
 
 
@@ -370,7 +388,7 @@ async def test_async_set_hvac_mode_raises_and_clears_pending_on_api_error():
     ent, cond, api, runtime = _make_entity_with_runtime()
     api.set_power.side_effect = ApiError("boom", status=500)
 
-    with pytest.raises(HomeAssistantError, match="Failed to set HVAC mode"):
+    with pytest.raises(HomeAssistantError, match="Failed to turn off"):
         await ent.async_set_hvac_mode(HVACMode.OFF)
 
     assert runtime.get_pending(1, "pwr_on") is None
@@ -575,3 +593,86 @@ async def test_service_set_humidifier_stage_raises_on_api_error():
 def test_humidity_to_stage_returns_index(val, expected_stage):
     """humidity_to_stage must return the HUM_ALLOWED index, never raise ValueError."""
     assert humidity_to_stage(val) == expected_stage
+
+
+# ---------------------------------------------------------------------------
+# HEAT mode — hvac_mode truth table and transitions
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize(
+    "pwr_on, u_temp_room, damp_pos, expected_mode",
+    [
+        (False, 225, 2, HVACMode.OFF),
+        (True, 225, 2, HVACMode.HEAT),          # valid temp, not recirculation
+        (True, 225, 1, HVACMode.FAN_ONLY),       # recirculation blocks heater
+        (True, -1000, 2, HVACMode.FAN_ONLY),     # sentinel = heater off
+    ],
+)
+def test_hvac_mode_truth_table(pwr_on, u_temp_room, damp_pos, expected_mode):
+    ent, _, _ = _make_entity({"pwr_on": pwr_on, "u_temp_room": u_temp_room, "damp_pos": damp_pos})
+    assert ent.hvac_mode == expected_mode
+
+
+@pytest.mark.asyncio
+async def test_set_hvac_mode_heat_from_off_uses_default_20():
+    """HEAT from off with no prior heat temp uses 20.0°C default."""
+    ent, cond, api, runtime = _make_entity_with_runtime({"pwr_on": False, "u_temp_room": -1000})
+    await ent.async_set_hvac_mode(HVACMode.HEAT)
+    api.set_power_and_heat.assert_awaited_once_with(1, True, 20.0)
+
+
+@pytest.mark.asyncio
+async def test_set_hvac_mode_heat_from_off_uses_last_heat_temp():
+    """HEAT from off with a prior heat temp remembered uses that temp."""
+    ent, cond, api, runtime = _make_entity_with_runtime({"pwr_on": False, "u_temp_room": -1000})
+    ent._last_heat_temp = 24.0
+    await ent.async_set_hvac_mode(HVACMode.HEAT)
+    api.set_power_and_heat.assert_awaited_once_with(1, True, 24.0)
+
+
+@pytest.mark.asyncio
+async def test_set_hvac_mode_heat_from_off_uses_current_u_temp_room():
+    """HEAT from off with a valid u_temp_room in state uses that temp."""
+    ent, cond, api, runtime = _make_entity_with_runtime({"pwr_on": False, "u_temp_room": 230})
+    await ent.async_set_hvac_mode(HVACMode.HEAT)
+    api.set_power_and_heat.assert_awaited_once_with(1, True, 23.0)
+
+
+@pytest.mark.asyncio
+async def test_set_hvac_mode_fan_only_from_on_calls_heater_off():
+    """FAN_ONLY when device is already on calls set_heater_off, not set_power."""
+    ent, cond, api, runtime = _make_entity_with_runtime({"pwr_on": True, "u_temp_room": 225})
+    await ent.async_set_hvac_mode(HVACMode.FAN_ONLY)
+    api.set_heater_off.assert_awaited_once_with(1)
+    api.set_power.assert_not_awaited()
+    api.set_power_and_heat.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_set_hvac_mode_fan_only_from_off_calls_power_and_heat_none():
+    """FAN_ONLY when device is off uses set_power_and_heat(True, None)."""
+    ent, cond, api, runtime = _make_entity_with_runtime({"pwr_on": False})
+    await ent.async_set_hvac_mode(HVACMode.FAN_ONLY)
+    api.set_power_and_heat.assert_awaited_once_with(1, True, None)
+
+
+def test_resolve_heat_target_prefers_current_u_temp_room():
+    ent, _, _ = _make_entity({"u_temp_room": 245})
+    assert ent._resolve_heat_target() == pytest.approx(24.5)
+
+
+def test_resolve_heat_target_falls_back_to_last_heat_temp():
+    ent, _, _ = _make_entity({"u_temp_room": -1000})
+    ent._last_heat_temp = 21.0
+    assert ent._resolve_heat_target() == pytest.approx(21.0)
+
+
+def test_resolve_heat_target_defaults_to_20():
+    ent, _, _ = _make_entity({"u_temp_room": -1000})
+    assert ent._resolve_heat_target() == pytest.approx(20.0)
+
+
+def test_target_temperature_updates_last_heat_temp():
+    ent, _, _ = _make_entity({"u_temp_room": 235})
+    _ = ent.target_temperature  # access the property
+    assert ent._last_heat_temp == pytest.approx(23.5)

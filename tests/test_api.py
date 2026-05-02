@@ -75,6 +75,146 @@ async def test_login_success():
 
 
 @pytest.mark.asyncio
+async def test_user_agent_header_set_on_signin():
+    """Match the official mobile app's User-Agent so the server doesn't single us out."""
+    session = FakeSession()
+    session.queue_response(FakeResponse(200, json_data={"access_token": "t"}))
+
+    api = AtmeexApi(session)
+    await api.login("user@example.com", "pwd")
+
+    _method, _url, _payload, headers = session.requests[0]
+    assert headers["User-Agent"] == "okhttp/3.14.9"
+
+
+@pytest.mark.asyncio
+async def test_user_agent_header_set_on_authorized_requests():
+    """Authenticated GET should also carry the okhttp User-Agent."""
+    session = FakeSession()
+    session.queue_response(FakeResponse(200, json_data=[]))
+
+    api = AtmeexApi(session)
+    api._token = "t"
+
+    await api.get_devices()
+
+    _method, _url, _payload, headers = session.requests[0]
+    assert headers["User-Agent"] == "okhttp/3.14.9"
+
+
+@pytest.mark.asyncio
+async def test_request_sms_code_posts_signup_with_phone_code_grant():
+    """SMS request must hit /auth/signup with grant_type=phone_code."""
+    session = FakeSession()
+    session.queue_response(FakeResponse(200, json_data={}))
+
+    api = AtmeexApi(session)
+    await api.request_sms_code("+79991234567")
+
+    method, url, payload, headers = session.requests[0]
+    assert method == "POST"
+    assert url == f"{API_BASE_URL}/auth/signup"
+    assert payload == {"grant_type": "phone_code", "phone": "+79991234567"}
+    assert headers["User-Agent"] == "okhttp/3.14.9"
+
+
+@pytest.mark.asyncio
+async def test_login_phone_posts_signin_with_phone_code():
+    """Phone signin must send phone+phone_code under grant_type=phone_code and store tokens."""
+    session = FakeSession()
+    session.queue_response(
+        FakeResponse(200, json_data={"access_token": "tok", "refresh_token": "rt"})
+    )
+
+    api = AtmeexApi(session)
+    await api.login_phone("+79991234567", "1234")
+
+    assert api._token == "tok"
+    assert api.refresh_token == "rt"
+
+    method, url, payload, _headers = session.requests[0]
+    assert method == "POST"
+    assert url == f"{API_BASE_URL}/auth/signin"
+    assert payload == {
+        "grant_type": "phone_code",
+        "phone": "+79991234567",
+        "phone_code": "1234",
+    }
+
+
+@pytest.mark.asyncio
+async def test_login_phone_clears_email_credentials():
+    """A successful phone login must wipe any stale email/password.
+
+    Otherwise a previous email login on the same AtmeexApi instance could
+    silently resurrect itself as the 401-relogin fallback.
+    """
+    session = FakeSession()
+    session.queue_response(FakeResponse(200, json_data={"access_token": "t"}))
+
+    api = AtmeexApi(session)
+    api._email = "stale@example.com"
+    api._password = "stalepw"
+
+    await api.login_phone("+79991234567", "1234")
+
+    assert api._email is None
+    assert api._password is None
+    assert api._has_replayable_credentials() is False
+
+
+@pytest.mark.asyncio
+async def test_phone_account_does_not_replay_signin_on_401():
+    """Phone accounts cannot replay the SMS code, so 401 must not trigger _sign_in."""
+    sign_in_called = 0
+
+    class Phone401Session:
+        def __init__(self):
+            self.requests = []
+
+        def request(self, method, url, json=None, headers=None, timeout=None):
+            self.requests.append((method, url))
+            return FakeResponse(401, text_data="unauthorized")
+
+        def post(self, url, json=None, headers=None, timeout=None):
+            return self.request("POST", url, json=json, headers=headers, timeout=timeout)
+
+    session = Phone401Session()
+    api = AtmeexApi(session)
+    api._token = "t"
+    api._phone = "+79991234567"
+    api._phone_code = "1234"  # already consumed but stored
+
+    async def _counted_sign_in():
+        nonlocal sign_in_called
+        sign_in_called += 1
+
+    api._sign_in = _counted_sign_in
+
+    status, _ = await api._request("GET", "/devices")
+
+    assert status == 401
+    assert sign_in_called == 0
+    # Only the one GET — no relogin attempt
+    assert len(session.requests) == 1
+
+
+@pytest.mark.asyncio
+async def test_request_sms_code_error_raises_apierror():
+    """Server-side error on SMS request must surface as ApiError with status."""
+    session = FakeSession()
+    session.queue_response(FakeResponse(429, text_data="too many requests"))
+
+    api = AtmeexApi(session)
+
+    with pytest.raises(ApiError) as exc:
+        await api.request_sms_code("+79991234567")
+
+    assert exc.value.status == 429
+    assert "request_sms_code failed 429" in str(exc.value)
+
+
+@pytest.mark.asyncio
 async def test_login_error_raises_apierror():
     session = FakeSession()
     session.queue_response(FakeResponse(401, text_data="unauthorized"))
@@ -195,7 +335,6 @@ async def test_get_device_error_raises():
         ("set_power", True, {"u_pwr_on": True}),
         ("set_target_temperature", 21.5, {"u_temp_room": 215}),
         ("set_fan_speed", 3, {"u_fan_speed": 2}),  # HA speed 3 → API speed 2
-        ("set_breezer_mode", 2, {"u_damp_pos": 2}),
         ("set_humid_stage", 1, {"u_hum_stg": 1}),
     ],
 )
@@ -324,3 +463,83 @@ async def test_concurrent_401_sign_in_called_once():
 
     # The critical invariant: sign-in was called exactly once, not 5 times
     assert sign_in_calls == 1, f"_sign_in called {sign_in_calls} times, expected 1"
+
+
+# ---------------------------------------------------------------------------
+# set_breezer_mode — new multi-field behaviour
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "mode, expected_body",
+    [
+        (0, {"u_pwr_on": True, "u_damp_pos": 0}),
+        (1, {"u_pwr_on": True, "u_damp_pos": 1}),
+        (2, {"u_pwr_on": True, "u_damp_pos": 2}),
+        (3, {"u_pwr_on": False, "u_damp_pos": 0}),
+    ],
+)
+async def test_set_breezer_mode_body(mode, expected_body):
+    session = FakeSession()
+    session.queue_response(FakeResponse(200))
+
+    api = AtmeexApi(session)
+    api._token = "t"
+    await api.set_breezer_mode(1, mode)
+
+    req = session.requests[0]
+    assert req[0] == "PUT"
+    assert req[2] == expected_body
+
+
+@pytest.mark.asyncio
+async def test_set_breezer_mode_invalid_raises():
+    api = AtmeexApi(FakeSession())
+    api._token = "t"
+    with pytest.raises(ApiError, match="invalid mode"):
+        await api.set_breezer_mode(1, 4)
+
+
+# ---------------------------------------------------------------------------
+# set_heater_off
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_set_heater_off():
+    session = FakeSession()
+    session.queue_response(FakeResponse(200))
+
+    api = AtmeexApi(session)
+    api._token = "t"
+    await api.set_heater_off(1)
+
+    req = session.requests[0]
+    assert req[0] == "PUT"
+    assert req[2] == {"u_temp_room": -1000}
+
+
+# ---------------------------------------------------------------------------
+# set_power_and_heat
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "pwr_on, temp_c, expected_body",
+    [
+        (True, 22.5, {"u_pwr_on": True, "u_temp_room": 225}),
+        (True, None, {"u_pwr_on": True, "u_temp_room": -1000}),
+        (False, 20.0, {"u_pwr_on": False, "u_temp_room": 200}),
+        (False, None, {"u_pwr_on": False, "u_temp_room": -1000}),
+    ],
+)
+async def test_set_power_and_heat_body(pwr_on, temp_c, expected_body):
+    session = FakeSession()
+    session.queue_response(FakeResponse(200))
+
+    api = AtmeexApi(session)
+    api._token = "t"
+    await api.set_power_and_heat(1, pwr_on, temp_c)
+
+    req = session.requests[0]
+    assert req[0] == "PUT"
+    assert req[2] == expected_body

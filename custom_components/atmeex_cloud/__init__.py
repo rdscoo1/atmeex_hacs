@@ -28,6 +28,10 @@ from .const import (
     EVENT_API_ERROR,
     EVENT_DEVICE_UPDATED,
     WS_LOGBOOK_MIN_INTERVAL_SEC,
+    CONF_AUTH_METHOD,
+    CONF_PHONE,
+    AUTH_METHOD_EMAIL,
+    AUTH_METHOD_PHONE,
 )
 from .helpers import apply_condition_update, apply_settings_update
 
@@ -69,29 +73,40 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up Atmeex Cloud from a config entry."""
     session = async_get_clientsession(hass)
 
-    # Поддерживаем оба варианта ключей: CONF_EMAIL/CONF_PASSWORD и "email"/"password"
-    email = entry.data.get(CONF_EMAIL) or entry.data.get("email")
-    password = entry.data.get(CONF_PASSWORD) or entry.data.get("password")
+    # Default to email for entries created before phone login was supported.
+    auth_method = entry.data.get(CONF_AUTH_METHOD, AUTH_METHOD_EMAIL)
 
     api = AtmeexApi(session)
     await api.async_init()
 
-    # Restore refresh token from previous session if available
+    # Restore refresh token from previous session if available.
     stored_refresh_token = entry.data.get("refresh_token")
     if stored_refresh_token:
         api._refresh_token = stored_refresh_token
 
-    # Логин: различаем неверные креды и временные сетевые проблемы
     try:
-        await api.login(email, password)
+        if auth_method == AUTH_METHOD_PHONE:
+            # Phone accounts cannot replay sign-in; refresh_token is the
+            # only path back to a valid access token across restarts.
+            if not stored_refresh_token:
+                raise ConfigEntryAuthFailed(
+                    "Phone account requires re-verification (no refresh token stored)"
+                )
+            await api.authenticate_phone()
+        else:
+            email = entry.data.get(CONF_EMAIL)
+            password = entry.data.get(CONF_PASSWORD)
+            if not email or not password:
+                raise ConfigEntryAuthFailed(
+                    "Email account is missing credentials in config entry"
+                )
+            await api.login(email, password)
     except ApiError as err:
         status = getattr(err, "status", None)
         if status in (401, 403):
-            # неправильный логин/пароль → запускаем re-auth flow
             raise ConfigEntryAuthFailed(
                 f"Invalid Atmeex credentials: {err}"
             ) from err
-        # остальное — проблемы соединения / бэкенда → NotReady
         raise ConfigEntryNotReady(
             f"Cannot connect to Atmeex Cloud: {err}"
         ) from err
@@ -531,10 +546,19 @@ async def async_remove_config_entry_device(
     device_entry: DeviceEntry,
 ) -> bool:
     """Remove a device from the integration.
-    
+
     This allows users to remove individual devices that are no longer
-    connected or needed.
+    connected or needed. Per-device runtime state (locks, pending commands)
+    is dropped here so it doesn't accumulate across add/remove cycles.
     """
-    # We allow removal of any device - the device will reappear
-    # on next poll if it's still connected to the account
+    runtime: AtmeexRuntimeData | None = getattr(config_entry, "runtime_data", None)
+    if runtime is not None:
+        for domain, ident in device_entry.identifiers:
+            if domain != DOMAIN:
+                continue
+            key = str(ident)
+            runtime.pending_commands.pop(key, None)
+            runtime.device_locks.pop(key, None)
+
+    # The device will reappear on next poll if it's still connected to the account.
     return True

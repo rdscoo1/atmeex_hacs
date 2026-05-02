@@ -246,19 +246,33 @@ Same as MEDIUM #8 above — `coordinator.py` primary get_devices path narrowed.
 
 ---
 
+### ~~Unbounded dict growth (pending_commands/device_locks)~~ FIXED
+
+**Severity: Low** | **Status: Resolved 2026-05-02**
+
+`AtmeexRuntimeData.pending_commands` and `device_locks` accumulated one entry per device ID seen during the lifetime of the loaded config entry, with no cleanup on device removal.
+
+**Fix:** `async_remove_config_entry_device` ([__init__.py:528-548](../../custom_components/atmeex_cloud/__init__.py#L528-L548)) now iterates the device entry's `(DOMAIN, ident)` identifiers and pops the corresponding keys from both `runtime.pending_commands` and `runtime.device_locks`. Defensive against missing `runtime_data` (failed setup) and unknown identifiers.
+
+**Files changed:** `__init__.py`, `tests/test_init.py` (3 new tests)
+
+---
+
 ## Active Concerns
 
 No unresolved concerns identified as of 2026-05-02.
 
-Items previously in "Dismissed Concerns" (2026-03-28) remain non-issues:
-- Unbounded dict growth (pending_commands/device_locks) — typical 1-5 devices, negligible memory
-- Refresh tasks cache leak — `finally` block always executes correctly
-- WebSocket token refresh timing — `_token_getter()` called on every `_connect_once()`
-- Bare `except` clauses marked intentional — `# noqa: BLE001` annotations remain appropriate
-- Entity name collision — `async_set_unique_id` + `_abort_if_unique_id_configured()` prevents duplicates
-- Temperature parsing fragility — `target_temperature` validates range; `None` returns are correct HA semantics
+## Verified non-issues (2026-05-02)
+
+The following items were verified against current code and remain correctly resolved by their existing mechanism:
+
+- **Refresh tasks cache leak** — `finally` block at [__init__.py:295-297](../../custom_components/atmeex_cloud/__init__.py#L295-L297) pops with identity check (`is task`).
+- **WebSocket token refresh timing** — [websocket.py:123](../../custom_components/atmeex_cloud/websocket.py#L123) calls `self._token_getter()` on every `_connect_once()`.
+- **Bare `except` clauses** — `# noqa: BLE001` annotations cover logging-only / boundary catches; spot-checked at [__init__.py:104](../../custom_components/atmeex_cloud/__init__.py#L104), [config_flow.py:108](../../custom_components/atmeex_cloud/config_flow.py#L108), [websocket.py:145](../../custom_components/atmeex_cloud/websocket.py#L145).
+- **Entity name collision** — `async_set_unique_id` + `_abort_if_unique_id_configured()` present at [config_flow.py:92-93](../../custom_components/atmeex_cloud/config_flow.py#L92-L93) (and reauth path).
+- **Temperature parsing fragility** — `target_temperature` at [climate.py:210-215](../../custom_components/atmeex_cloud/climate.py#L210-L215) range-validates and returns `None` correctly.
 
 ---
 
 *Concerns audit: 2026-05-02*
-*All 20 concerns resolved (3 original + 17 code review)*
+*All 21 concerns resolved (3 original + 17 code review + 1 follow-up cleanup)*

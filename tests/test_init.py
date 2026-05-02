@@ -2016,3 +2016,62 @@ async def test_apply_settings_update_sets_online_true(monkeypatch):
         {"type": "settings", "data": [{"id": 1, "settings": {"u_pwr_on": 1}}]},
     )
     assert runtime.coordinator.data["states"]["1"]["online"] is True
+
+
+@pytest.mark.asyncio
+async def test_async_remove_config_entry_device_drops_per_device_state():
+    """Device removal must evict per-device locks and pending commands.
+
+    Without this cleanup, runtime.device_locks / runtime.pending_commands grow
+    unboundedly across add/remove cycles for the lifetime of the loaded entry.
+    """
+    from custom_components.atmeex_cloud.runtime import AtmeexRuntimeData, PendingCommand
+
+    runtime = AtmeexRuntimeData(api=None, coordinator=None, refresh_device=None)
+    runtime.device_locks["42"] = asyncio.Lock()
+    runtime.device_locks["99"] = asyncio.Lock()
+    runtime.pending_commands["42"] = {"pwr_on": PendingCommand(value=True, timestamp=0.0, attribute="pwr_on")}
+    runtime.pending_commands["99"] = {"pwr_on": PendingCommand(value=False, timestamp=0.0, attribute="pwr_on")}
+
+    entry = SimpleNamespace(runtime_data=runtime)
+    device_entry = SimpleNamespace(identifiers={(DOMAIN, "42"), ("other_domain", "ignored")})
+
+    result = await atmeex_init.async_remove_config_entry_device(
+        hass=SimpleNamespace(), config_entry=entry, device_entry=device_entry
+    )
+
+    assert result is True
+    assert "42" not in runtime.device_locks
+    assert "42" not in runtime.pending_commands
+    # Other devices and unrelated identifiers are untouched.
+    assert "99" in runtime.device_locks
+    assert "99" in runtime.pending_commands
+
+
+@pytest.mark.asyncio
+async def test_async_remove_config_entry_device_handles_missing_runtime():
+    """Removal must not crash when runtime_data is unset (e.g. failed setup)."""
+    entry = SimpleNamespace()  # no runtime_data attribute
+    device_entry = SimpleNamespace(identifiers={(DOMAIN, "42")})
+
+    result = await atmeex_init.async_remove_config_entry_device(
+        hass=SimpleNamespace(), config_entry=entry, device_entry=device_entry
+    )
+    assert result is True
+
+
+@pytest.mark.asyncio
+async def test_async_remove_config_entry_device_unknown_device_is_noop():
+    """Removing a device that was never tracked must not raise."""
+    from custom_components.atmeex_cloud.runtime import AtmeexRuntimeData
+
+    runtime = AtmeexRuntimeData(api=None, coordinator=None, refresh_device=None)
+    entry = SimpleNamespace(runtime_data=runtime)
+    device_entry = SimpleNamespace(identifiers={(DOMAIN, "never_seen")})
+
+    result = await atmeex_init.async_remove_config_entry_device(
+        hass=SimpleNamespace(), config_entry=entry, device_entry=device_entry
+    )
+    assert result is True
+    assert runtime.device_locks == {}
+    assert runtime.pending_commands == {}
