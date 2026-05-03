@@ -93,6 +93,16 @@ class AtmeexConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         # Carries the phone number across phone → phone_code steps.
         self._pending_phone: str | None = None
 
+    def _abort_if_unique_id_mismatch(self) -> None:
+        """Abort if unique_id doesn't match the entry being reauthenticated.
+
+        Added in HA 2024.x; shim here so older versions stay compatible.
+        """
+        try:
+            super()._abort_if_unique_id_mismatch()  # type: ignore[misc]
+        except AttributeError:
+            pass
+
     @staticmethod
     def async_get_options_flow(
         config_entry: ConfigEntry,
@@ -408,6 +418,11 @@ class AtmeexOptionsFlowHandler(config_entries.OptionsFlow):
     Modern HA provides ``self.config_entry`` automatically — no need to
     accept it in ``__init__``.
     """
+
+    @property
+    def config_entry(self) -> ConfigEntry:
+        """Return the config entry. Shim for HA versions prior to 2024.x."""
+        return self._config_entry  # type: ignore[attr-defined]
 
     async def async_step_init(self, user_input: dict[str, Any] | None = None) -> FlowResult:
         if user_input is not None:

@@ -139,7 +139,7 @@ class AtmeexFanEntity(AtmeexEntityMixin, CoordinatorEntity, FanEntity):
 
     # ----- commands -----
 
-    async def async_turn_on(self, percentage: int | None = None, **kwargs) -> None:
+    async def async_turn_on(self, percentage: int | None = None, preset_mode: str | None = None, **kwargs) -> None:
         if percentage is None:
             percentage = self.percentage or 100
         speed = self._percentage_to_speed(percentage)
