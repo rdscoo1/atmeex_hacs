@@ -54,14 +54,6 @@ _DEVICE_SENSOR_SPECS: tuple[_SensorSpec, ...] = (
         convert=deci_to_c,
     ),
     _SensorSpec(
-        key="temp_out",
-        unique_suffix="outdoor_temp",
-        device_class=SensorDeviceClass.TEMPERATURE,
-        unit=UnitOfTemperature.CELSIUS,
-        translation_key="outdoor_temperature",
-        convert=deci_to_c,
-    ),
-    _SensorSpec(
         key="hum_room",
         unique_suffix="humidity",
         device_class=SensorDeviceClass.HUMIDITY,
@@ -215,10 +207,6 @@ def AtmeexInletTempSensor(coordinator, device: AtmeexDevice, entry_id: str) -> A
     """Factory alias for inlet temperature sensor."""
     return AtmeexDeviceSensor(coordinator, device, entry_id, _SPEC_BY_SUFFIX["inlet_temp"])
 
-
-def AtmeexOutdoorTempSensor(coordinator, device: AtmeexDevice, entry_id: str) -> AtmeexDeviceSensor:
-    """Factory alias for outdoor temperature sensor."""
-    return AtmeexDeviceSensor(coordinator, device, entry_id, _SPEC_BY_SUFFIX["outdoor_temp"])
 
 
 def AtmeexHumiditySensor(coordinator, device: AtmeexDevice, entry_id: str) -> AtmeexDeviceSensor:

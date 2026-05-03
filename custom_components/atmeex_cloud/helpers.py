@@ -181,7 +181,7 @@ def apply_condition_update(
     if "fan_speed" in condition_data:
         updated["fan_speed"] = api_to_fan_speed(condition_data["fan_speed"])
 
-    for field in ("temp_room", "temp_in", "temp_out", "hum_room", "co2_ppm", "damp_pos", "hum_stg"):
+    for field in ("temp_room", "temp_in", "hum_room", "co2_ppm", "damp_pos", "hum_stg"):
         if field in condition_data:
             parsed = _to_int(condition_data[field])
             if parsed is not None:
@@ -328,10 +328,6 @@ def _normalize_device_state(item: dict[str, Any]) -> dict[str, Any]:
         out["hum_room"] = int(hum_room)
     if isinstance(temp_room, (int, float)):
         out["temp_room"] = int(temp_room)
-
-    temp_out = cond.get("temp_out")
-    if isinstance(temp_out, (int, float)):
-        out["temp_out"] = int(temp_out)
 
     # Normalize boolean mode flags (auto / night)
     for bool_field in ("u_auto", "u_night"):

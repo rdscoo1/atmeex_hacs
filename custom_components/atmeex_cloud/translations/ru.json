@@ -166,9 +166,6 @@
       "inlet_temperature": {
         "name": "Температура входящего воздуха"
       },
-      "outdoor_temperature": {
-        "name": "Температура наружного воздуха"
-      },
       "humidity": {
         "name": "Влажность"
       }

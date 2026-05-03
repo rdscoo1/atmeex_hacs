@@ -155,9 +155,6 @@
       "inlet_temperature": {
         "name": "Inlet temperature"
       },
-      "outdoor_temperature": {
-        "name": "Outdoor temperature"
-      },
       "humidity": {
         "name": "Humidity"
       }
