@@ -66,6 +66,29 @@ async def test_fan_async_set_percentage_raises_homeassistant_error_on_api_failur
 
 
 @pytest.mark.asyncio
+async def test_fan_async_turn_on_no_percentage_only_calls_set_power():
+    fan, cond, api, coord = _make_fan_entity()
+
+    await fan.async_turn_on()
+
+    api.set_power.assert_awaited_once_with(1, True)
+    api.set_fan_speed.assert_not_awaited()
+    coord.async_request_refresh.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_fan_async_turn_on_with_percentage_sets_speed_then_power():
+    fan, cond, api, coord = _make_fan_entity()
+
+    # 75% → speed 5 (same mapping checked in test_fan_async_set_percentage)
+    await fan.async_turn_on(percentage=75)
+
+    api.set_fan_speed.assert_awaited_once_with(1, 5)
+    api.set_power.assert_awaited_once_with(1, True)
+    assert coord.async_request_refresh.await_count == 2
+
+
+@pytest.mark.asyncio
 async def test_fan_async_turn_off_uses_set_power():
     fan, cond, api, coord = _make_fan_entity()
 
