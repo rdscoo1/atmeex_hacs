@@ -1,12 +1,15 @@
 """Shared test fixtures for the Atmeex Cloud integration."""
 from __future__ import annotations
 
+from types import MethodType
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
 
 from custom_components.atmeex_cloud.api import AtmeexDevice
+from custom_components.atmeex_cloud.coordinator import AtmeexCoordinator
+from custom_components.atmeex_cloud.runtime import AtmeexRuntimeData
 
 
 class DummyCoordinator:
@@ -17,26 +20,53 @@ class DummyCoordinator:
     avoids the full HA machinery.
     """
 
-    def __init__(self, hass, logger, name=None, update_method=None, update_interval=None, **kwargs):
+    def __init__(self, hass=None, logger=None, name=None, update_method=None, update_interval=None, **kwargs):
         self.hass = hass
         self.logger = logger
         self.name = name
         self.update_method = update_method
         self.update_interval = update_interval
-        self.data = None
+        self.data = kwargs.get("data")
         self.last_update_success = False
+        self.last_update_success_time = None
         # Attributes that AtmeexCoordinator adds
-        self.last_api_error = None
-        self.last_success_ts = None
+        self.last_api_error = kwargs.get("last_api_error")
+        self.last_success_ts = kwargs.get("last_success_ts")
+        self._ws_device_update_ts = {}
+        self._refresh_device_update_ts = {}
         # Extra counter used by some WS tests
         self.update_calls = 0
 
+    def setup_update(self, *, api, fire_logbook_event):
+        self._api = api
+        self._fire_logbook_event = fire_logbook_event
+        self._api_error_last_ts = float("-inf")
+        self._api_error_suppressed = 0
+        for method_name in (
+            "_fetch_devices_safely",
+            "_fire_api_error_event",
+            "_async_update_data",
+        ):
+            setattr(
+                self,
+                method_name,
+                MethodType(getattr(AtmeexCoordinator, method_name), self),
+            )
+
     async def async_config_entry_first_refresh(self):
-        self.data = await self.update_method()
+        if hasattr(self, "_async_update_data"):
+            self.data = await self._async_update_data()
+        else:
+            self.data = await self.update_method()
+        self.last_update_success = True
 
     def async_set_updated_data(self, data):
         self.update_calls += 1
         self.data = data
+
+    async def async_request_refresh(self):
+        if hasattr(self, "_async_update_data"):
+            self.data = await self._async_update_data()
 
 
 def make_fake_api_class(
@@ -102,3 +132,15 @@ def make_entry_stub(*, options: dict | None = None):
         add_update_listener=lambda _listener: (lambda: None),
         async_on_unload=lambda _cb: None,
     )
+
+
+def make_runtime(hass, entry, api, coordinator, *, websocket_manager=None):
+    """Build runtime data and attach it to a config entry."""
+    runtime = AtmeexRuntimeData(
+        api=api,
+        coordinator=coordinator,
+        refresh_device=AsyncMock(),
+        websocket_manager=websocket_manager,
+    )
+    entry.runtime_data = runtime
+    return runtime

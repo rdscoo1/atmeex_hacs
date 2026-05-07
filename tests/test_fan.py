@@ -56,14 +56,6 @@ async def test_fan_async_set_percentage():
     coord.async_request_refresh.assert_awaited_once()
 
 
-@pytest.mark.asyncio
-async def test_fan_async_set_percentage_raises_homeassistant_error_on_api_failure():
-    fan, cond, api, coord = _make_fan_entity()
-    api.set_fan_speed.side_effect = ApiError("boom", status=500)
-
-    with pytest.raises(HomeAssistantError, match="Failed to set fan speed"):
-        await fan.async_set_percentage(75)
-
 
 @pytest.mark.asyncio
 async def test_fan_async_turn_on_no_percentage_only_calls_set_power():

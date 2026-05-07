@@ -6,8 +6,10 @@ from homeassistant.const import CONF_EMAIL, CONF_PASSWORD
 from types import SimpleNamespace
 from homeassistant import data_entry_flow
 from custom_components.atmeex_cloud.config_flow import AtmeexConfigFlow, AtmeexOptionsFlowHandler
+from custom_components.atmeex_cloud.config_flow import _clean_phone, _email_unique_id
 from custom_components.atmeex_cloud.api import ApiError
 from custom_components.atmeex_cloud.const import (
+    DOMAIN,
     CONF_ENABLE_WEBSOCKET,
     CONF_UPDATE_INTERVAL,
     DEFAULT_ENABLE_WEBSOCKET,
@@ -20,6 +22,7 @@ from custom_components.atmeex_cloud.const import (
     AUTH_METHOD_EMAIL,
     AUTH_METHOD_PHONE,
 )
+from pytest_homeassistant_custom_component.common import MockConfigEntry
 
 
 def _make_flow() -> AtmeexConfigFlow:
@@ -52,6 +55,50 @@ def _make_phone_reauth_flow(phone: str = "+79991234567") -> AtmeexConfigFlow:
             CONF_PHONE: phone,
         }
     )
+
+
+@pytest.mark.parametrize(
+    ("raw_phone", "expected"),
+    [
+        ("+7 (495) 123-45-67", "+74951234567"),
+        ("84951234567", "84951234567"),
+        ("+7-495-123-45-67", "+74951234567"),
+        ("  +7 (495) 123-45-67  ", "+74951234567"),
+        ("+7(495)1234567", "+74951234567"),
+    ],
+)
+def test_clean_phone_normalizes_cosmetic_input(raw_phone, expected):
+    assert _clean_phone(raw_phone) == expected
+
+
+@pytest.mark.asyncio
+async def test_email_step_aborts_duplicate_config_entry(hass, enable_custom_integrations):
+    existing = MockConfigEntry(
+        domain=DOMAIN,
+        unique_id=_email_unique_id("user@example.com"),
+        data={CONF_EMAIL: "user@example.com", CONF_PASSWORD: "old"},
+    )
+    existing.add_to_hass(hass)
+
+    with patch(
+        "custom_components.atmeex_cloud.config_flow.async_get_clientsession"
+    ) as get_session, patch(
+        "custom_components.atmeex_cloud.config_flow.AtmeexApi"
+    ) as api_cls:
+        get_session.return_value = object()
+        api = api_cls.return_value
+        api.async_init = AsyncMock()
+        api.login = AsyncMock()
+        api.get_devices = AsyncMock(return_value=[])
+
+        result = await hass.config_entries.flow.async_init(
+            DOMAIN,
+            context={"source": "email"},
+            data={CONF_EMAIL: "user@example.com", CONF_PASSWORD: "new"},
+        )
+
+    assert result["type"] == data_entry_flow.FlowResultType.ABORT
+    assert result["reason"] == "already_configured"
 
 
 @pytest.mark.asyncio

@@ -10,7 +10,7 @@
 
 Atmeex Cloud is a custom integration for [Home Assistant](https://www.home-assistant.io/) that connects your **Atmeex (AirNanny)** ventilation devices to the Home Assistant ecosystem. It uses the official Atmeex Cloud REST API to provide reliable control and monitoring of your breezers directly from Home Assistant dashboards and automations.
 
-> 🧩 Originally based on the open-source integration by [@anpavlov](https://github.com/anpavlov), extensively rewritten by [Sergei Polunovskii](https://github.com/pols1), and fully refactored to modern HA standards by [@rdscoo1](https://github.com/rdscoo1) with race-condition protection, comprehensive diagnostics, and 73+ automated tests.
+> 🧩 Originally based on the open-source integration by [@anpavlov](https://github.com/anpavlov), extensively rewritten by [Sergei Polunovskii](https://github.com/pols1), and fully refactored to modern HA standards by [@rdscoo1](https://github.com/rdscoo1) with race-condition protection, WebSocket real-time updates, phone/SMS authentication, and 224+ automated tests.
 
 ## Features
 
@@ -27,13 +27,17 @@ Atmeex Cloud is a custom integration for [Home Assistant](https://www.home-assis
 ### Monitoring
 - **Room temperature** sensor
 - **Room humidity** sensor
+- **CO2 level** sensor (optional, for models with CO2 sensor)
+- **Inlet air temperature** sensor
 - **Online/offline status** as dedicated binary sensor
 - **Diagnostics** sensor with API statistics
 
 ### Reliability
-- **Race condition protection** — rapid fan speed changes won't regress to stale values
+- **WebSocket** for instant real-time updates
+- **HTTP polling** as fallback with configurable interval (10–300 seconds)
+- **Automatic reconnection** with exponential backoff
+- **Race condition protection** — rapid commands won't regress to stale values
 - **Re-authentication flow** — automatic prompt when credentials expire
-- **Configurable polling interval** (3–60 seconds)
 - **Robust error handling** with automatic retries
 
 ### Automation Support
@@ -61,13 +65,17 @@ Atmeex Cloud is a custom integration for [Home Assistant](https://www.home-assis
 
 1. Go to **Settings** → **Devices & Services** → **Add Integration**
 2. Search for **Atmeex Cloud**
-3. Enter your Atmeex account credentials (email and password)
+3. Choose your sign-in method:
+   - **Email and password** — enter your Atmeex Cloud email and password
+   - **Phone and SMS code** — enter your phone number, then the SMS code sent to it
 4. All connected devices will appear automatically
 
 ### Options
 
 After setup, you can configure:
-- **Update interval** (3–60 seconds) — how often to poll the Atmeex Cloud API
+- **Update interval** (10–300 seconds) — how often to poll the Atmeex Cloud API
+- **Enable WebSocket** — use WebSocket for instant real-time updates; disable for HTTP-polling only (more reliable but slower)
+- **Enable CO2 sensor** — show the CO2 level sensor; disable if your device does not have a CO2 sensor
 
 ## Entities
 
@@ -82,6 +90,9 @@ Each device creates the following entities:
 | `switch` | `switch.bedroom_breezer_auto_nanny` | AutoNanny mode toggle |
 | `switch` | `switch.bedroom_breezer_sleep_mode` | Sleep mode toggle |
 | `binary_sensor` | `binary_sensor.bedroom_breezer_online` | Device connectivity status |
+| `sensor` | `sensor.bedroom_breezer_co2` | CO2 level in ppm (optional) |
+| `sensor` | `sensor.bedroom_breezer_humidity` | Room humidity |
+| `sensor` | `sensor.bedroom_breezer_inlet_temperature` | Inlet air temperature |
 | `sensor` | `sensor.atmeex_diagnostics` | API statistics and health |
 
 ## Breezer Operation Modes
@@ -333,10 +344,13 @@ script:
 | Problem | Cause | Solution |
 |---------|-------|----------|
 | Integration fails to load | Old or corrupted files | Reinstall from HACS |
-| Auth failed during setup | Wrong credentials | Verify your Atmeex Cloud email and password |
+| Auth failed during setup (email) | Wrong credentials | Verify your Atmeex Cloud email and password |
+| Auth failed during setup (phone) | Wrong SMS code or expired | Re-enter phone number to request a new SMS code |
+| Session expired notification | Access token expired | Follow the re-authentication prompt in HA; for phone accounts, confirm before a new SMS is sent |
 | Temperature shows -100°C | API didn't return data | Wait for next update or restart HA |
-| Device shows unavailable | Device offline or API issue | Check device connectivity |
+| Device shows unavailable | Device offline or API issue | Check device connectivity in the Atmeex mobile app |
 | Fan speed reverts | Race condition (fixed in v0.5+) | Update to latest version |
+| CO2 sensor missing | Device has no CO2 sensor | Disable CO2 sensor in integration options |
 
 ### Enable Debug Logging
 
@@ -373,16 +387,18 @@ pytest --cov        # With coverage report
 
 ### Test Coverage
 
-The test suite includes **73+ tests** covering:
+The test suite includes **224+ tests** covering:
 
 | Module | Coverage |
 |--------|----------|
-| `api.py` | API client, authentication, error handling |
-| `__init__.py` | Setup, coordinator, race protection |
+| `api.py` | API client, email + phone authentication, User-Agent, error handling |
+| `__init__.py` | Setup, coordinator, WS reauth, refresh_device |
+| `coordinator.py` | Poll cycle, race-condition timestamp guards |
+| `websocket.py` | Connection lifecycle, reconnect, exponential backoff |
 | `climate.py` | Climate entity, all HVAC operations |
 | `fan.py` | Fan entity, speed control |
 | `select.py` | Select entities for modes |
-| `config_flow.py` | Config and options flow |
+| `config_flow.py` | Email flow, phone flow, reauth branching |
 | `binary_sensor.py` | Online status sensor |
 
 ### CI/CD
