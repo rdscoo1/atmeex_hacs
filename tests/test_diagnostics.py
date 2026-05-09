@@ -41,7 +41,10 @@ async def test_config_entry_diagnostics(hass):
         "states": {"1": {"pwr_on": True}},
     }
 
-    api = SimpleNamespace(_token="t")
+    api = SimpleNamespace(
+        _token="SECRET_ACCESS_TOKEN_SENTINEL",
+        refresh_token="SECRET_REFRESH_TOKEN_SENTINEL",
+    )
     async def _refresh(_device_id):  # pragma: no cover - просто заглушка
         return None
 
@@ -65,6 +68,9 @@ async def test_config_entry_diagnostics(hass):
     # и что секреты (email/password) отредактированы
     assert diag["entry"]["data"][CONF_EMAIL] != "user@example.com"
     assert diag["entry"]["data"][CONF_PASSWORD] != "secret"
+    dumped = json_dumps(diag)
+    assert "SECRET_ACCESS_TOKEN_SENTINEL" not in dumped
+    assert "SECRET_REFRESH_TOKEN_SENTINEL" not in dumped
 
 
 @pytest.mark.asyncio

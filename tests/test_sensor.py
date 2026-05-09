@@ -12,19 +12,7 @@ from custom_components.atmeex_cloud.sensor import (
     AtmeexInletTempSensor,
     async_setup_entry,
 )
-
-
-class DummyCoordinator:
-    def __init__(self, data, last_success_ts=None, last_api_error=None):
-        self.data = data
-        self.last_update_success = True
-        self.last_update_success_time = None
-        self.last_success_ts = last_success_ts
-        self.last_api_error = last_api_error
-
-    async def async_request_refresh(self):
-        # для совместимости, но тестам обычно не нужен
-        pass
+from tests.conftest import DummyCoordinator
 
 
 @pytest.mark.asyncio

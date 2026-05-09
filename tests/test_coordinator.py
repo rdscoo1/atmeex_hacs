@@ -9,6 +9,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 from custom_components.atmeex_cloud.api import AtmeexDevice, ApiError
+from custom_components.atmeex_cloud.const import EVENT_API_ERROR, WS_LOGBOOK_MIN_INTERVAL_SEC
 from custom_components.atmeex_cloud.coordinator import AtmeexCoordinator
 
 
@@ -146,3 +147,26 @@ async def test_fetch_devices_primary_unexpected_exception_propagates():
 
     with pytest.raises(_UnexpectedBug):
         await coord._fetch_devices_safely()
+
+
+def test_fire_api_error_event_throttles_repeated_events(monkeypatch):
+    fired = MagicMock()
+    coord, _api = _make_coordinator()
+    coord._fire_logbook_event = fired
+
+    now = 1000.0
+    monkeypatch.setattr(time, "monotonic", lambda: now)
+
+    coord._fire_api_error_event({"message": "first"})
+    coord._fire_api_error_event({"message": "second"})
+
+    fired.assert_called_once_with(EVENT_API_ERROR, {"message": "first"})
+
+    now += WS_LOGBOOK_MIN_INTERVAL_SEC + 0.1
+    coord._fire_api_error_event({"message": "third"})
+
+    assert fired.call_count == 2
+    fired.assert_called_with(
+        EVENT_API_ERROR,
+        {"message": "third", "suppressed_errors": 1},
+    )

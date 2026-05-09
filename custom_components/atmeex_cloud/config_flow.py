@@ -7,7 +7,7 @@ import voluptuous as vol
 from homeassistant import config_entries
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import CONF_EMAIL, CONF_PASSWORD
-from homeassistant.data_entry_flow import FlowResult
+from homeassistant.data_entry_flow import AbortFlow, FlowResult
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 
 from .api import AtmeexApi, ApiError
@@ -155,6 +155,8 @@ class AtmeexConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             except ApiError as err:
                 status = getattr(err, "status", None)
                 errors["base"] = "invalid_auth" if status in (401, 403) else "cannot_connect"
+            except AbortFlow:
+                raise
             except Exception as err:  # noqa: BLE001
                 _LOGGER.exception(
                     "Unexpected error during Atmeex email config flow: %s", err
@@ -268,6 +270,8 @@ class AtmeexConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 errors["base"] = (
                     "invalid_auth" if status in (401, 403) else "cannot_connect"
                 )
+            except AbortFlow:
+                raise
             except Exception as err:  # noqa: BLE001
                 _LOGGER.exception(
                     "Unexpected error verifying SMS code: %s", err

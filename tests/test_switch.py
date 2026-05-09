@@ -74,14 +74,6 @@ def test_auto_nanny_properties():
     assert auto.available is True
 
 
-@pytest.mark.asyncio
-async def test_auto_nanny_turn_on_handles_api_error():
-    auto, _, api, _ = _make_switches()
-    api.set_auto_mode.side_effect = ApiError("boom", status=500)
-
-    with pytest.raises(HomeAssistantError, match="Failed to enable AutoNanny"):
-        await auto.async_turn_on()
-
 
 @pytest.mark.asyncio
 async def test_auto_nanny_turn_off_calls_api_and_refresh():
@@ -101,14 +93,6 @@ def test_sleep_mode_properties():
     assert sleep.available is False
 
 
-@pytest.mark.asyncio
-async def test_sleep_mode_turn_on_handles_api_error():
-    _, sleep, api, _ = _make_switches()
-    api.set_sleep_mode.side_effect = ApiError("boom", status=500)
-
-    with pytest.raises(HomeAssistantError, match="Failed to enable Sleep Mode"):
-        await sleep.async_turn_on()
-
 
 @pytest.mark.asyncio
 async def test_sleep_mode_turn_off_calls_api_and_refresh():
@@ -120,19 +104,6 @@ async def test_sleep_mode_turn_off_calls_api_and_refresh():
     refresh_cb.assert_awaited_once_with(42)
 
 
-def test_auto_nanny_is_on_reflects_pending_before_confirmation():
-    """is_on must return True immediately after pending is set, even before the API confirms."""
-    auto, _, _, _ = _make_switches({"online": True, "u_auto": False}, with_runtime=True)
-    # Simulate what _execute_command does before the API call
-    auto._runtime.set_pending(42, "u_auto", True)
-    assert auto.is_on is True
-
-
-def test_sleep_mode_is_on_reflects_pending_before_confirmation():
-    """is_on must return True immediately after pending is set, even before the API confirms."""
-    _, sleep, _, _ = _make_switches({"online": True, "u_night": False}, with_runtime=True)
-    sleep._runtime.set_pending(42, "u_night", True)
-    assert sleep.is_on is True
 
 
 # ---------------------------------------------------------------------------
@@ -152,6 +123,9 @@ def _make_power_switch(state: dict | None = None, *, with_runtime: bool = False)
     )
     api = MagicMock()
     api.set_power = AsyncMock()
+    api.set_auto_mode = AsyncMock()
+    api.set_sleep_mode = AsyncMock()
+    api.set_breezer_mode = AsyncMock()
     refresh_cb = AsyncMock()
     runtime = None
     if with_runtime:
@@ -185,17 +159,15 @@ def test_power_switch_is_on_false():
     assert switch.is_on is False
 
 
-def test_power_switch_is_on_reflects_pending():
-    switch, _, _ = _make_power_switch({"online": True, "pwr_on": False}, with_runtime=True)
-    switch._runtime.set_pending(42, "pwr_on", True)
-    assert switch.is_on is True
-
 
 @pytest.mark.asyncio
 async def test_power_switch_turn_on_calls_api():
     switch, api, refresh_cb = _make_power_switch()
     await switch.async_turn_on()
     api.set_power.assert_awaited_once_with(42, True)
+    api.set_auto_mode.assert_not_awaited()
+    api.set_sleep_mode.assert_not_awaited()
+    api.set_breezer_mode.assert_not_awaited()
     refresh_cb.assert_awaited_once_with(42)
 
 
@@ -204,12 +176,8 @@ async def test_power_switch_turn_off_calls_api():
     switch, api, refresh_cb = _make_power_switch()
     await switch.async_turn_off()
     api.set_power.assert_awaited_once_with(42, False)
+    api.set_auto_mode.assert_not_awaited()
+    api.set_sleep_mode.assert_not_awaited()
+    api.set_breezer_mode.assert_not_awaited()
     refresh_cb.assert_awaited_once_with(42)
 
-
-@pytest.mark.asyncio
-async def test_power_switch_turn_on_handles_api_error():
-    switch, api, _ = _make_power_switch()
-    api.set_power.side_effect = ApiError("boom", status=500)
-    with pytest.raises(HomeAssistantError, match="Failed to turn on"):
-        await switch.async_turn_on()

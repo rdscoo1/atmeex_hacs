@@ -168,9 +168,17 @@ class AtmeexFanEntity(AtmeexEntityMixin, CoordinatorEntity, FanEntity):
             await self.async_turn_off()
             return
         speed = self._percentage_to_speed(percentage)
+        turn_on_after_speed = not self.is_on
         await self._execute_command(
             self.api.set_fan_speed(self._device_id, speed),
             pending_attr="fan_speed",
             pending_value=speed,
             error_message="Failed to set fan speed",
         )
+        if turn_on_after_speed:
+            await self._execute_command(
+                self.api.set_power(self._device_id, True),
+                pending_attr="pwr_on",
+                pending_value=True,
+                error_message="Failed to turn on fan",
+            )

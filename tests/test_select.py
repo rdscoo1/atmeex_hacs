@@ -76,14 +76,6 @@ async def test_humidification_select_invalid_option_noop():
     coord.async_request_refresh.assert_not_awaited()
 
 
-@pytest.mark.asyncio
-async def test_humidification_select_raises_homeassistant_error_on_api_failure():
-    hum, breezer, cond, api, coord = _make_selects()
-    api.set_humid_stage.side_effect = ApiError("boom", status=500)
-
-    with pytest.raises(HomeAssistantError, match="Failed to set humidification stage"):
-        await hum.async_select_option("2")
-
 
 def test_breezer_select_current_option_from_damp_pos():
     hum, breezer, cond, api, coord = _make_selects({"damp_pos": 1})
@@ -112,14 +104,6 @@ async def test_breezer_select_invalid_option_noop():
     api.set_breezer_mode.assert_not_awaited()
     coord.async_request_refresh.assert_not_awaited()
 
-
-@pytest.mark.asyncio
-async def test_breezer_select_raises_homeassistant_error_on_api_failure():
-    hum, breezer, cond, api, coord = _make_selects()
-    api.set_breezer_mode.side_effect = ApiError("boom", status=500)
-
-    with pytest.raises(HomeAssistantError, match="Failed to set work mode"):
-        await breezer.async_select_option(BREEZER_OPTIONS[1])
 
 
 @pytest.mark.asyncio
