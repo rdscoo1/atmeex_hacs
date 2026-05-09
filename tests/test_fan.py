@@ -53,7 +53,20 @@ async def test_fan_async_set_percentage():
     await fan.async_set_percentage(75)
 
     api.set_fan_speed.assert_awaited_once_with(1, 5)
+    api.set_power.assert_not_awaited()
     coord.async_request_refresh.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_fan_async_set_percentage_turns_on_when_currently_off():
+    fan, cond, api, coord = _make_fan_entity()
+    cond["pwr_on"] = False
+
+    await fan.async_set_percentage(75)
+
+    api.set_fan_speed.assert_awaited_once_with(1, 5)
+    api.set_power.assert_awaited_once_with(1, True)
+    assert coord.async_request_refresh.await_count == 2
 
 
 
