@@ -228,12 +228,23 @@ class AtmeexClimateEntity(AtmeexEntityMixin, CoordinatorEntity, ClimateEntity):
                 )
         elif hvac_mode == HVACMode.HEAT:
             target_c = self._resolve_heat_target()
-            await self._execute_command(
-                self.api.set_power_and_heat(self._device_id, True, target_c),
-                pending_attr="pwr_on",
-                pending_value=True,
-                error_message="Failed to enter heat mode",
-            )
+            device_off = not bool(self._device_state.get("pwr_on"))
+            if device_off:
+                await self._execute_command(
+                    self.api.set_power_and_heat(self._device_id, True, target_c),
+                    pending_attr="pwr_on",
+                    pending_value=True,
+                    error_message="Failed to enter heat mode",
+                )
+            else:
+                # Device already on (e.g. fan-only -> heat): repeating the
+                # unchanged u_pwr_on in a multi-field PUT makes the device drop
+                # the u_temp_room field, so the heater never engages. Send the
+                # heater target on its own, like async_set_temperature does.
+                await self._execute_command(
+                    self.api.set_target_temperature(self._device_id, target_c),
+                    error_message="Failed to enter heat mode",
+                )
             if self._runtime is not None:
                 self._runtime.set_pending(
                     self._device_id, "u_temp_room", c_to_deci(target_c)

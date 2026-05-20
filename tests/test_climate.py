@@ -656,6 +656,26 @@ async def test_set_hvac_mode_fan_only_from_off_calls_power_and_heat_none():
     api.set_power_and_heat.assert_awaited_once_with(1, True, None)
 
 
+@pytest.mark.asyncio
+async def test_set_hvac_mode_heat_from_on_calls_set_target_temperature():
+    """HEAT when device is already on (fan-only -> heat) sends only the target.
+
+    A multi-field PUT that repeats the unchanged u_pwr_on makes the device
+    drop u_temp_room, so the heater never engages. When already on, the
+    single-field set_target_temperature path must be used instead.
+    """
+    ent, cond, api, runtime = _make_entity_with_runtime(
+        {"pwr_on": True, "u_temp_room": -1000}
+    )
+    ent._last_heat_temp = 22.0
+    await ent.async_set_hvac_mode(HVACMode.HEAT)
+    api.set_target_temperature.assert_awaited_once_with(1, 22.0)
+    api.set_power_and_heat.assert_not_awaited()
+    # u_temp_room pending must still be recorded so hvac_mode shows HEAT
+    pending = runtime.get_pending(1, "u_temp_room")
+    assert pending is not None and pending.value == 220
+
+
 def test_resolve_heat_target_prefers_current_u_temp_room():
     ent, _, _ = _make_entity({"u_temp_room": 245})
     assert ent._resolve_heat_target() == pytest.approx(24.5)
