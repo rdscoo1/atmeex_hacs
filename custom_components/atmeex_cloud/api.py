@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 import logging
 import re
 import time
 from typing import Any
-from dataclasses import dataclass, field
 from urllib.parse import quote
 
 from aiohttp import ClientSession, ClientError, ClientResponse
@@ -18,7 +21,16 @@ from .helpers import (
     normalize_device_id,
     parse_atmeex_bool,
 )
-from .const import API_BASE_URL, RETRY_MAX_DELAY_SEC, RETRY_MAX_ATTEMPTS, RETRY_BASE_DELAY_SEC, USER_AGENT
+from .const import (
+    API_AUTH_TIMEOUT_SEC,
+    API_BASE_URL,
+    API_REQUEST_TIMEOUT_SEC,
+    RETRY_BASE_DELAY_SEC,
+    RETRY_MAX_ATTEMPTS,
+    RETRY_MAX_DELAY_SEC,
+    TOKEN_REFRESH_BUFFER_SEC,
+    USER_AGENT,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -85,6 +97,54 @@ class AtmeexRateLimitError(AtmeexApiError):
 
 
 ApiError = AtmeexApiError
+
+
+def _retry_after_seconds(value: str | None) -> float | None:
+    if value is None:
+        return None
+    try:
+        return max(0.0, float(value))
+    except ValueError:
+        try:
+            parsed = parsedate_to_datetime(value)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return max(0.0, (parsed - datetime.now(timezone.utc)).total_seconds())
+
+
+def _error_for_status(
+    operation: str,
+    status: int,
+    retry_after: float | None,
+) -> AtmeexApiError:
+    if status in (401, 403):
+        return AtmeexAuthenticationError(
+            operation, "authentication rejected", status=status
+        )
+    if status == 429:
+        return AtmeexRateLimitError(
+            operation,
+            "rate limited",
+            status=status,
+            retry_after=retry_after,
+        )
+    if status >= 500:
+        return AtmeexConnectionError(
+            operation, "cloud service unavailable", status=status
+        )
+    return AtmeexProtocolError(operation, "request rejected", status=status)
+
+
+def _device_url(device_id: int | str, suffix: str = "") -> URL:
+    """Build a URL whose device identifier remains one opaque path segment."""
+    canonical_id = normalize_device_id(device_id)
+    encoded_id = quote(canonical_id, safe="").replace(".", "%2E")
+    return URL(
+        f"{API_BASE_URL}/devices/{encoded_id}{suffix}",
+        encoded=True,
+    )
 
 @dataclass(slots=True)
 class AtmeexDevice:
@@ -228,7 +288,7 @@ class AtmeexApi:
             # пока не получим ошибку авторизации
             return True
         # обновляем токен чуть заранее — за 60 секунд до истечения
-        return time.time() < self._token_expires_at - 60
+        return time.time() < self._token_expires_at - TOKEN_REFRESH_BUFFER_SEC
 
     def _has_replayable_credentials(self) -> bool:
         """True if we can re-acquire a token without user interaction.
@@ -283,82 +343,90 @@ class AtmeexApi:
             headers["Authorization"] = f"{self._token_type} {self._token}"
         return headers
 
-    async def _json(self, resp: ClientResponse) -> Any:
-        """Разобрать JSON-ответ, логично сообщив об ошибке при невалидном JSON."""
-        try:
-            return await resp.json()
-        except Exception:  # noqa: BLE001
-            raise AtmeexProtocolError(
-                "decode_json",
-                "response is not valid JSON",
-                status=resp.status,
-            )
-
-    async def _with_retries(
+    async def _consume_response(
         self,
-        coro_factory,
-        action_name: str,
+        response: ClientResponse,
+        operation: str,
         *,
-        fallback_value: Any = None,
-        use_fallback: bool = False,
+        expect_json: bool,
     ) -> Any:
-        """Выполнить coro_factory() с ограниченным числом ретраев по сетевым ошибкам.
+        retry_after = _retry_after_seconds(response.headers.get("Retry-After"))
+        if response.status >= 400:
+            await response.read()
+            raise _error_for_status(operation, response.status, retry_after)
+        if not expect_json:
+            await response.read()
+            return None
+        try:
+            return await response.json(content_type=None)
+        except (ClientError, TypeError, ValueError) as err:
+            await response.read()
+            raise AtmeexProtocolError(
+                operation,
+                "response is not valid JSON",
+                status=response.status,
+            ) from err
 
-        Повторяем только при:
-        - asyncio.TimeoutError
-        - aiohttp.ClientError
-
-        Если use_fallback=True и после всех попыток остаётся сетевая ошибка,
-        возвращаем fallback_value вместо поднятия ApiError.
-        Для HTTP-ошибок (4xx/5xx) ретраи НЕ делаем — они считаются логическими.
-        """
+    async def _call_with_get_retries(
+        self,
+        operation: str,
+        call: Callable[[], Awaitable[Any]],
+        recover_auth: Callable[[], Awaitable[None]] | None = None,
+    ) -> Any:
         delay = RETRY_BASE_DELAY_SEC
-        last_exc: Exception | None = None
-        safe_action_name = _sanitize_operation(action_name)
-
+        auth_recovered = False
         for attempt in range(1, RETRY_MAX_ATTEMPTS + 1):
             try:
-                return await coro_factory()
-            except (asyncio.TimeoutError, ClientError) as e:
-                last_exc = e
-                self._retry_count += 1
+                return await call()
+            except AtmeexAuthenticationError:
+                if (
+                    recover_auth is None
+                    or auth_recovered
+                    or attempt == RETRY_MAX_ATTEMPTS
+                ):
+                    raise
+                # Authentication recovery is not a retryable GET transport
+                # failure. Its own error must propagate, while the following
+                # GET consumes the next slot in the same three-attempt budget.
+                await recover_auth()
+                auth_recovered = True
+                continue
+            except AtmeexRateLimitError as err:
+                retryable: AtmeexApiError = err
+            except AtmeexConnectionError as err:
+                retryable = err
+            except (asyncio.TimeoutError, ClientError) as err:
+                retryable = AtmeexConnectionError(operation, "transport failed")
+                retryable.__cause__ = err
+            if attempt == RETRY_MAX_ATTEMPTS:
+                raise retryable
+            self._retry_count += 1
+            wait = (
+                retryable.retry_after
+                if isinstance(retryable, AtmeexRateLimitError)
+                and retryable.retry_after is not None
+                else delay
+            )
+            await asyncio.sleep(min(wait, RETRY_MAX_DELAY_SEC))
+            delay = min(delay * 2, RETRY_MAX_DELAY_SEC)
+        raise AtmeexConnectionError(operation, "retry budget exhausted")
 
-                if attempt >= RETRY_MAX_ATTEMPTS:
-                    if use_fallback:
-                        return fallback_value
-                    raise AtmeexConnectionError(
-                        safe_action_name, "transport failed"
-                    ) from last_exc
-
-                _LOGGER.warning(
-                    "Atmeex: %s failed on attempt %d/%d",
-                    safe_action_name,
-                    attempt,
-                    RETRY_MAX_ATTEMPTS,
-                )
-                await asyncio.sleep(delay)
-                delay = min(delay * 2, RETRY_MAX_DELAY_SEC)
-
-        if use_fallback:
-            return fallback_value
-        if last_exc:
-            raise AtmeexConnectionError(
-                safe_action_name, "transport failed"
-            ) from last_exc
-        return fallback_value
-
-    def _apply_token_response(self, data: dict) -> None:
+    def _apply_token_response(self, data: Any, operation: str) -> None:
         """Extract and store token data from an auth response."""
+        if not isinstance(data, dict):
+            raise AtmeexProtocolError(
+                operation,
+                "token response is not an object",
+            )
         token = data.get("access_token") or data.get("token")
-        token_type = data.get("token_type") or "Bearer"
-        if not token:
-            raise AtmeexProtocolError("login", "access token is missing")
+        if not isinstance(token, str) or not token:
+            raise AtmeexProtocolError(operation, "access token is missing")
         self._token = token
-        self._token_type = token_type
+        self._token_type = str(data.get("token_type") or "Bearer")
 
         # Store refresh token if provided
         rt = data.get("refresh_token")
-        if rt:
+        if isinstance(rt, str) and rt:
             self._refresh_token = rt
 
         expires_in = data.get("expires_in")
@@ -368,169 +436,151 @@ class AtmeexApi:
             self._token_expires_at = None
 
     async def _sign_in(self) -> None:
-        """Выполнить логин по уже сохранённым email/паролю и сохранить токен доступа.
-
-        Only email/password is replayable — phone_code is single-use and must
-        be supplied through ``login_phone()`` from the config flow.
-        """
         if not self._email or not self._password:
             raise AtmeexAuthenticationError(
                 "login", "email credentials are unavailable"
             )
-
-        async def _do_login():
-            async with self._session.post(
-                f"{API_BASE_URL}/auth/signin",
-                json={
-                    "grant_type": "basic",
-                    "email": self._email,
-                    "password": self._password,
-                },
-                headers=self._unauth_headers(),
-            ) as resp:
-                if resp.status >= 400:
-                    if resp.status in (401, 403):
-                        raise AtmeexAuthenticationError(
-                            "login", "authentication rejected", status=resp.status
-                        )
-                    if resp.status == 429:
-                        raise AtmeexRateLimitError(
-                            "login", "rate limited", status=resp.status
-                        )
-                    if resp.status >= 500:
-                        raise AtmeexConnectionError(
-                            "login", "cloud service unavailable", status=resp.status
-                        )
-                    raise AtmeexProtocolError(
-                        "login", "request rejected", status=resp.status
-                    )
-                data = await self._json(resp)
-                self._apply_token_response(data)
-
-        await self._with_retries(_do_login, "login")
+        data = await self._auth_post(
+            "login",
+            {
+                "grant_type": "basic",
+                "email": self._email,
+                "password": self._password,
+            },
+            expect_json=True,
+        )
+        self._apply_token_response(data, "login")
 
     async def _sign_in_phone(self) -> None:
-        """Exchange a phone + SMS code for tokens (single-use)."""
         if not self._phone or not self._phone_code:
             raise AtmeexAuthenticationError(
                 "login_phone", "phone credentials are unavailable"
             )
-
-        async def _do_login():
-            async with self._session.post(
-                f"{API_BASE_URL}/auth/signin",
-                json={
-                    "grant_type": "phone_code",
-                    "phone": self._phone,
-                    "phone_code": self._phone_code,
-                },
-                headers=self._unauth_headers(),
-            ) as resp:
-                if resp.status >= 400:
-                    if resp.status in (401, 403):
-                        raise AtmeexAuthenticationError(
-                            "login_phone",
-                            "authentication rejected",
-                            status=resp.status,
-                        )
-                    if resp.status == 429:
-                        raise AtmeexRateLimitError(
-                            "login_phone", "rate limited", status=resp.status
-                        )
-                    if resp.status >= 500:
-                        raise AtmeexConnectionError(
-                            "login_phone",
-                            "cloud service unavailable",
-                            status=resp.status,
-                        )
-                    raise AtmeexProtocolError(
-                        "login_phone", "request rejected", status=resp.status
-                    )
-                data = await self._json(resp)
-                self._apply_token_response(data)
-
-        await self._with_retries(_do_login, "login_phone")
+        data = await self._auth_post(
+            "login_phone",
+            {
+                "grant_type": "phone_code",
+                "phone": self._phone,
+                "phone_code": self._phone_code,
+            },
+            expect_json=True,
+        )
+        self._apply_token_response(data, "login_phone")
 
     async def _signin_refresh(self) -> None:
-        """Authenticate using the refresh token (cheaper than full login)."""
         if not self._refresh_token:
             raise AtmeexAuthenticationError(
                 "refresh_token", "refresh token is unavailable"
             )
-
-        async def _do_refresh():
-            async with self._session.post(
-                f"{API_BASE_URL}/auth/signin",
-                json={
-                    "grant_type": "refresh_token",
-                    "refresh_token": self._refresh_token,
-                },
-                headers=self._unauth_headers(),
-            ) as resp:
-                if resp.status >= 400:
-                    # Invalidate refresh token on auth errors
-                    self._refresh_token = None
-                    if resp.status in (401, 403):
-                        raise AtmeexAuthenticationError(
-                            "refresh_token",
-                            "authentication rejected",
-                            status=resp.status,
-                        )
-                    if resp.status == 429:
-                        raise AtmeexRateLimitError(
-                            "refresh_token", "rate limited", status=resp.status
-                        )
-                    if resp.status >= 500:
-                        raise AtmeexConnectionError(
-                            "refresh_token",
-                            "cloud service unavailable",
-                            status=resp.status,
-                        )
-                    raise AtmeexProtocolError(
-                        "refresh_token", "request rejected", status=resp.status
-                    )
-                data = await self._json(resp)
-                self._apply_token_response(data)
-
-        await self._with_retries(_do_refresh, "refresh_token")
+        data = await self._auth_post(
+            "refresh_token",
+            {
+                "grant_type": "refresh_token",
+                "refresh_token": self._refresh_token,
+            },
+            expect_json=True,
+        )
+        self._apply_token_response(data, "refresh_token")
     
+    async def _request_once(
+        self,
+        method: str,
+        path: str | URL,
+        *,
+        operation: str,
+        json_body: Any | None = None,
+        expect_json: bool,
+    ) -> Any:
+        request_url = path if isinstance(path, URL) else f"{API_BASE_URL}{path}"
+        try:
+            async with self._session.request(
+                method,
+                request_url,
+                json=json_body,
+                headers=self._headers(),
+                timeout=API_REQUEST_TIMEOUT_SEC,
+            ) as response:
+                return await self._consume_response(
+                    response,
+                    operation,
+                    expect_json=expect_json,
+                )
+        except AtmeexApiError:
+            raise
+        except (asyncio.TimeoutError, ClientError) as err:
+            raise AtmeexConnectionError(operation, "transport failed") from err
+
     async def _request(
         self,
         method: str,
         path: str | URL,
         *,
-        timeout: int = 20,
-        json: Any | None = None,
-        headers: dict[str, str] | None = None,
-    ) -> tuple[int, Any]:
-        """Запрос с токеном + 1 auto-relogin по 401/403.
-        Возвращает (status, payload), где payload = json (если <400) иначе text.
-        """
+        operation: str,
+        json_body: Any | None = None,
+        expect_json: bool = True,
+    ) -> Any:
         await self._ensure_token()
-        url = path if isinstance(path, URL) else f"{API_BASE_URL}{path}"
+        attempted_token: str | None = None
 
-        async def _do(retry_auth: bool = True) -> tuple[int, Any]:
-            req_headers = self._headers()
-            if headers:
-                req_headers.update(headers)
+        async def call() -> Any:
+            nonlocal attempted_token
+            attempted_token = self._token
+            return await self._request_once(
+                method,
+                path,
+                operation=operation,
+                json_body=json_body,
+                expect_json=expect_json,
+            )
 
-            async with self._session.request(
-                method, url, json=json, headers=req_headers, timeout=timeout
-            ) as resp:
-                if resp.status in (401, 403) and retry_auth and self._has_replayable_credentials():
-                    stale_token = self._token
-                    async with self._lock:
-                        # Another coroutine may have already refreshed the token.
-                        if self._token == stale_token:
-                            self._token_expires_at = None
-                            await self._sign_in()
-                    return await _do(retry_auth=False)
+        async def recover_auth() -> None:
+            async with self._lock:
+                if self._token == attempted_token:
+                    self._token_expires_at = None
+                    await self._sign_in()
 
-                if resp.status < 400:
-                    return resp.status, await self._json(resp)
-                return resp.status, await resp.text()
+        if method == "GET":
+            return await self._call_with_get_retries(
+                operation,
+                call,
+                recover_auth=(
+                    recover_auth
+                    if self._has_replayable_credentials()
+                    else None
+                ),
+            )
 
-        return await _do()
+        try:
+            return await call()
+        except AtmeexAuthenticationError:
+            if not self._has_replayable_credentials():
+                raise
+            await recover_auth()
+            return await call()
+
+    async def _auth_post(
+        self,
+        operation: str,
+        payload: dict[str, Any],
+        *,
+        expect_json: bool,
+    ) -> Any:
+        try:
+            async with self._session.post(
+                f"{API_BASE_URL}/auth/{'signup' if operation == 'request_sms_code' else 'signin'}",
+                json=payload,
+                headers=self._unauth_headers(),
+                timeout=API_AUTH_TIMEOUT_SEC,
+            ) as response:
+                return await self._consume_response(
+                    response,
+                    operation,
+                    expect_json=expect_json,
+                )
+        except AtmeexApiError:
+            raise
+        except (asyncio.TimeoutError, ClientError) as err:
+            raise AtmeexConnectionError(operation, "transport failed") from err
 
 
     # ---------- публичные методы ----------
@@ -546,35 +596,11 @@ class AtmeexApi:
         await self._sign_in()
 
     async def request_sms_code(self, phone: str) -> None:
-        """Ask the server to send an SMS verification code to ``phone``."""
-        async def _do():
-            async with self._session.post(
-                f"{API_BASE_URL}/auth/signup",
-                json={"grant_type": "phone_code", "phone": phone},
-                headers=self._unauth_headers(),
-            ) as resp:
-                if resp.status >= 400:
-                    if resp.status in (401, 403):
-                        raise AtmeexAuthenticationError(
-                            "request_sms_code",
-                            "authentication rejected",
-                            status=resp.status,
-                        )
-                    if resp.status == 429:
-                        raise AtmeexRateLimitError(
-                            "request_sms_code", "rate limited", status=resp.status
-                        )
-                    if resp.status >= 500:
-                        raise AtmeexConnectionError(
-                            "request_sms_code",
-                            "cloud service unavailable",
-                            status=resp.status,
-                        )
-                    raise AtmeexProtocolError(
-                        "request_sms_code", "request rejected", status=resp.status
-                    )
-
-        await self._with_retries(_do, "request_sms_code")
+        await self._auth_post(
+            "request_sms_code",
+            {"grant_type": "phone_code", "phone": phone},
+            expect_json=False,
+        )
 
     async def login_phone(self, phone: str, phone_code: str) -> None:
         """Exchange a phone + SMS code for tokens (single-use code)."""
@@ -603,128 +629,67 @@ class AtmeexApi:
         await self._signin_refresh()
 
     async def get_devices(self, fallback: bool = False) -> list[AtmeexDevice]:
-        """Получить список устройств.
-
-        Параметр fallback:
-        - False (по умолчанию): любые ошибки (HTTP/JSON/сеть) → ApiError.
-        - True: HTTP-ошибки и неожиданный формат → пустой список,
-          сетевые ошибки после всех ретраев тоже приводят к пустому списку,
-          а не к исключению.
-        """
-
-        async def _do_get():
-            status, data = await self._request("GET", "/devices", timeout=20)
-
-            if status >= 400:
-                if fallback:
-                    return []
-                if status in (401, 403):
-                    raise AtmeexAuthenticationError(
-                        "get_devices", "authentication rejected", status=status
-                    )
-                if status == 429:
-                    raise AtmeexRateLimitError(
-                        "get_devices", "rate limited", status=status
-                    )
-                if status >= 500:
-                    raise AtmeexConnectionError(
-                        "get_devices", "cloud service unavailable", status=status
-                    )
-                raise AtmeexProtocolError(
-                    "get_devices", "request rejected", status=status
-                )
-            
-            if isinstance(data, dict) and "items" in data:
-                raw_list = data["items"] if isinstance(data["items"], list) else []
-            elif isinstance(data, list):
-                raw_list = data
-            else:
-                if fallback:
-                    return []
-                raise AtmeexProtocolError(
-                    "get_devices", "unexpected collection shape"
-                )
-
-            devices: list[AtmeexDevice] = []
-            for raw in raw_list:
-                try:
-                    devices.append(AtmeexDevice.from_raw(raw))
-                except Exception:
-                    _LOGGER.debug("Failed to parse device %s", raw)
-            return devices
-
-        return await self._with_retries(_do_get, "get_devices", use_fallback=fallback, fallback_value=[])
+        try:
+            payload = await self._request(
+                "GET",
+                "/devices",
+                operation="get_devices",
+                expect_json=True,
+            )
+        except AtmeexAuthenticationError:
+            raise
+        except (AtmeexConnectionError, AtmeexRateLimitError, AtmeexProtocolError):
+            if fallback:
+                return []
+            raise
+        if isinstance(payload, list):
+            items = payload
+        elif isinstance(payload, dict) and isinstance(payload.get("items"), list):
+            items = payload["items"]
+        elif fallback:
+            return []
+        else:
+            raise AtmeexProtocolError(
+                "get_devices", "unexpected collection shape"
+            )
+        devices: list[AtmeexDevice] = []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            try:
+                devices.append(AtmeexDevice.from_raw(item))
+            except AtmeexProtocolError:
+                continue
+        return devices
 
     async def get_device(self, device_id: int | str) -> AtmeexDevice:
-        """Получить полное описание одного устройства как AtmeexDevice."""
-        async def _do_get():
-            encoded_device_id = quote(
-                normalize_device_id(device_id),
-                safe="",
-            ).replace(".", "%2E")
-            device_url = URL(
-                f"{API_BASE_URL}/devices/{encoded_device_id}",
-                encoded=True,
+        payload = await self._request(
+            "GET",
+            _device_url(device_id),
+            operation="get_device",
+            expect_json=True,
+        )
+        if not isinstance(payload, dict):
+            raise AtmeexProtocolError(
+                "get_device", "device response is not an object"
             )
-            status, data = await self._request(
-                "GET", device_url, timeout=20
-            )
-
-            if status != 200:
-                if status in (401, 403):
-                    raise AtmeexAuthenticationError(
-                        "get_device", "authentication rejected", status=status
-                    )
-                if status == 429:
-                    raise AtmeexRateLimitError(
-                        "get_device", "rate limited", status=status
-                    )
-                if status >= 500:
-                    raise AtmeexConnectionError(
-                        "get_device", "cloud service unavailable", status=status
-                    )
-                raise AtmeexProtocolError(
-                    "get_device", "request rejected", status=status
-                )
-
-            if not isinstance(data, dict):
-                raise AtmeexProtocolError(
-                    "get_device", "device response is not an object"
-                )
-
-            return AtmeexDevice.from_raw(data)
-
-        return await self._with_retries(_do_get, f"get_device({device_id})")
+        return AtmeexDevice.from_raw(payload)
 
     async def _put_params(
         self,
         device_id: int | str,
         body: dict[str, Any],
         action_name: str,
-        timeout: int = 20,
+        timeout: int = API_REQUEST_TIMEOUT_SEC,
     ) -> None:
-        """Унифицированный помощник для всех PUT-запросов изменения параметров.
-
-        Set-commands are intentionally NOT retried: the server may have already
-        applied the change before the network error, so retrying could double-fire.
-        """
-        status, data = await self._request("PUT", f"/devices/{device_id}/params", json=body, timeout=timeout)
-        if status >= 400:
-            if status in (401, 403):
-                raise AtmeexAuthenticationError(
-                    action_name, "authentication rejected", status=status
-                )
-            if status == 429:
-                raise AtmeexRateLimitError(
-                    action_name, "rate limited", status=status
-                )
-            if status >= 500:
-                raise AtmeexConnectionError(
-                    action_name, "cloud service unavailable", status=status
-                )
-            raise AtmeexProtocolError(
-                action_name, "request rejected", status=status
-            )
+        del timeout
+        await self._request(
+            "PUT",
+            _device_url(device_id, "/params"),
+            operation=action_name,
+            json_body=body,
+            expect_json=False,
+        )
 
     async def set_power(self, device_id: int | str, on: bool) -> None:
         """Установить состояние питания (вкл/выкл) через поле u_pwr_on."""

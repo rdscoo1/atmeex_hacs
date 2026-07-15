@@ -1,5 +1,6 @@
 import asyncio
 import logging
+from unittest.mock import AsyncMock
 
 import pytest
 from aiohttp import ClientError
@@ -15,6 +16,11 @@ from custom_components.atmeex_cloud.api import (
     AtmeexProtocolError,
     AtmeexRateLimitError,
     AtmeexState,
+    _retry_after_seconds,
+)
+from custom_components.atmeex_cloud.const import (
+    API_AUTH_TIMEOUT_SEC,
+    API_REQUEST_TIMEOUT_SEC,
 )
 
 
@@ -42,7 +48,7 @@ def test_api_error_remains_exact_compatibility_alias():
 
 
 @pytest.mark.asyncio
-async def test_retry_log_redacts_transport_exception_and_sanitizes_operation(
+async def test_get_retry_redacts_transport_exception_and_sanitizes_operation(
     caplog, monkeypatch
 ):
     api = AtmeexApi(FakeSession())
@@ -56,32 +62,33 @@ async def test_retry_log_redacts_transport_exception_and_sanitizes_operation(
     monkeypatch.setattr(asyncio, "sleep", no_sleep)
     with caplog.at_level(logging.WARNING, logger="custom_components.atmeex_cloud.api"):
         with pytest.raises(AtmeexConnectionError) as raised:
-            await api._with_retries(fail_request, "get devices\n")
+            await api._call_with_get_retries("get devices\n", fail_request)
 
     assert raised.value.operation == "get_devices"
     assert "household-secret-response" not in str(raised.value)
     assert "household-secret-response" not in caplog.text
-    assert "get_devices failed on attempt" in caplog.text
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("status", "error_type"),
+    ("status", "error_type", "expected_attempts"),
     [
-        (401, AtmeexAuthenticationError),
-        (403, AtmeexAuthenticationError),
-        (429, AtmeexRateLimitError),
-        (500, AtmeexConnectionError),
-        (404, AtmeexProtocolError),
+        (401, AtmeexAuthenticationError, 1),
+        (403, AtmeexAuthenticationError, 1),
+        (429, AtmeexRateLimitError, 3),
+        (500, AtmeexConnectionError, 3),
+        (404, AtmeexProtocolError, 1),
     ],
 )
 async def test_get_devices_maps_status_without_exposing_response_body(
-    status, error_type
+    status, error_type, expected_attempts, monkeypatch
 ):
     session = FakeSession()
-    session.queue_response(
-        FakeResponse(status, text_data="household-secret-response")
-    )
+    for _index in range(3):
+        session.queue_response(
+            FakeResponse(status, text_data="household-secret-response")
+        )
+    monkeypatch.setattr(asyncio, "sleep", AsyncMock())
     api = AtmeexApi(session)
     api._token = "access"
 
@@ -89,13 +96,31 @@ async def test_get_devices_maps_status_without_exposing_response_body(
         await api.get_devices()
 
     assert "household-secret-response" not in str(raised.value)
+    assert len(session.requests) == expected_attempts
+
+
+def test_retry_after_http_date_and_invalid_values():
+    assert _retry_after_seconds("Wed, 21 Oct 2099 07:28:00 GMT") > 0
+    assert _retry_after_seconds("Thu, 01 Jan 1970 00:00:00 GMT") == 0
+    assert _retry_after_seconds("not-a-date") is None
 
 
 class FakeResponse:
-    def __init__(self, status: int, json_data=None, text_data=""):
+    def __init__(
+        self,
+        status: int,
+        json_data=None,
+        text_data: str = "",
+        *,
+        headers: dict[str, str] | None = None,
+        json_error: Exception | None = None,
+    ) -> None:
         self.status = status
         self._json = json_data
-        self._text = text_data
+        self._body = text_data.encode()
+        self.headers = headers or {}
+        self._json_error = json_error
+        self.read_called = False
 
     async def __aenter__(self):
         return self
@@ -103,40 +128,209 @@ class FakeResponse:
     async def __aexit__(self, exc_type, exc, tb):
         return False
 
-    async def json(self):
+    async def json(self, *, content_type=None):
+        if self._json_error is not None:
+            raise self._json_error
         return self._json
 
-    async def text(self):
-        return self._text
+    async def read(self):
+        self.read_called = True
+        return self._body
 
 
 class FakeSession:
-    def __init__(self):
-        self.requests = []
-        self._responses = []
+    def __init__(self) -> None:
+        self.requests: list[tuple[str, str, object, dict[str, str] | None, object]] = []
+        self._responses: list[FakeResponse | Exception] = []
 
-    def queue_response(self, resp: FakeResponse):
-        self._responses.append(resp)
+    def queue_response(self, response: FakeResponse | Exception) -> None:
+        self._responses.append(response)
 
-    def _pop_response(self):
-        assert self._responses, "No queued response"
-        return self._responses.pop(0)
-
-    # Новый универсальный метод, который использует AtmeexApi через _authorized_request
     def request(self, method, url, json=None, headers=None, timeout=None):
-        self.requests.append((method, url, json, headers))
-        return self._pop_response()
+        self.requests.append((method, url, json, headers, timeout))
+        assert self._responses, "No queued response"
+        response = self._responses.pop(0)
+        if isinstance(response, Exception):
+            raise response
+        return response
 
-    # login() внутри Api использует session.post(...)
     def post(self, url, json=None, headers=None, timeout=None):
         return self.request("POST", url, json=json, headers=headers, timeout=timeout)
 
-    # На всякий случай оставляем get/put как обёртки
-    def get(self, url, headers=None, timeout=None):
-        return self.request("GET", url, json=None, headers=headers, timeout=timeout)
 
-    def put(self, url, json=None, headers=None, timeout=None):
-        return self.request("PUT", url, json=json, headers=headers, timeout=timeout)
+@pytest.mark.asyncio
+async def test_429_maps_retry_after_without_exposing_body(monkeypatch):
+    session = FakeSession()
+    responses = [
+        FakeResponse(
+            429,
+            text_data="household-secret-response",
+            headers={"Retry-After": "12"},
+        )
+        for _index in range(3)
+    ]
+    for response in responses:
+        session.queue_response(response)
+    api = AtmeexApi(session)
+    api._token = "access"
+    monkeypatch.setattr(asyncio, "sleep", AsyncMock())
+
+    with pytest.raises(AtmeexRateLimitError) as caught:
+        await api.get_device("7")
+
+    assert caught.value.status == 429
+    assert caught.value.retry_after == 12.0
+    assert "household-secret-response" not in str(caught.value)
+    assert all(response.read_called for response in responses)
+
+
+@pytest.mark.asyncio
+async def test_malformed_success_json_is_consumed_and_sanitized():
+    session = FakeSession()
+    response = FakeResponse(
+        200,
+        json_error=ValueError("household-secret-response"),
+    )
+    session.queue_response(response)
+    api = AtmeexApi(session)
+    api._token = "access"
+
+    with pytest.raises(AtmeexProtocolError) as raised:
+        await api.get_devices()
+
+    assert raised.value.operation == "get_devices"
+    assert "household-secret-response" not in str(raised.value)
+    assert response.read_called is True
+    assert len(session.requests) == 1
+
+
+@pytest.mark.asyncio
+async def test_get_transport_failure_uses_exactly_three_bounded_attempts(monkeypatch):
+    session = FakeSession()
+    session.queue_response(asyncio.TimeoutError())
+    session.queue_response(asyncio.TimeoutError())
+    session.queue_response(asyncio.TimeoutError())
+    sleep = AsyncMock()
+    monkeypatch.setattr(asyncio, "sleep", sleep)
+    api = AtmeexApi(session)
+    api._token = "access"
+
+    with pytest.raises(AtmeexConnectionError, match="get_devices"):
+        await api.get_devices()
+
+    assert len(session.requests) == 3
+    assert [call.args[0] for call in sleep.await_args_list] == [1.0, 2.0]
+    assert all(
+        request[4] == API_REQUEST_TIMEOUT_SEC
+        for request in session.requests
+    )
+
+
+@pytest.mark.asyncio
+async def test_put_204_empty_body_is_success_and_is_not_retried():
+    session = FakeSession()
+    response = FakeResponse(204)
+    session.queue_response(response)
+    api = AtmeexApi(session)
+    api._token = "access"
+
+    await api.set_power("7", True)
+
+    assert len(session.requests) == 1
+    assert response.read_called is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("device_id", "encoded_id"),
+    [
+        ("zone/a b", "zone%2Fa%20b"),
+        (".", "%2E"),
+        ("..", "%2E%2E"),
+    ],
+)
+async def test_put_preserves_opaque_device_id_segment(device_id, encoded_id):
+    session = FakeSession()
+    session.queue_response(FakeResponse(204))
+    api = AtmeexApi(session)
+    api._token = "access"
+
+    await api.set_power(device_id, True)
+
+    assert str(session.requests[0][1]).endswith(
+        f"/devices/{encoded_id}/params"
+    )
+
+
+@pytest.mark.asyncio
+async def test_sms_transport_failure_is_not_retried_and_has_timeout():
+    session = FakeSession()
+    session.queue_response(asyncio.TimeoutError())
+    api = AtmeexApi(session)
+
+    with pytest.raises(AtmeexConnectionError, match="request_sms_code"):
+        await api.request_sms_code("+79991234567")
+
+    assert len(session.requests) == 1
+    assert session.requests[0][4] == API_AUTH_TIMEOUT_SEC
+
+
+@pytest.mark.asyncio
+async def test_get_reauth_consumes_shared_three_get_attempt_budget(monkeypatch):
+    session = FakeSession()
+    session.queue_response(FakeResponse(401, text_data="expired"))
+    session.queue_response(FakeResponse(200, json_data={"access_token": "new"}))
+    for _index in range(3):
+        session.queue_response(FakeResponse(500, text_data="unavailable"))
+    monkeypatch.setattr(asyncio, "sleep", AsyncMock())
+    api = AtmeexApi(session)
+    api._token = "old"
+    api._email = "user@example.com"
+    api._password = "password"
+
+    with pytest.raises(AtmeexConnectionError) as raised:
+        await api.get_devices()
+
+    assert raised.value.operation == "get_devices"
+    assert [request[0] for request in session.requests].count("GET") == 3
+    assert [request[0] for request in session.requests].count("POST") == 1
+
+
+@pytest.mark.asyncio
+async def test_get_does_not_retry_failed_auth_recovery(monkeypatch):
+    session = FakeSession()
+    session.queue_response(FakeResponse(401, text_data="expired"))
+    session.queue_response(asyncio.TimeoutError())
+    session.queue_response(FakeResponse(200, json_data=[]))
+    sleep = AsyncMock()
+    monkeypatch.setattr(asyncio, "sleep", sleep)
+    api = AtmeexApi(session)
+    api._token = "old"
+    api._email = "user@example.com"
+    api._password = "password"
+
+    with pytest.raises(AtmeexConnectionError) as raised:
+        await api.get_devices()
+
+    assert raised.value.operation == "login"
+    assert [request[0] for request in session.requests] == ["GET", "POST"]
+    sleep.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "payload",
+    [None, [], "token", {"access_token": 7}, {"access_token": object()}],
+)
+async def test_login_rejects_malformed_success_payload(payload):
+    session = FakeSession()
+    session.queue_response(FakeResponse(200, json_data=payload))
+    api = AtmeexApi(session)
+
+    with pytest.raises(AtmeexProtocolError) as raised:
+        await api.login("user@example.com", "password")
+
+    assert raised.value.operation == "login"
 
 
 def test_device_normalization_overwrites_raw_id_and_rejects_bad_online_literal():
@@ -236,7 +430,7 @@ async def test_login_success():
     await api.login("user@example.com", "pwd")
 
     assert api._token == "token123"
-    method, url, payload, _headers = session.requests[0]
+    method, url, payload, _headers, timeout = session.requests[0]
     assert method == "POST"
     assert url == f"{API_BASE_URL}/auth/signin"
     # теперь login отправляет grant_type="basic"
@@ -247,20 +441,20 @@ async def test_login_success():
 
 @pytest.mark.asyncio
 async def test_user_agent_header_set_on_signin():
-    """Match the official mobile app's User-Agent so the server doesn't single us out."""
+    """Sign-in advertises the integration name and version."""
     session = FakeSession()
     session.queue_response(FakeResponse(200, json_data={"access_token": "t"}))
 
     api = AtmeexApi(session)
     await api.login("user@example.com", "pwd")
 
-    _method, _url, _payload, headers = session.requests[0]
-    assert headers["User-Agent"] == "okhttp/3.14.9"
+    _method, _url, _payload, headers, timeout = session.requests[0]
+    assert headers["User-Agent"] == "AtmeexCloudHomeAssistant/0.9.5"
 
 
 @pytest.mark.asyncio
 async def test_user_agent_header_set_on_authorized_requests():
-    """Authenticated GET should also carry the okhttp User-Agent."""
+    """Authenticated GET carries the integration User-Agent."""
     session = FakeSession()
     session.queue_response(FakeResponse(200, json_data=[]))
 
@@ -269,8 +463,8 @@ async def test_user_agent_header_set_on_authorized_requests():
 
     await api.get_devices()
 
-    _method, _url, _payload, headers = session.requests[0]
-    assert headers["User-Agent"] == "okhttp/3.14.9"
+    _method, _url, _payload, headers, timeout = session.requests[0]
+    assert headers["User-Agent"] == "AtmeexCloudHomeAssistant/0.9.5"
 
 
 @pytest.mark.asyncio
@@ -282,11 +476,11 @@ async def test_request_sms_code_posts_signup_with_phone_code_grant():
     api = AtmeexApi(session)
     await api.request_sms_code("+79991234567")
 
-    method, url, payload, headers = session.requests[0]
+    method, url, payload, headers, timeout = session.requests[0]
     assert method == "POST"
     assert url == f"{API_BASE_URL}/auth/signup"
     assert payload == {"grant_type": "phone_code", "phone": "+79991234567"}
-    assert headers["User-Agent"] == "okhttp/3.14.9"
+    assert headers["User-Agent"] == "AtmeexCloudHomeAssistant/0.9.5"
 
 
 @pytest.mark.asyncio
@@ -303,7 +497,7 @@ async def test_login_phone_posts_signin_with_phone_code():
     assert api._token == "tok"
     assert api.refresh_token == "rt"
 
-    method, url, payload, _headers = session.requests[0]
+    method, url, payload, _headers, timeout = session.requests[0]
     assert method == "POST"
     assert url == f"{API_BASE_URL}/auth/signin"
     assert payload == {
@@ -362,40 +556,42 @@ async def test_phone_account_does_not_replay_signin_on_401():
 
     api._sign_in = _counted_sign_in
 
-    status, _ = await api._request("GET", "/devices")
+    with pytest.raises(AtmeexAuthenticationError):
+        await api._request("GET", "/devices", operation="get_devices")
 
-    assert status == 401
     assert sign_in_called == 0
     # Only the one GET — no relogin attempt
     assert len(session.requests) == 1
 
 
 @pytest.mark.asyncio
-async def test_request_sms_code_error_raises_apierror():
-    """Server-side error on SMS request must surface as ApiError with status."""
+async def test_request_sms_code_429_raises_typed_rate_limit():
     session = FakeSession()
-    session.queue_response(FakeResponse(429, text_data="too many requests"))
-
+    session.queue_response(
+        FakeResponse(429, text_data="private-body", headers={"Retry-After": "4"})
+    )
     api = AtmeexApi(session)
 
-    with pytest.raises(ApiError) as exc:
+    with pytest.raises(AtmeexRateLimitError) as caught:
         await api.request_sms_code("+79991234567")
 
-    assert exc.value.status == 429
-    assert str(exc.value) == "request_sms_code: rate limited (status=429)"
+    assert caught.value.operation == "request_sms_code"
+    assert caught.value.status == 429
+    assert caught.value.retry_after == 4.0
+    assert len(session.requests) == 1
 
 
 @pytest.mark.asyncio
-async def test_login_error_raises_apierror():
+async def test_login_401_raises_typed_authentication_error():
     session = FakeSession()
-    session.queue_response(FakeResponse(401, text_data="unauthorized"))
-
+    session.queue_response(FakeResponse(401, text_data="private-body"))
     api = AtmeexApi(session)
 
-    with pytest.raises(ApiError) as exc:
+    with pytest.raises(AtmeexAuthenticationError) as caught:
         await api.login("user@example.com", "wrong")
 
-    assert str(exc.value) == "login: authentication rejected (status=401)"
+    assert caught.value.operation == "login"
+    assert caught.value.status == 401
 
 
 @pytest.mark.asyncio
@@ -414,48 +610,38 @@ async def test_get_devices_success():
     assert dev.id == 1
     assert dev.raw["id"] == 1  # если хочется проверить "сырой" dict
 
-    method, url, _payload, headers = session.requests[0]
+    method, url, _payload, headers, timeout = session.requests[0]
     assert method == "GET"
     assert url == f"{API_BASE_URL}/devices"
     assert headers["Authorization"] == "Bearer t"
 
 
 @pytest.mark.asyncio
-async def test_get_devices_error_no_fallback():
+async def test_get_devices_500_retries_without_relogin(monkeypatch):
     session = FakeSession()
-    session.queue_response(FakeResponse(500, text_data="error"))
-
+    for _index in range(3):
+        session.queue_response(FakeResponse(500, text_data="private-body"))
+    monkeypatch.setattr(asyncio, "sleep", AsyncMock())
     api = AtmeexApi(session)
-    api._token = "t"  # чтобы не упереться в "credentials not set"
-
-    with pytest.raises(ApiError) as exc:
-        await api.get_devices()
-
-    assert str(exc.value) == "get_devices: cloud service unavailable (status=500)"
-
-
-@pytest.mark.asyncio
-async def test_get_devices_500_does_not_trigger_relogin():
-    session = FakeSession()
-    session.queue_response(FakeResponse(500, text_data="server error"))
-
-    api = AtmeexApi(session)
-    api._token = "t"
+    api._token = "access"
     api._email = "user@example.com"
-    api._password = "pwd"
+    api._password = "password"
 
-    with pytest.raises(ApiError) as exc:
+    with pytest.raises(AtmeexConnectionError) as caught:
         await api.get_devices()
 
-    assert str(exc.value) == "get_devices: cloud service unavailable (status=500)"
-    assert len(session.requests) == 1
-    assert session.requests[0][0] == "GET"
+    assert caught.value.operation == "get_devices"
+    assert caught.value.status == 500
+    assert len(session.requests) == 3
+    assert all(request[0] == "GET" for request in session.requests)
 
 
 @pytest.mark.asyncio
-async def test_get_devices_error_with_fallback_returns_empty_list():
+async def test_get_devices_error_with_fallback_returns_empty_list(monkeypatch):
     session = FakeSession()
-    session.queue_response(FakeResponse(500, text_data="error"))
+    for _index in range(3):
+        session.queue_response(FakeResponse(500, text_data="error"))
+    monkeypatch.setattr(asyncio, "sleep", AsyncMock())
 
     api = AtmeexApi(session)
     api._token = "t"
@@ -477,7 +663,7 @@ async def test_get_device_success():
     assert dev.id == 1
     assert dev.raw["id"] == 1
 
-    method, url, _payload, headers = session.requests[0]
+    method, url, _payload, headers, timeout = session.requests[0]
     assert method == "GET"
     assert str(url) == f"{API_BASE_URL}/devices/1"
     assert headers["Authorization"] == "Bearer t"
@@ -523,22 +709,23 @@ async def test_setters_success(method_name, ha_value, expected_body):
 
     req = session.requests[0]
     assert req[0] == "PUT"
-    assert req[1].startswith(f"{API_BASE_URL}/devices/1/params")
+    assert str(req[1]).startswith(f"{API_BASE_URL}/devices/1/params")
     assert req[2] == expected_body
 
 
 @pytest.mark.asyncio
-async def test_setter_error_raises():
+async def test_setter_500_raises_without_retry():
     session = FakeSession()
-    session.queue_response(FakeResponse(500))
-
+    session.queue_response(FakeResponse(500, text_data="private-body"))
     api = AtmeexApi(session)
-    api._token = "t"
+    api._token = "access"
 
-    with pytest.raises(ApiError) as exc:
-        await api.set_power(1, True)
+    with pytest.raises(AtmeexConnectionError) as caught:
+        await api.set_power("1", True)
 
-    assert str(exc.value) == "set_power: cloud service unavailable (status=500)"
+    assert caught.value.operation == "set_power"
+    assert caught.value.status == 500
+    assert len(session.requests) == 1
 
 
 @pytest.mark.asyncio
@@ -623,7 +810,12 @@ async def test_concurrent_401_sign_in_called_once():
     api._sign_in = _counted_sign_in
 
     # Fire 5 concurrent GET /devices calls — all will see 401 with old token
-    tasks = [asyncio.create_task(api._request("GET", "/devices")) for _ in range(5)]
+    tasks = [
+        asyncio.create_task(
+            api._request("GET", "/devices", operation="get_devices")
+        )
+        for _ in range(5)
+    ]
     results = await asyncio.gather(*tasks, return_exceptions=True)
 
     # All requests should ultimately succeed (200 with new token)
@@ -662,11 +854,12 @@ async def test_set_breezer_mode_body(mode, expected_body):
 
 
 @pytest.mark.asyncio
-async def test_set_breezer_mode_invalid_raises():
+async def test_set_breezer_mode_invalid_raises_protocol_error():
     api = AtmeexApi(FakeSession())
-    api._token = "t"
-    with pytest.raises(ApiError, match="invalid mode"):
-        await api.set_breezer_mode(1, 4)
+    api._token = "access"
+
+    with pytest.raises(AtmeexProtocolError, match="set_breezer_mode"):
+        await api.set_breezer_mode("1", 4)
 
 
 # ---------------------------------------------------------------------------

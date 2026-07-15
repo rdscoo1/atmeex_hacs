@@ -10,13 +10,13 @@ BREEZER_MODES = [
 HUMIDIFICATION_OPTIONS = ["off", "1", "2", "3"]
 
 API_BASE_URL = "https://api.iot.atmeex.com"
-# Match the official Atmeex mobile app's User-Agent so the cloud doesn't
-# single us out as a non-native client. atmeexpy uses the same value.
-USER_AGENT = "okhttp/3.14.9"
-API_TIMEOUT_DEFAULT = 20
+INTEGRATION_VERSION = "0.9.5"
+USER_AGENT = f"AtmeexCloudHomeAssistant/{INTEGRATION_VERSION}"
+API_REQUEST_TIMEOUT_SEC = 20
+API_AUTH_TIMEOUT_SEC = 20
 RETRY_MAX_ATTEMPTS = 3
 RETRY_BASE_DELAY_SEC = 1.0
-RETRY_MAX_DELAY_SEC = 32.0  # CAP exponential backoff!
+RETRY_MAX_DELAY_SEC = 8.0
 TOKEN_REFRESH_BUFFER_SEC = 60
 
 # Logbook event types (shared between __init__ and logbook modules)
