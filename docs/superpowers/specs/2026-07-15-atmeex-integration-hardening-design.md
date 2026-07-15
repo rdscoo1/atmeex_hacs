@@ -109,7 +109,7 @@ Delegates commands to `AtmeexCommandExecutor`, combines coordinator availability
 
 #### Configuration and support modules
 
-`config_flow.py` uses the compatibility layer and real flow-manager semantics. `diagnostics.py` exports an explicit safe schema. `logbook.py` retains event identifiers while filtering routine technical updates. The manifest, translations, services, README files, HACS metadata, and CI workflows document and enforce the final contract.
+`config_flow.py` uses the compatibility layer and real flow-manager semantics. `diagnostics.py` exports an explicit safe schema. Routine device-update events remain on the Home Assistant bus for automations but are not registered as logbook-described events; meaningful recovery transitions add one explicit privacy-safe logbook entry. The manifest, translations, services, README files, HACS metadata, and CI workflows document and enforce the final contract.
 
 ## State convergence design
 
@@ -312,7 +312,7 @@ A reconfigure flow allows proactive email/password or phone/SMS credential repla
 
 ### Services and platform behavior
 
-Existing `set_breezer_mode` and `set_humidifier_stage` service names, target selectors, fields, and accepted values remain intact. They register once from integration `async_setup` and route to the existing entity behavior through supported Home Assistant service helpers. Native entity actions continue to work.
+Existing `set_breezer_mode` and `set_humidifier_stage` service names, target selectors, fields, and accepted values remain intact. They register once through Home Assistant's supported `EntityPlatform.async_register_entity_service` helper. That helper preserves target permissions, call context, entity serialization, feature/availability filtering, and polling behavior; integration code does not manually extract targets or call entity methods. Native entity actions continue to work.
 
 All platforms define an explicit `PARALLEL_UPDATES`. Command platforms use `0` because the integration owns per-device serialization; coordinator-only platforms also use `0` because they perform no direct polling calls.
 
