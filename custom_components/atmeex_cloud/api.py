@@ -340,6 +340,10 @@ class AtmeexApi:
     def refresh_token(self) -> str | None:
         return self._refresh_token
 
+    def restore_refresh_token(self, refresh_token: str) -> None:
+        """Seed a refresh token persisted on the config entry."""
+        self._refresh_token = refresh_token
+
     @property
     def retry_count(self) -> int:
         """Return the cumulative count of bounded HTTP retry attempts."""
@@ -742,30 +746,24 @@ class AtmeexApi:
             )
         await self._signin_refresh()
 
-    async def get_devices(self, fallback: bool = False) -> list[AtmeexDevice]:
-        try:
-            payload = await self._request(
-                "GET",
-                "/devices",
-                operation="get_devices",
-                expect_json=True,
-            )
-        except AtmeexAuthenticationError:
-            raise
-        except (AtmeexConnectionError, AtmeexRateLimitError, AtmeexProtocolError):
-            if fallback:
-                return []
-            raise
+    async def get_devices(self) -> list[AtmeexDevice]:
+        payload = await self._request(
+            "GET",
+            "/devices",
+            operation="get_devices",
+            expect_json=True,
+        )
         if isinstance(payload, list):
             items = payload
         elif isinstance(payload, dict) and isinstance(payload.get("items"), list):
             items = payload["items"]
-        elif fallback:
-            return []
         else:
             raise AtmeexProtocolError(
                 "get_devices", "unexpected collection shape"
             )
+        if not items:
+            return []
+
         devices: list[AtmeexDevice] = []
         for item in items:
             if not isinstance(item, dict):
@@ -774,9 +772,15 @@ class AtmeexApi:
                 devices.append(AtmeexDevice.from_raw(item))
             except AtmeexProtocolError:
                 continue
+        if not devices:
+            raise AtmeexProtocolError(
+                "get_devices",
+                "non-empty collection has no valid device items",
+            )
         return devices
 
     async def get_device(self, device_id: int | str) -> AtmeexDevice:
+        canonical_id = normalize_device_id(device_id)
         payload = await self._request(
             "GET",
             _device_url(device_id),
@@ -787,7 +791,12 @@ class AtmeexApi:
             raise AtmeexProtocolError(
                 "get_device", "device response is not an object"
             )
-        return AtmeexDevice.from_raw(payload)
+        device = AtmeexDevice.from_raw(payload)
+        if normalize_device_id(device.id) != canonical_id:
+            raise AtmeexProtocolError(
+                "get_device", "device id does not match request"
+            )
+        return device
 
     async def _put_params(
         self,

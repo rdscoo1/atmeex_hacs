@@ -13,7 +13,9 @@ from tests.conftest import DummyCoordinator
 class FakeApi:
     """Фейковый API для проверки refresh_device без реального HA."""
 
-    def __init__(self, session):
+    def __init__(self, session, *, on_refresh_token_changed=None):
+        self.session = session
+        self.on_refresh_token_changed = on_refresh_token_changed
         # начальное состояние: устройство включено
         dev_initial_raw = {
             "id": 1,

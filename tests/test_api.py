@@ -456,6 +456,29 @@ async def test_get_device_preserves_opaque_dot_segment_id(device_id, encoded_id)
 
 
 @pytest.mark.asyncio
+async def test_get_device_rejects_response_for_a_different_canonical_id():
+    session = FakeSession()
+    session.queue_response(
+        FakeResponse(200, json_data={"id": "8", "condition": {}, "settings": {}})
+    )
+    api = AtmeexApi(session)
+    api._token = "access"
+
+    with pytest.raises(AtmeexProtocolError, match="device id does not match request"):
+        await api.get_device("0007")
+
+    assert str(session.requests[0][1]).endswith("/devices/7")
+
+
+def test_restore_refresh_token_seeds_persisted_value():
+    api = AtmeexApi(FakeSession())
+
+    api.restore_refresh_token("persisted-refresh")
+
+    assert api.refresh_token == "persisted-refresh"
+
+
+@pytest.mark.asyncio
 async def test_login_success():
     session = FakeSession()
     # token_type не обязателен, но добавим для реалистичности
@@ -994,17 +1017,41 @@ async def test_get_devices_500_retries_without_relogin(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_get_devices_error_with_fallback_returns_empty_list(monkeypatch):
+@pytest.mark.parametrize("payload", [[], {"items": []}])
+async def test_empty_inventory_is_valid_authoritative_success(payload):
     session = FakeSession()
-    for _index in range(3):
-        session.queue_response(FakeResponse(500, text_data="error"))
-    monkeypatch.setattr(asyncio, "sleep", AsyncMock())
-
+    session.queue_response(FakeResponse(200, json_data=payload))
     api = AtmeexApi(session)
-    api._token = "t"
+    api._token = "access"
 
-    result = await api.get_devices(fallback=True)
-    assert result == []  # HTTP-ошибка в fallback-режиме → пустой список
+    assert await api.get_devices() == []
+    assert len(session.requests) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "payload",
+    [{}, {"items": {}}, {"devices": []}, "not-a-collection", None],
+)
+async def test_malformed_inventory_shape_is_protocol_failure(payload):
+    session = FakeSession()
+    session.queue_response(FakeResponse(200, json_data=payload))
+    api = AtmeexApi(session)
+    api._token = "access"
+
+    with pytest.raises(AtmeexProtocolError, match="get_devices"):
+        await api.get_devices()
+
+
+@pytest.mark.asyncio
+async def test_nonempty_all_invalid_inventory_is_protocol_failure():
+    session = FakeSession()
+    session.queue_response(FakeResponse(200, json_data=[{"name": "missing-id"}, 7]))
+    api = AtmeexApi(session)
+    api._token = "access"
+
+    with pytest.raises(AtmeexProtocolError, match="no valid device items"):
+        await api.get_devices()
 
 
 @pytest.mark.asyncio

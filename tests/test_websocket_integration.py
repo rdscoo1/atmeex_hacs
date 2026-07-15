@@ -44,8 +44,9 @@ async def test_websocket_batch_message_updates_coordinator_once(monkeypatch):
             raise AssertionError("ws_connect must not be called in this test")
 
     class FakeApi:
-        def __init__(self, session):
+        def __init__(self, session, *, on_refresh_token_changed=None):
             self.session = session
+            self.on_refresh_token_changed = on_refresh_token_changed
             self.async_init = AsyncMock()
             self.refresh_token = None
             self.login = AsyncMock()
@@ -191,7 +192,9 @@ async def test_setup_entry_websocket_auth_failure_starts_reauth(monkeypatch):
             raise AssertionError("ws_connect should not be called")
 
     class FakeApi:
-        def __init__(self, _session):
+        def __init__(self, _session, *, on_refresh_token_changed=None):
+            self.session = _session
+            self.on_refresh_token_changed = on_refresh_token_changed
             self.async_init = AsyncMock()
             self.refresh_token = None
             self.login = AsyncMock()
@@ -302,7 +305,9 @@ async def test_ws_reauth_can_trigger_again_after_successful_reconnect(monkeypatc
             raise AssertionError("ws_connect should not be called")
 
     class FakeApi:
-        def __init__(self, _session):
+        def __init__(self, _session, *, on_refresh_token_changed=None):
+            self.session = _session
+            self.on_refresh_token_changed = on_refresh_token_changed
             self.async_init = AsyncMock()
             self.refresh_token = None
             self.login = AsyncMock()
@@ -429,7 +434,9 @@ async def test_websocket_settings_message_updates_state(monkeypatch):
             raise AssertionError("ws_connect should not be called")
 
     class FakeApi:
-        def __init__(self, _session):
+        def __init__(self, _session, *, on_refresh_token_changed=None):
+            self.session = _session
+            self.on_refresh_token_changed = on_refresh_token_changed
             self.async_init = AsyncMock()
             self.refresh_token = None
             self.login = AsyncMock()
@@ -568,7 +575,9 @@ async def test_websocket_logbook_device_events_are_throttled(monkeypatch):
             raise AssertionError("ws_connect should not be called")
 
     class FakeApi:
-        def __init__(self, _session):
+        def __init__(self, _session, *, on_refresh_token_changed=None):
+            self.session = _session
+            self.on_refresh_token_changed = on_refresh_token_changed
             self.async_init = AsyncMock()
             self.refresh_token = None
             self.login = AsyncMock()
@@ -707,7 +716,9 @@ async def _build_ws_runtime(monkeypatch, *, initial_condition=None):
     )
 
     class _FakeApi:
-        def __init__(self, _s):
+        def __init__(self, _s, *, on_refresh_token_changed=None):
+            self.session = _s
+            self.on_refresh_token_changed = on_refresh_token_changed
             self.async_init = AsyncMock()
             self.refresh_token = None
             self.login = AsyncMock()
@@ -919,8 +930,9 @@ async def test_refresh_device_coalesces_parallel_requests(monkeypatch):
     created_apis = []
 
     class FakeApi:
-        def __init__(self, session):
+        def __init__(self, session, *, on_refresh_token_changed=None):
             self.session = session
+            self.on_refresh_token_changed = on_refresh_token_changed
             self.async_init = AsyncMock()
             self.refresh_token = None
             self.login = AsyncMock()
@@ -1030,7 +1042,9 @@ async def test_refresh_device_hung_task_times_out_for_second_caller(monkeypatch)
     task_started = asyncio.Event()  # signals that the explicit refresh task reached gate.wait()
 
     class FakeApi:
-        def __init__(self, session):
+        def __init__(self, session, *, on_refresh_token_changed=None):
+            self.session = session
+            self.on_refresh_token_changed = on_refresh_token_changed
             self.async_init = AsyncMock()
             self.refresh_token = None
             self.login = AsyncMock()

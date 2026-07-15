@@ -1,14 +1,21 @@
 """Unit tests for AtmeexCoordinator._async_update_data."""
-import asyncio
 import logging
 import time
 
-import aiohttp
 import pytest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
-from custom_components.atmeex_cloud.api import AtmeexDevice, ApiError
+from homeassistant.exceptions import ConfigEntryAuthFailed
+from homeassistant.helpers.update_coordinator import UpdateFailed
+
+from custom_components.atmeex_cloud.api import (
+    AtmeexAuthenticationError,
+    AtmeexConnectionError,
+    AtmeexDevice,
+    AtmeexProtocolError,
+    AtmeexRateLimitError,
+)
 from custom_components.atmeex_cloud.const import EVENT_API_ERROR, WS_LOGBOOK_MIN_INTERVAL_SEC
 from custom_components.atmeex_cloud.coordinator import AtmeexCoordinator
 
@@ -51,20 +58,6 @@ async def test_update_data_builds_states():
 
 
 @pytest.mark.asyncio
-async def test_update_data_raises_auth_failed_on_401():
-    """ApiError(401) from get_devices should propagate as ConfigEntryAuthFailed."""
-    coord, api = _make_coordinator()
-    api.get_devices = AsyncMock(
-        side_effect=ApiError("test_coordinator", "unauthorized", status=401)
-    )
-
-    from homeassistant.exceptions import ConfigEntryAuthFailed
-    with pytest.raises(ConfigEntryAuthFailed):
-        await coord._async_update_data()
-    assert isinstance(coord.last_api_error, ApiError)
-
-
-@pytest.mark.asyncio
 async def test_update_data_preserves_offline_devices():
     """Devices from previous poll that disappear from API should be preserved."""
     dev1_raw = {"id": 1, "name": "Dev1", "model": "m", "online": True,
@@ -92,17 +85,40 @@ async def test_update_data_preserves_offline_devices():
 
 
 @pytest.mark.asyncio
-async def test_fetch_devices_primary_network_error_falls_back():
-    """asyncio.TimeoutError on the primary get_devices call must be caught and
-    fall through to the fallback path — not propagate as an unhandled exception.
-    """
-    coord, api = _make_coordinator()
-    api.get_devices = AsyncMock(side_effect=asyncio.TimeoutError())
-    api.get_device = AsyncMock(side_effect=asyncio.TimeoutError())
+async def test_fetch_devices_uses_one_authoritative_inventory_call():
+    coord, api = _make_coordinator(devices=[])
 
-    # Both primary and fallback time out → empty list (no devices)
-    devices = await coord._fetch_devices_safely()
-    assert devices == []
+    assert await coord._fetch_devices_safely() == []
+    api.get_devices.assert_awaited_once_with()
+    api.get_device.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "error_type",
+    [AtmeexConnectionError, AtmeexRateLimitError, AtmeexProtocolError],
+)
+async def test_update_data_maps_transient_typed_errors_to_update_failed(error_type):
+    coord, api = _make_coordinator()
+    api.get_devices = AsyncMock(side_effect=error_type("get_devices", "failed"))
+
+    with pytest.raises(UpdateFailed, match="Atmeex API update failed"):
+        await coord._async_update_data()
+
+
+@pytest.mark.asyncio
+async def test_update_data_maps_typed_auth_error_to_config_entry_auth_failed():
+    coord, api = _make_coordinator()
+    api.get_devices = AsyncMock(
+        side_effect=AtmeexAuthenticationError(
+            "get_devices",
+            "authentication rejected",
+            status=401,
+        )
+    )
+
+    with pytest.raises(ConfigEntryAuthFailed, match="Atmeex authentication failed"):
+        await coord._async_update_data()
 
 
 @pytest.mark.asyncio

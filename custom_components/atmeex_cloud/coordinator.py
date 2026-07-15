@@ -1,17 +1,24 @@
 """DataUpdateCoordinator subclass for Atmeex Cloud integration."""
 from __future__ import annotations
 
-import asyncio
 import logging
 import time
 from typing import Any, Callable, TypedDict
 
-import aiohttp
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import ConfigEntryAuthFailed
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
-from .api import ApiError, AtmeexApi, AtmeexDevice, AtmeexState
+from .api import (
+    ApiError,
+    AtmeexApi,
+    AtmeexAuthenticationError,
+    AtmeexConnectionError,
+    AtmeexDevice,
+    AtmeexProtocolError,
+    AtmeexRateLimitError,
+    AtmeexState,
+)
 from .const import EVENT_API_ERROR, WS_LOGBOOK_MIN_INTERVAL_SEC
 
 _LOGGER = logging.getLogger(__name__)
@@ -84,65 +91,25 @@ class AtmeexCoordinator(DataUpdateCoordinator[AtmeexCoordinatorData]):
         self._api_error_last_ts = now
 
     async def _fetch_devices_safely(self) -> list[AtmeexDevice]:
-        """Получить список устройств с fallback и дочитыванием по id
-
-        Важные моменты:
-        * 401/403 не скрываем — они должны привести к re-auth;
-        * сетевые/прочие ошибки → пытаемся fallback=True;
-        * для каждого устройства по возможности вызываем get_device(id),
-          но auth-ошибки опять же не глотаем.
-        """
+        """Fetch one authoritative inventory and hydrate each listed device."""
         api = self._api
-        devices: list[AtmeexDevice] = []
-
-        # 1. Основной вызов без fallback
-        try:
-            primary = await api.get_devices(fallback=False)
-            if isinstance(primary, list) and primary:
-                devices = primary
-        except ApiError as err:
-            status = getattr(err, "status", None)
-            if status in (401, 403):
-                raise
-            _LOGGER.debug("Primary get_devices failed: %s", err)
-        except (asyncio.TimeoutError, aiohttp.ClientError) as err:
-            _LOGGER.debug("Unexpected error in primary get_devices: %s", err)
-
-        # 2. Если ничего не получили — пробуем fallback=True
-        if not devices:
-            try:
-                fb = await api.get_devices(fallback=True)
-                if isinstance(fb, list):
-                    devices = fb
-            except ApiError as err:
-                if getattr(err, "status", None) in (401, 403):
-                    raise
-                _LOGGER.warning("Fallback get_devices failed: %s", err)
-                devices = []
-            except (asyncio.TimeoutError, aiohttp.ClientError) as err:
-                _LOGGER.warning("Fallback get_devices network error: %s", err)
-                devices = []
-            except Exception as err:
-                _LOGGER.exception("Unexpected error in fallback get_devices: %s", err)
-                devices = []
-
-        # 3. Дочитываем по одному устройству
+        if api is None:
+            raise AtmeexProtocolError(
+                "get_devices", "coordinator API is not configured"
+            )
+        devices = await api.get_devices()
         hydrated: list[AtmeexDevice] = []
-        for dev in devices:
-            did = dev.id
+        for device in devices:
             try:
-                full = await api.get_device(did)
-                hydrated.append(full)
-            except ApiError as err:
-                status = getattr(err, "status", None)
-                if status in (401, 403):
-                    raise
-                _LOGGER.debug("get_device(%s) failed: %s", did, err)
-                hydrated.append(dev)
-            except Exception as err:  # noqa: BLE001
-                _LOGGER.debug(
-                    "Unexpected error in get_device(%s): %s", did, err)
-                hydrated.append(dev)
+                hydrated.append(await api.get_device(device.id))
+            except AtmeexAuthenticationError:
+                raise
+            except (
+                AtmeexConnectionError,
+                AtmeexRateLimitError,
+                AtmeexProtocolError,
+            ):
+                hydrated.append(device)
 
         return hydrated
 
@@ -155,23 +122,30 @@ class AtmeexCoordinator(DataUpdateCoordinator[AtmeexCoordinatorData]):
         start_ts = time.perf_counter()
         try:
             device_objs = await self._fetch_devices_safely()
-        except ApiError as err:
+        except AtmeexAuthenticationError as err:
             self.last_api_error = err
-            status = getattr(err, "status", None)
             self._fire_api_error_event(
                 {
                     "message": str(err),
-                    "status": status,
+                    "status": err.status,
                     "source": "coordinator_update",
                 }
             )
-            if status in (401, 403):
-                raise ConfigEntryAuthFailed(
-                    f"Authentication with Atmeex failed during update: {err}"
-                ) from err
-            raise UpdateFailed(
-                f"Error communicating with Atmeex API: {err}"
-            ) from err
+            raise ConfigEntryAuthFailed("Atmeex authentication failed") from err
+        except (
+            AtmeexConnectionError,
+            AtmeexRateLimitError,
+            AtmeexProtocolError,
+        ) as err:
+            self.last_api_error = err
+            self._fire_api_error_event(
+                {
+                    "message": str(err),
+                    "status": err.status,
+                    "source": "coordinator_update",
+                }
+            )
+            raise UpdateFailed("Atmeex API update failed") from err
         except Exception as err:
             self.last_api_error = None
             self._fire_api_error_event(

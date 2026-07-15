@@ -14,7 +14,16 @@ from homeassistant.helpers.device_registry import DeviceEntry
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.const import CONF_EMAIL, CONF_PASSWORD
 
-from .api import AtmeexApi, ApiError, AtmeexDevice, AtmeexState
+from .api import (
+    ApiError,
+    AtmeexApi,
+    AtmeexAuthenticationError,
+    AtmeexConnectionError,
+    AtmeexDevice,
+    AtmeexProtocolError,
+    AtmeexRateLimitError,
+    AtmeexState,
+)
 from .coordinator import AtmeexCoordinator, AtmeexCoordinatorData
 from .const import (
     DOMAIN,
@@ -76,13 +85,26 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     # Default to email for entries created before phone login was supported.
     auth_method = entry.data.get(CONF_AUTH_METHOD, AUTH_METHOD_EMAIL)
 
-    api = AtmeexApi(session)
+    stored_refresh_token = entry.data.get("refresh_token")
+
+    def _persist_refresh_token(refresh_token: str) -> None:
+        if entry.data.get("refresh_token") == refresh_token:
+            return
+        new_data = {**entry.data, "refresh_token": refresh_token}
+        try:
+            hass.config_entries.async_update_entry(entry, data=new_data)
+        except Exception:
+            _LOGGER.warning("Failed to persist rotated Atmeex refresh token")
+
+    api = AtmeexApi(
+        session,
+        on_refresh_token_changed=_persist_refresh_token,
+    )
     await api.async_init()
 
     # Restore refresh token from previous session if available.
-    stored_refresh_token = entry.data.get("refresh_token")
     if stored_refresh_token:
-        api._refresh_token = stored_refresh_token
+        api.restore_refresh_token(stored_refresh_token)
 
     try:
         if auth_method == AUTH_METHOD_PHONE:
@@ -101,23 +123,14 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                     "Email account is missing credentials in config entry"
                 )
             await api.login(email, password)
-    except ApiError as err:
-        status = getattr(err, "status", None)
-        if status in (401, 403):
-            raise ConfigEntryAuthFailed(
-                f"Invalid Atmeex credentials: {err}"
-            ) from err
-        raise ConfigEntryNotReady(
-            f"Cannot connect to Atmeex Cloud: {err}"
-        ) from err
-
-    # Persist refresh token if the API returned one
-    if api.refresh_token and api.refresh_token != stored_refresh_token:
-        new_data = {**entry.data, "refresh_token": api.refresh_token}
-        try:
-            hass.config_entries.async_update_entry(entry, data=new_data)
-        except Exception as err:  # noqa: BLE001
-            _LOGGER.warning("Failed to persist new refresh token: %s", err)
+    except AtmeexAuthenticationError as err:
+        raise ConfigEntryAuthFailed("Atmeex authentication failed") from err
+    except (
+        AtmeexConnectionError,
+        AtmeexRateLimitError,
+        AtmeexProtocolError,
+    ) as err:
+        raise ConfigEntryNotReady("Cannot connect to Atmeex Cloud") from err
 
     options = getattr(entry, "options", {}) or {}
     update_interval_seconds = _resolve_update_interval_seconds(options)
@@ -132,8 +145,18 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     coordinator: AtmeexCoordinator
 
-    async def _update_listener(hass: HomeAssistant, entry: ConfigEntry) -> None:
-        await hass.config_entries.async_reload(entry.entry_id)
+    options_snapshot = dict(entry.options)
+
+    async def _update_listener(
+        hass: HomeAssistant,
+        updated_entry: ConfigEntry,
+    ) -> None:
+        nonlocal options_snapshot
+        current_options = dict(updated_entry.options)
+        if current_options == options_snapshot:
+            return
+        options_snapshot = current_options
+        await hass.config_entries.async_reload(updated_entry.entry_id)
 
     coordinator = AtmeexCoordinator(
         hass,
