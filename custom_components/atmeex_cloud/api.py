@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import time
 from typing import Any
 from dataclasses import dataclass, field
@@ -14,12 +15,68 @@ from .const import API_BASE_URL, RETRY_MAX_DELAY_SEC, RETRY_MAX_ATTEMPTS, RETRY_
 _LOGGER = logging.getLogger(__name__)
 
 
-class ApiError(Exception):
-    """Обёртка для всех ошибок работы с облачным API Atmeex."""
+_OPERATION_CHARS = re.compile(r"[^a-zA-Z0-9_.:/()-]+")
 
-    def __init__(self, message: str, *, status: int | None = None) -> None:
-        super().__init__(message)
+
+def _sanitize_operation(operation: str) -> str:
+    """Return a bounded log-safe operation label."""
+    sanitized = _OPERATION_CHARS.sub("_", str(operation)).strip("_")
+    return sanitized[:80] or "atmeex_request"
+
+
+class AtmeexApiError(Exception):
+    """Base class for sanitized Atmeex API failures."""
+
+    def __init__(
+        self,
+        operation: str,
+        message: str,
+        *,
+        status: int | None = None,
+    ) -> None:
+        self.operation = _sanitize_operation(operation)
         self.status = status
+        suffix = f" (status={status})" if status is not None else ""
+        super().__init__(f"{self.operation}: {message}{suffix}")
+
+
+class AtmeexAuthenticationError(AtmeexApiError):
+    """Credentials are absent, invalid, or exhausted."""
+
+
+class AtmeexConnectionError(AtmeexApiError):
+    """The request could not obtain an authoritative cloud response."""
+
+
+class AtmeexProtocolError(AtmeexApiError):
+    """The cloud response violates the documented payload contract."""
+
+
+class AtmeexRateLimitError(AtmeexApiError):
+    """The cloud asked the caller to reduce request rate."""
+
+    def __init__(
+        self,
+        operation: str,
+        message: str,
+        *,
+        status: int | None = None,
+        retry_after: float | None = None,
+    ) -> None:
+        self.retry_after = retry_after
+        safe_operation = _sanitize_operation(operation)
+        suffix_parts: list[str] = []
+        if status is not None:
+            suffix_parts.append(f"status={status}")
+        if retry_after is not None:
+            suffix_parts.append(f"retry_after={retry_after:g}s")
+        suffix = f" ({', '.join(suffix_parts)})" if suffix_parts else ""
+        self.operation = safe_operation
+        self.status = status
+        Exception.__init__(self, f"{safe_operation}: {message}{suffix}")
+
+
+ApiError = AtmeexApiError
 
 @dataclass(slots=True)
 class AtmeexDevice:
@@ -174,7 +231,9 @@ class AtmeexApi:
                     _LOGGER.debug("Refresh token failed, falling back to basic login")
 
             if not self._has_replayable_credentials():
-                raise ApiError("login: credentials not set")
+                raise AtmeexAuthenticationError(
+                    "ensure_token", "credentials are unavailable"
+                )
 
             await self._sign_in()
 
@@ -199,8 +258,11 @@ class AtmeexApi:
         try:
             return await resp.json()
         except Exception:  # noqa: BLE001
-            text = await resp.text()
-            raise ApiError(f"Bad JSON from API ({resp.status}): {text[:200]}")
+            raise AtmeexProtocolError(
+                "decode_json",
+                "response is not valid JSON",
+                status=resp.status,
+            )
 
     async def _with_retries(
         self,
@@ -222,6 +284,7 @@ class AtmeexApi:
         """
         delay = RETRY_BASE_DELAY_SEC
         last_exc: Exception | None = None
+        safe_action_name = _sanitize_operation(action_name)
 
         for attempt in range(1, RETRY_MAX_ATTEMPTS + 1):
             try:
@@ -233,15 +296,15 @@ class AtmeexApi:
                 if attempt >= RETRY_MAX_ATTEMPTS:
                     if use_fallback:
                         return fallback_value
-                    # Формат оставляем прежним, чтобы не ломать тесты/логи
-                    raise ApiError(f"{action_name} network error: {e}") from e
+                    raise AtmeexConnectionError(
+                        safe_action_name, "transport failed"
+                    ) from last_exc
 
                 _LOGGER.warning(
-                    "Atmeex: %s failed on attempt %d/%d: %s",
-                    action_name,
+                    "Atmeex: %s failed on attempt %d/%d",
+                    safe_action_name,
                     attempt,
                     RETRY_MAX_ATTEMPTS,
-                    e,
                 )
                 await asyncio.sleep(delay)
                 delay = min(delay * 2, RETRY_MAX_DELAY_SEC)
@@ -249,7 +312,9 @@ class AtmeexApi:
         if use_fallback:
             return fallback_value
         if last_exc:
-            raise ApiError(f"{action_name} network error: {last_exc}") from last_exc
+            raise AtmeexConnectionError(
+                safe_action_name, "transport failed"
+            ) from last_exc
         return fallback_value
 
     def _apply_token_response(self, data: dict) -> None:
@@ -257,7 +322,7 @@ class AtmeexApi:
         token = data.get("access_token") or data.get("token")
         token_type = data.get("token_type") or "Bearer"
         if not token:
-            raise ApiError("login: token missing in response")
+            raise AtmeexProtocolError("login", "access token is missing")
         self._token = token
         self._token_type = token_type
 
@@ -279,7 +344,9 @@ class AtmeexApi:
         be supplied through ``login_phone()`` from the config flow.
         """
         if not self._email or not self._password:
-            raise ApiError("login: credentials not set")
+            raise AtmeexAuthenticationError(
+                "login", "email credentials are unavailable"
+            )
 
         async def _do_login():
             async with self._session.post(
@@ -291,11 +358,21 @@ class AtmeexApi:
                 },
                 headers=self._unauth_headers(),
             ) as resp:
-                text = await resp.text()
                 if resp.status >= 400:
-                    raise ApiError(
-                        f"Auth failed {resp.status}: {text[:200]}",
-                        status=resp.status,
+                    if resp.status in (401, 403):
+                        raise AtmeexAuthenticationError(
+                            "login", "authentication rejected", status=resp.status
+                        )
+                    if resp.status == 429:
+                        raise AtmeexRateLimitError(
+                            "login", "rate limited", status=resp.status
+                        )
+                    if resp.status >= 500:
+                        raise AtmeexConnectionError(
+                            "login", "cloud service unavailable", status=resp.status
+                        )
+                    raise AtmeexProtocolError(
+                        "login", "request rejected", status=resp.status
                     )
                 data = await self._json(resp)
                 self._apply_token_response(data)
@@ -305,7 +382,9 @@ class AtmeexApi:
     async def _sign_in_phone(self) -> None:
         """Exchange a phone + SMS code for tokens (single-use)."""
         if not self._phone or not self._phone_code:
-            raise ApiError("login: phone credentials not set")
+            raise AtmeexAuthenticationError(
+                "login_phone", "phone credentials are unavailable"
+            )
 
         async def _do_login():
             async with self._session.post(
@@ -317,11 +396,25 @@ class AtmeexApi:
                 },
                 headers=self._unauth_headers(),
             ) as resp:
-                text = await resp.text()
                 if resp.status >= 400:
-                    raise ApiError(
-                        f"Auth failed {resp.status}: {text[:200]}",
-                        status=resp.status,
+                    if resp.status in (401, 403):
+                        raise AtmeexAuthenticationError(
+                            "login_phone",
+                            "authentication rejected",
+                            status=resp.status,
+                        )
+                    if resp.status == 429:
+                        raise AtmeexRateLimitError(
+                            "login_phone", "rate limited", status=resp.status
+                        )
+                    if resp.status >= 500:
+                        raise AtmeexConnectionError(
+                            "login_phone",
+                            "cloud service unavailable",
+                            status=resp.status,
+                        )
+                    raise AtmeexProtocolError(
+                        "login_phone", "request rejected", status=resp.status
                     )
                 data = await self._json(resp)
                 self._apply_token_response(data)
@@ -331,7 +424,9 @@ class AtmeexApi:
     async def _signin_refresh(self) -> None:
         """Authenticate using the refresh token (cheaper than full login)."""
         if not self._refresh_token:
-            raise ApiError("refresh: no refresh token")
+            raise AtmeexAuthenticationError(
+                "refresh_token", "refresh token is unavailable"
+            )
 
         async def _do_refresh():
             async with self._session.post(
@@ -342,13 +437,27 @@ class AtmeexApi:
                 },
                 headers=self._unauth_headers(),
             ) as resp:
-                text = await resp.text()
                 if resp.status >= 400:
                     # Invalidate refresh token on auth errors
                     self._refresh_token = None
-                    raise ApiError(
-                        f"Auth failed {resp.status}: {text[:200]}",
-                        status=resp.status,
+                    if resp.status in (401, 403):
+                        raise AtmeexAuthenticationError(
+                            "refresh_token",
+                            "authentication rejected",
+                            status=resp.status,
+                        )
+                    if resp.status == 429:
+                        raise AtmeexRateLimitError(
+                            "refresh_token", "rate limited", status=resp.status
+                        )
+                    if resp.status >= 500:
+                        raise AtmeexConnectionError(
+                            "refresh_token",
+                            "cloud service unavailable",
+                            status=resp.status,
+                        )
+                    raise AtmeexProtocolError(
+                        "refresh_token", "request rejected", status=resp.status
                     )
                 data = await self._json(resp)
                 self._apply_token_response(data)
@@ -414,11 +523,25 @@ class AtmeexApi:
                 json={"grant_type": "phone_code", "phone": phone},
                 headers=self._unauth_headers(),
             ) as resp:
-                text = await resp.text()
                 if resp.status >= 400:
-                    raise ApiError(
-                        f"request_sms_code failed {resp.status}: {text[:200]}",
-                        status=resp.status,
+                    if resp.status in (401, 403):
+                        raise AtmeexAuthenticationError(
+                            "request_sms_code",
+                            "authentication rejected",
+                            status=resp.status,
+                        )
+                    if resp.status == 429:
+                        raise AtmeexRateLimitError(
+                            "request_sms_code", "rate limited", status=resp.status
+                        )
+                    if resp.status >= 500:
+                        raise AtmeexConnectionError(
+                            "request_sms_code",
+                            "cloud service unavailable",
+                            status=resp.status,
+                        )
+                    raise AtmeexProtocolError(
+                        "request_sms_code", "request rejected", status=resp.status
                     )
 
         await self._with_retries(_do, "request_sms_code")
@@ -442,7 +565,11 @@ class AtmeexApi:
         no token is stored, the caller must surface a reauth prompt.
         """
         if not self._refresh_token:
-            raise ApiError("authenticate_phone: no refresh token", status=401)
+            raise AtmeexAuthenticationError(
+                "authenticate_phone",
+                "refresh token is unavailable",
+                status=401,
+            )
         await self._signin_refresh()
 
     async def get_devices(self, fallback: bool = False) -> list[AtmeexDevice]:
@@ -461,7 +588,21 @@ class AtmeexApi:
             if status >= 400:
                 if fallback:
                     return []
-                raise ApiError(f"get_devices {status}: {str(data)[:200]}", status=status)
+                if status in (401, 403):
+                    raise AtmeexAuthenticationError(
+                        "get_devices", "authentication rejected", status=status
+                    )
+                if status == 429:
+                    raise AtmeexRateLimitError(
+                        "get_devices", "rate limited", status=status
+                    )
+                if status >= 500:
+                    raise AtmeexConnectionError(
+                        "get_devices", "cloud service unavailable", status=status
+                    )
+                raise AtmeexProtocolError(
+                    "get_devices", "request rejected", status=status
+                )
             
             if isinstance(data, dict) and "items" in data:
                 raw_list = data["items"] if isinstance(data["items"], list) else []
@@ -470,7 +611,9 @@ class AtmeexApi:
             else:
                 if fallback:
                     return []
-                raise ApiError("get_devices: unexpected response shape")
+                raise AtmeexProtocolError(
+                    "get_devices", "unexpected collection shape"
+                )
 
             devices: list[AtmeexDevice] = []
             for raw in raw_list:
@@ -488,13 +631,26 @@ class AtmeexApi:
             status, data = await self._request("GET", f"/devices/{device_id}", timeout=20)
 
             if status != 200:
-                raise ApiError(
-                    f"GET /devices/{device_id} {status}: {str(data)[:300]}",
-                    status=status,
+                if status in (401, 403):
+                    raise AtmeexAuthenticationError(
+                        "get_device", "authentication rejected", status=status
+                    )
+                if status == 429:
+                    raise AtmeexRateLimitError(
+                        "get_device", "rate limited", status=status
+                    )
+                if status >= 500:
+                    raise AtmeexConnectionError(
+                        "get_device", "cloud service unavailable", status=status
+                    )
+                raise AtmeexProtocolError(
+                    "get_device", "request rejected", status=status
                 )
 
             if not isinstance(data, dict):
-                raise ApiError(f"get_device: unexpected payload for {device_id}")
+                raise AtmeexProtocolError(
+                    "get_device", "device response is not an object"
+                )
 
             return AtmeexDevice.from_raw(data)
 
@@ -514,7 +670,21 @@ class AtmeexApi:
         """
         status, data = await self._request("PUT", f"/devices/{device_id}/params", json=body, timeout=timeout)
         if status >= 400:
-            raise ApiError(f"{action_name} {status}: {str(data)[:200]}", status=status)
+            if status in (401, 403):
+                raise AtmeexAuthenticationError(
+                    action_name, "authentication rejected", status=status
+                )
+            if status == 429:
+                raise AtmeexRateLimitError(
+                    action_name, "rate limited", status=status
+                )
+            if status >= 500:
+                raise AtmeexConnectionError(
+                    action_name, "cloud service unavailable", status=status
+                )
+            raise AtmeexProtocolError(
+                action_name, "request rejected", status=status
+            )
 
     async def set_power(self, device_id: int | str, on: bool) -> None:
         """Установить состояние питания (вкл/выкл) через поле u_pwr_on."""
@@ -525,7 +695,9 @@ class AtmeexApi:
         """Установить целевую температуру в °C (в API отправляется в деци-°C)."""
         value = c_to_deci(temp_c)
         if value is None:
-            raise ApiError(f"set_target_temperature: invalid temperature {temp_c!r}")
+            raise AtmeexProtocolError(
+                "set_target_temperature", "invalid temperature"
+            )
 
         body = {"u_temp_room": value}
         await self._put_params(device_id, body, "set_target_temperature")
@@ -560,7 +732,7 @@ class AtmeexApi:
         elif mode in (0, 1, 2):
             body = {"u_pwr_on": True, "u_damp_pos": mode}
         else:
-            raise ApiError(f"set_breezer_mode: invalid mode {mode}")
+            raise AtmeexProtocolError("set_breezer_mode", "invalid mode")
         await self._put_params(device_id, body, "set_breezer_mode")
 
     async def set_heater_off(self, device_id: int | str) -> None:
@@ -580,7 +752,9 @@ class AtmeexApi:
         else:
             value = c_to_deci(temp_c)
             if value is None:
-                raise ApiError(f"set_power_and_heat: invalid temperature {temp_c!r}")
+                raise AtmeexProtocolError(
+                    "set_power_and_heat", "invalid temperature"
+                )
             body["u_temp_room"] = value
         await self._put_params(device_id, body, "set_power_and_heat")
 

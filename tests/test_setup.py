@@ -215,7 +215,9 @@ async def test_setup_entry_raises_auth_failed_on_invalid_credentials(monkeypatch
     class FakeApi:
         def __init__(self, _session):
             self.async_init = AsyncMock()
-            self.login = AsyncMock(side_effect=ApiError("bad creds", status=401))
+            self.login = AsyncMock(
+                side_effect=ApiError("test_setup", "bad creds", status=401)
+            )
 
     monkeypatch.setattr(atmeex_init, "AtmeexApi", FakeApi)
     monkeypatch.setattr(atmeex_init, "async_get_clientsession", lambda _hass: object())
@@ -241,7 +243,9 @@ async def test_setup_entry_raises_not_ready_on_non_auth_error(monkeypatch):
     class FakeApi:
         def __init__(self, _session):
             self.async_init = AsyncMock()
-            self.login = AsyncMock(side_effect=ApiError("server down", status=500))
+            self.login = AsyncMock(
+                side_effect=ApiError("test_setup", "server down", status=500)
+            )
 
     monkeypatch.setattr(atmeex_init, "AtmeexApi", FakeApi)
     monkeypatch.setattr(atmeex_init, "async_get_clientsession", lambda _hass: object())
@@ -286,11 +290,13 @@ async def test_setup_entry_uses_fallback_devices_and_hydration_fallback(monkeypa
             async def _get_devices(*, fallback=False):
                 self.get_devices_calls.append(fallback)
                 if not fallback:
-                    raise ApiError("primary failed", status=500)
+                    raise ApiError("test_setup", "primary failed", status=500)
                 return [self.dev]
 
             self.get_devices = AsyncMock(side_effect=_get_devices)
-            self.get_device = AsyncMock(side_effect=ApiError("partial failure", status=500))
+            self.get_device = AsyncMock(
+                side_effect=ApiError("test_setup", "partial failure", status=500)
+            )
 
     monkeypatch.setattr(atmeex_init, "AtmeexApi", FakeApi)
     monkeypatch.setattr(atmeex_init, "async_get_clientsession", lambda _hass: object())
@@ -360,7 +366,7 @@ async def test_setup_entry_reauth_on_fallback_auth_error(monkeypatch):
             async def _get_devices(*, fallback=False):
                 if not fallback:
                     return []
-                raise ApiError("token expired", status=401)
+                raise ApiError("test_setup", "token expired", status=401)
 
             self.get_devices = AsyncMock(side_effect=_get_devices)
             self.get_device = AsyncMock()

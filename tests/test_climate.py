@@ -534,7 +534,9 @@ async def test_service_set_breezer_mode_all_valid_modes():
 async def test_service_set_breezer_mode_raises_on_api_error():
     """ApiError from set_breezer_mode is re-raised as HomeAssistantError."""
     ent, _cond, api = _make_entity()
-    api.set_breezer_mode.side_effect = ApiError("network", status=503)
+    api.set_breezer_mode.side_effect = ApiError(
+        "test_climate_command", "network", status=503
+    )
     with pytest.raises(HomeAssistantError):
         await ent.async_set_breezer_mode(BREEZER_MODES[0])
 
@@ -574,7 +576,9 @@ async def test_service_set_humidifier_stage_clamps_value(stage, expected):
 async def test_service_set_humidifier_stage_raises_on_api_error():
     """ApiError from set_humid_stage is re-raised as HomeAssistantError."""
     ent, _cond, api = _make_entity({"hum_stg": 1})
-    api.set_humid_stage.side_effect = ApiError("timeout", status=None)
+    api.set_humid_stage.side_effect = ApiError(
+        "test_climate_command", "timeout", status=None
+    )
     with pytest.raises(HomeAssistantError):
         await ent.async_set_humidifier_stage(1)
 

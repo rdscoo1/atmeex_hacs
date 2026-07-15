@@ -90,55 +90,91 @@ def test_pending_state_via_mixin(make_entity, set_pending, read_value, expected)
     [
         (
             _make_entity_with_runtime,
-            lambda ent, api: setattr(api.set_power, "side_effect", ApiError("boom", status=500)),
+            lambda ent, api: setattr(
+                api.set_power,
+                "side_effect",
+                ApiError("test_entity_command", "boom", status=500),
+            ),
             lambda ent: ent.async_set_hvac_mode(HVACMode.OFF),
             "Failed to turn off",
         ),
         (
             _make_entity_with_runtime,
-            lambda ent, api: setattr(api.set_fan_speed, "side_effect", ApiError("boom", status=500)),
+            lambda ent, api: setattr(
+                api.set_fan_speed,
+                "side_effect",
+                ApiError("test_entity_command", "boom", status=500),
+            ),
             lambda ent: ent.async_set_fan_mode("5"),
             "Failed to set fan mode",
         ),
         (
             _make_entity,
-            lambda ent, api: setattr(api.set_breezer_mode, "side_effect", ApiError("boom", status=500)),
+            lambda ent, api: setattr(
+                api.set_breezer_mode,
+                "side_effect",
+                ApiError("test_entity_command", "boom", status=500),
+            ),
             lambda ent: ent.async_set_swing_mode(BREEZER_SWING_MODES[1]),
             "Failed to set swing mode",
         ),
         (
             _make_fan_entity,
-            lambda ent, api: setattr(api.set_fan_speed, "side_effect", ApiError("boom", status=500)),
+            lambda ent, api: setattr(
+                api.set_fan_speed,
+                "side_effect",
+                ApiError("test_entity_command", "boom", status=500),
+            ),
             lambda ent: ent.async_set_percentage(75),
             "Failed to set fan speed",
         ),
         (
             _make_auto_switch,
-            lambda ent, api: setattr(api.set_auto_mode, "side_effect", ApiError("boom", status=500)),
+            lambda ent, api: setattr(
+                api.set_auto_mode,
+                "side_effect",
+                ApiError("test_entity_command", "boom", status=500),
+            ),
             lambda ent: ent.async_turn_on(),
             "Failed to enable AutoNanny",
         ),
         (
             _make_sleep_switch,
-            lambda ent, api: setattr(api.set_sleep_mode, "side_effect", ApiError("boom", status=500)),
+            lambda ent, api: setattr(
+                api.set_sleep_mode,
+                "side_effect",
+                ApiError("test_entity_command", "boom", status=500),
+            ),
             lambda ent: ent.async_turn_on(),
             "Failed to enable Sleep Mode",
         ),
         (
             _make_power_switch_standard,
-            lambda ent, api: setattr(api.set_power, "side_effect", ApiError("boom", status=500)),
+            lambda ent, api: setattr(
+                api.set_power,
+                "side_effect",
+                ApiError("test_entity_command", "boom", status=500),
+            ),
             lambda ent: ent.async_turn_on(),
             "Failed to turn on",
         ),
         (
             _make_humidification_select,
-            lambda ent, api: setattr(api.set_humid_stage, "side_effect", ApiError("boom", status=500)),
+            lambda ent, api: setattr(
+                api.set_humid_stage,
+                "side_effect",
+                ApiError("test_entity_command", "boom", status=500),
+            ),
             lambda ent: ent.async_select_option("2"),
             "Failed to set humidification stage",
         ),
         (
             _make_breezer_select,
-            lambda ent, api: setattr(api.set_breezer_mode, "side_effect", ApiError("boom", status=500)),
+            lambda ent, api: setattr(
+                api.set_breezer_mode,
+                "side_effect",
+                ApiError("test_entity_command", "boom", status=500),
+            ),
             lambda ent: ent.async_select_option(BREEZER_OPTIONS[1]),
             "Failed to set work mode",
         ),

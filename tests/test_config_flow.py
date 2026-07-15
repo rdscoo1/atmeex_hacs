@@ -167,7 +167,7 @@ async def test_email_step_cannot_connect():
 
         api = api_cls.return_value
         api.async_init = AsyncMock()
-        api.login.side_effect = ApiError("fail")
+        api.login.side_effect = ApiError("test_config_flow", "fail")
 
         result = await flow.async_step_email(user_input=user_input)
 
@@ -189,7 +189,7 @@ async def test_email_step_invalid_auth():
         get_session.return_value = object()
         api = api_cls.return_value
         api.async_init = AsyncMock()
-        api.login.side_effect = ApiError("invalid", status=401)
+        api.login.side_effect = ApiError("test_config_flow", "invalid", status=401)
 
         result = await flow.async_step_email(user_input=user_input)
 
@@ -259,7 +259,9 @@ async def test_phone_step_sms_request_failure_shows_error_on_phone_form():
         get_session.return_value = object()
         api = api_cls.return_value
         api.async_init = AsyncMock()
-        api.request_sms_code = AsyncMock(side_effect=ApiError("rate limited", status=429))
+        api.request_sms_code = AsyncMock(
+            side_effect=ApiError("test_config_flow", "rate limited", status=429)
+        )
 
         result = await flow.async_step_phone(user_input={CONF_PHONE: "+79991234567"})
 
@@ -324,7 +326,9 @@ async def test_phone_code_step_invalid_code():
         get_session.return_value = object()
         api = api_cls.return_value
         api.async_init = AsyncMock()
-        api.login_phone = AsyncMock(side_effect=ApiError("bad code", status=401))
+        api.login_phone = AsyncMock(
+            side_effect=ApiError("test_config_flow", "bad code", status=401)
+        )
 
         result = await flow.async_step_phone_code(
             user_input={CONF_PHONE_CODE: "wrong"}
@@ -462,7 +466,9 @@ async def test_reauth_confirm_invalid_auth():
         get_session.return_value = object()
         api = api_cls.return_value
         api.async_init = AsyncMock()
-        api.login.side_effect = ApiError("bad creds", status=403)
+        api.login.side_effect = ApiError(
+            "test_config_flow", "bad creds", status=403
+        )
 
         await flow.async_step_reauth(entry_data={})
         result = await flow.async_step_reauth_confirm(user_input=user_input)

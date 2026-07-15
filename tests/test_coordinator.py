@@ -54,7 +54,9 @@ async def test_update_data_builds_states():
 async def test_update_data_raises_auth_failed_on_401():
     """ApiError(401) from get_devices should propagate as ConfigEntryAuthFailed."""
     coord, api = _make_coordinator()
-    api.get_devices = AsyncMock(side_effect=ApiError("unauthorized", status=401))
+    api.get_devices = AsyncMock(
+        side_effect=ApiError("test_coordinator", "unauthorized", status=401)
+    )
 
     from homeassistant.exceptions import ConfigEntryAuthFailed
     with pytest.raises(ConfigEntryAuthFailed):

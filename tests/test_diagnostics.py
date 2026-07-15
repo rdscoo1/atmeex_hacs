@@ -95,7 +95,7 @@ async def test_config_entry_diagnostics_serializes_api_error(hass):
         "devices": [{"id": 1, "name": "Dev"}],
         "states": {"1": {"pwr_on": True}},
     }
-    coordinator.last_api_error = ApiError("boom", status=500)
+    coordinator.last_api_error = ApiError("test_diagnostics", "boom", status=500)
     coordinator.last_success_ts = 1234567890.0
 
     api = SimpleNamespace(_token="t")
@@ -112,7 +112,10 @@ async def test_config_entry_diagnostics_serializes_api_error(hass):
 
     diag = await async_get_config_entry_diagnostics(hass, entry)
 
-    assert diag["coordinator_diagnostics"]["last_api_error"] == "boom"
+    assert (
+        diag["coordinator_diagnostics"]["last_api_error"]
+        == "test_diagnostics: boom (status=500)"
+    )
     assert diag["coordinator_diagnostics"]["last_api_error_status"] == 500
     json_dumps(diag)
 

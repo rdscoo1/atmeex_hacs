@@ -24,7 +24,7 @@ async def test_sensor_exposes_basic_attrs(hass):
             "states": {},
         },
         last_success_ts=1234567890.0,
-        last_api_error=ApiError("some error"),
+        last_api_error=ApiError("test_sensor", "some error"),
     )
 
     runtime = AtmeexRuntimeData(
@@ -58,7 +58,7 @@ async def test_sensor_exposes_basic_attrs(hass):
     attrs = sensor.extra_state_attributes
     assert attrs["device_count"] == 2
     assert attrs["last_success_ts"] == 1234567890.0
-    assert attrs["last_api_error"] == "some error"
+    assert attrs["last_api_error"] == "test_sensor: some error"
     assert attrs["websocket_connected"] is None
     assert attrs["websocket_last_message_age_sec"] is None
     # если в сенсоре формируешь last_success_utc — просто проверяем наличие
@@ -174,7 +174,7 @@ async def test_diagnostics_sensor_serializes_api_error(hass):
     coord = DummyCoordinator(
         data={"devices": [{"id": 1}], "states": {}},
         last_success_ts=1234567890.0,
-        last_api_error=ApiError("boom", status=500),
+        last_api_error=ApiError("test_sensor", "boom", status=500),
     )
 
     runtime = AtmeexRuntimeData(
@@ -202,6 +202,6 @@ async def test_diagnostics_sensor_serializes_api_error(hass):
     sensor = entities[0]
     attrs = sensor.extra_state_attributes
 
-    assert attrs["last_api_error"] == "boom"
+    assert attrs["last_api_error"] == "test_sensor: boom (status=500)"
     assert attrs["last_api_error_status"] == 500
     json_dumps(attrs)

@@ -1,7 +1,93 @@
 import asyncio
-import pytest
+import logging
 
-from custom_components.atmeex_cloud.api import AtmeexApi, ApiError, API_BASE_URL, AtmeexDevice
+import pytest
+from aiohttp import ClientError
+
+from custom_components.atmeex_cloud.api import (
+    API_BASE_URL,
+    ApiError,
+    AtmeexApi,
+    AtmeexApiError,
+    AtmeexAuthenticationError,
+    AtmeexConnectionError,
+    AtmeexDevice,
+    AtmeexProtocolError,
+    AtmeexRateLimitError,
+)
+
+
+def test_typed_api_errors_expose_only_sanitized_context():
+    error = AtmeexRateLimitError(
+        "get_devices",
+        "rate limited",
+        status=429,
+        retry_after=7.5,
+    )
+
+    assert isinstance(error, AtmeexApiError)
+    assert error.operation == "get_devices"
+    assert error.status == 429
+    assert error.retry_after == 7.5
+    assert str(error) == "get_devices: rate limited (status=429, retry_after=7.5s)"
+    assert "household-secret-response" not in str(error)
+
+
+def test_api_error_remains_exact_compatibility_alias():
+    assert ApiError is AtmeexApiError
+    assert issubclass(AtmeexAuthenticationError, AtmeexApiError)
+    assert issubclass(AtmeexConnectionError, AtmeexApiError)
+    assert issubclass(AtmeexProtocolError, AtmeexApiError)
+
+
+@pytest.mark.asyncio
+async def test_retry_log_redacts_transport_exception_and_sanitizes_operation(
+    caplog, monkeypatch
+):
+    api = AtmeexApi(FakeSession())
+
+    async def fail_request():
+        raise ClientError("household-secret-response")
+
+    async def no_sleep(_delay):
+        return None
+
+    monkeypatch.setattr(asyncio, "sleep", no_sleep)
+    with caplog.at_level(logging.WARNING, logger="custom_components.atmeex_cloud.api"):
+        with pytest.raises(AtmeexConnectionError) as raised:
+            await api._with_retries(fail_request, "get devices\n")
+
+    assert raised.value.operation == "get_devices"
+    assert "household-secret-response" not in str(raised.value)
+    assert "household-secret-response" not in caplog.text
+    assert "get_devices failed on attempt" in caplog.text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("status", "error_type"),
+    [
+        (401, AtmeexAuthenticationError),
+        (403, AtmeexAuthenticationError),
+        (429, AtmeexRateLimitError),
+        (500, AtmeexConnectionError),
+        (404, AtmeexProtocolError),
+    ],
+)
+async def test_get_devices_maps_status_without_exposing_response_body(
+    status, error_type
+):
+    session = FakeSession()
+    session.queue_response(
+        FakeResponse(status, text_data="household-secret-response")
+    )
+    api = AtmeexApi(session)
+    api._token = "access"
+
+    with pytest.raises(error_type) as raised:
+        await api.get_devices()
+
+    assert "household-secret-response" not in str(raised.value)
 
 
 class FakeResponse:
@@ -211,7 +297,7 @@ async def test_request_sms_code_error_raises_apierror():
         await api.request_sms_code("+79991234567")
 
     assert exc.value.status == 429
-    assert "request_sms_code failed 429" in str(exc.value)
+    assert str(exc.value) == "request_sms_code: rate limited (status=429)"
 
 
 @pytest.mark.asyncio
@@ -224,8 +310,7 @@ async def test_login_error_raises_apierror():
     with pytest.raises(ApiError) as exc:
         await api.login("user@example.com", "wrong")
 
-    # формат сообщения сохраняем
-    assert "Auth failed 401" in str(exc.value)
+    assert str(exc.value) == "login: authentication rejected (status=401)"
 
 
 @pytest.mark.asyncio
@@ -261,8 +346,7 @@ async def test_get_devices_error_no_fallback():
     with pytest.raises(ApiError) as exc:
         await api.get_devices()
 
-    # Сообщение вида "get_devices 500: error" — можно при желании проверить
-    assert "get_devices 500" in str(exc.value)
+    assert str(exc.value) == "get_devices: cloud service unavailable (status=500)"
 
 
 @pytest.mark.asyncio
@@ -278,7 +362,7 @@ async def test_get_devices_500_does_not_trigger_relogin():
     with pytest.raises(ApiError) as exc:
         await api.get_devices()
 
-    assert "get_devices 500" in str(exc.value)
+    assert str(exc.value) == "get_devices: cloud service unavailable (status=500)"
     assert len(session.requests) == 1
     assert session.requests[0][0] == "GET"
 
@@ -325,7 +409,7 @@ async def test_get_device_error_raises():
     with pytest.raises(ApiError) as exc:
         await api.get_device(123)
 
-    assert "GET /devices/123 404" in str(exc.value)
+    assert str(exc.value) == "get_device: request rejected (status=404)"
 
 
 @pytest.mark.asyncio
@@ -369,7 +453,7 @@ async def test_setter_error_raises():
     with pytest.raises(ApiError) as exc:
         await api.set_power(1, True)
 
-    assert "set_power 500" in str(exc.value)
+    assert str(exc.value) == "set_power: cloud service unavailable (status=500)"
 
 
 @pytest.mark.asyncio
