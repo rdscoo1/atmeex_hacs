@@ -12,26 +12,55 @@ from custom_components.atmeex_cloud.const import (
     DOMAIN,
     PLATFORMS,
 )
-from custom_components.atmeex_cloud.helpers import to_bool, _normalize_device_state
+from custom_components.atmeex_cloud.helpers import (
+    _normalize_device_state,
+    normalize_device_id,
+    parse_atmeex_bool,
+)
 from homeassistant.exceptions import ConfigEntryAuthFailed, ConfigEntryNotReady
 
 
 @pytest.mark.parametrize(
-    "value, expected",
+    ("value", "expected"),
     [
         (True, True),
-        (False, False),
         (1, True),
-        (0, False),
         ("1", True),
+        ("true", True),
+        ("TRUE", True),
+        ("on", True),
+        ("yes", True),
+        (False, False),
+        (0, False),
         ("0", False),
+        ("false", False),
+        ("OFF", False),
+        ("no", False),
         ("", False),
-        ("foo", True),
-        (None, False),
     ],
 )
-def test_to_bool(value, expected):
-    assert to_bool(value) is expected
+def test_parse_atmeex_bool_accepts_only_documented_literals(value, expected):
+    assert parse_atmeex_bool(value) is expected
+
+
+@pytest.mark.parametrize("value", [None, "enabled", "2", 2, object()])
+def test_parse_atmeex_bool_rejects_unknown_literals(value):
+    with pytest.raises(ValueError, match="unsupported Atmeex boolean literal"):
+        parse_atmeex_bool(value)
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [(1, "1"), ("1", "1"), (" 0007 ", "7"), (123456789, "123456789")],
+)
+def test_normalize_device_id_returns_stable_string_key(value, expected):
+    assert normalize_device_id(value) == expected
+
+
+@pytest.mark.parametrize("value", [None, True, False, 1.0, "", "   "])
+def test_normalize_device_id_rejects_missing_or_boolean_ids(value):
+    with pytest.raises(ValueError, match="invalid Atmeex device id"):
+        normalize_device_id(value)
 
 def test_normalize_device_state_basic():
     """Test normalization converts API fan_speed (0-6) to HA fan_speed (1-7).

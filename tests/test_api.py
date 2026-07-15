@@ -14,6 +14,7 @@ from custom_components.atmeex_cloud.api import (
     AtmeexDevice,
     AtmeexProtocolError,
     AtmeexRateLimitError,
+    AtmeexState,
 )
 
 
@@ -136,6 +137,90 @@ class FakeSession:
 
     def put(self, url, json=None, headers=None, timeout=None):
         return self.request("PUT", url, json=json, headers=headers, timeout=timeout)
+
+
+def test_device_normalization_overwrites_raw_id_and_rejects_bad_online_literal():
+    device = AtmeexDevice.from_raw(
+        {"id": 42, "name": "Breezer", "online": "off", "condition": {}, "settings": {}}
+    )
+
+    assert device.id == 42
+    assert device.raw["id"] == 42
+    assert device.online is False
+    assert device.to_ha_dict()["id"] == 42
+
+    legacy = AtmeexDevice.from_raw({"id": "0007", "condition": {}, "settings": {}})
+    assert legacy.id == 7
+    assert f"{legacy.id}_fan" == "7_fan"
+
+    with pytest.raises(AtmeexProtocolError, match="parse_device"):
+        AtmeexDevice.from_raw({"id": 42, "online": "connected"})
+
+
+@pytest.mark.parametrize("field", ["condition", "settings"])
+@pytest.mark.parametrize("value", [[], "", 0, False, ["bad"], "bad", 1, True])
+def test_device_rejects_non_object_nested_fields(field, value):
+    raw = {"id": 42, "condition": {}, "settings": {}}
+    raw[field] = value
+
+    with pytest.raises(AtmeexProtocolError, match="parse_device"):
+        AtmeexDevice.from_raw(raw)
+
+
+@pytest.mark.parametrize(
+    "device",
+    [
+        [],
+        "bad",
+        {"id": 1, "condition": [], "settings": {}},
+        {"id": 1, "condition": 1, "settings": {}},
+        {"id": 1, "condition": {}, "settings": ""},
+        {"id": 1, "condition": {}, "settings": True},
+    ],
+)
+def test_state_wraps_every_malformed_nested_shape(device):
+    with pytest.raises(AtmeexProtocolError, match="normalize_device_state"):
+        AtmeexState.from_device_dict(device)
+
+
+@pytest.mark.asyncio
+async def test_get_device_percent_encodes_opaque_string_id():
+    session = FakeSession()
+    session.queue_response(
+        FakeResponse(
+            200,
+            json_data={"id": "zone/a b", "condition": {}, "settings": {}},
+        )
+    )
+    api = AtmeexApi(session)
+    api._token = "access"
+
+    device = await api.get_device("zone/a b")
+
+    assert device.id == "zone/a b"
+    assert str(session.requests[0][1]).endswith("/devices/zone%2Fa%20b")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("device_id", "encoded_id"),
+    [(".", "%2E"), ("..", "%2E%2E")],
+)
+async def test_get_device_preserves_opaque_dot_segment_id(device_id, encoded_id):
+    session = FakeSession()
+    session.queue_response(
+        FakeResponse(
+            200,
+            json_data={"id": device_id, "condition": {}, "settings": {}},
+        )
+    )
+    api = AtmeexApi(session)
+    api._token = "access"
+
+    device = await api.get_device(device_id)
+
+    assert device.id == device_id
+    assert str(session.requests[0][1]).endswith(f"/devices/{encoded_id}")
 
 
 @pytest.mark.asyncio
@@ -394,7 +479,7 @@ async def test_get_device_success():
 
     method, url, _payload, headers = session.requests[0]
     assert method == "GET"
-    assert url == f"{API_BASE_URL}/devices/1"
+    assert str(url) == f"{API_BASE_URL}/devices/1"
     assert headers["Authorization"] == "Bearer t"
 
 

@@ -6,10 +6,18 @@ import re
 import time
 from typing import Any
 from dataclasses import dataclass, field
+from urllib.parse import quote
 
 from aiohttp import ClientSession, ClientError, ClientResponse
+from yarl import URL
 
-from .helpers import _normalize_device_state, c_to_deci, fan_speed_to_api
+from .helpers import (
+    _normalize_device_state,
+    c_to_deci,
+    fan_speed_to_api,
+    normalize_device_id,
+    parse_atmeex_bool,
+)
 from .const import API_BASE_URL, RETRY_MAX_DELAY_SEC, RETRY_MAX_ATTEMPTS, RETRY_BASE_DELAY_SEC, USER_AGENT
 
 _LOGGER = logging.getLogger(__name__)
@@ -80,8 +88,9 @@ ApiError = AtmeexApiError
 
 @dataclass(slots=True)
 class AtmeexDevice:
-    """Типизированный wrapper вокруг сырого JSON устройства."""
-    id: int
+    """Validated device metadata with a legacy-compatible outward ID."""
+
+    id: int | str
     name: str
     model: str
     online: bool
@@ -89,60 +98,81 @@ class AtmeexDevice:
 
     @classmethod
     def from_raw(cls, raw: dict[str, Any]) -> "AtmeexDevice":
-        """Собрать устройство из сырого ответа API, с дефолтами."""
-        did = int(raw["id"])
-        name = str(raw.get("name") or f"Device {did}")
-        model = str(raw.get("model") or "unknown")
-        # Don't default to True - if API doesn't provide online status, check condition
-        online_raw = raw.get("online")
-        if online_raw is not None:
-            online = bool(online_raw)
-        else:
-            # Check if device has fresh condition data
-            cond = raw.get("condition") or {}
-            online = bool(cond and cond.get("time"))
-        
+        if not isinstance(raw, dict):
+            raise AtmeexProtocolError("parse_device", "device item is not an object")
+        try:
+            device_key = normalize_device_id(raw.get("id"))
+            try:
+                device_id: int | str = int(device_key, 10)
+            except ValueError:
+                device_id = device_key
+            condition_raw = raw.get("condition")
+            settings_raw = raw.get("settings")
+            condition = {} if condition_raw is None else condition_raw
+            settings = {} if settings_raw is None else settings_raw
+            if not isinstance(condition, dict) or not isinstance(settings, dict):
+                raise ValueError("condition/settings must be objects")
+            online_raw = raw.get("online")
+            online = (
+                parse_atmeex_bool(online_raw)
+                if online_raw is not None
+                else bool(condition.get("time"))
+            )
+        except ValueError as err:
+            raise AtmeexProtocolError("parse_device", "invalid device fields") from err
+
+        normalized_raw = dict(raw)
+        normalized_raw["id"] = device_id
+        normalized_raw["condition"] = dict(condition)
+        normalized_raw["settings"] = dict(settings)
         return cls(
-            id=did,
-            name=name,
-            model=model,
+            id=device_id,
+            name=str(raw.get("name") or f"Device {device_id}"),
+            model=str(raw.get("model") or "unknown"),
             online=online,
-            raw=raw,
+            raw=normalized_raw,
         )
 
     @property
     def condition(self) -> dict[str, Any]:
-        return dict(self.raw.get("condition") or {})
+        return dict(self.raw["condition"])
 
     @property
     def settings(self) -> dict[str, Any]:
-        return dict(self.raw.get("settings") or {})
+        return dict(self.raw["settings"])
 
     def to_ha_dict(self) -> dict[str, Any]:
-        """Форма, в которой coordinator будет хранить устройство."""
-        # Важно не потерять лишние поля из raw — поэтому делаем копию
         data = dict(self.raw)
-        data.setdefault("id", self.id)
-        data.setdefault("name", self.name)
-        data.setdefault("model", self.model)
-        data.setdefault("online", self.online)
-        # гарантируем наличие condition/settings как словарей
+        data["id"] = self.id
+        data["name"] = self.name
+        data["model"] = self.model
+        data["online"] = self.online
         data["condition"] = self.condition
         data["settings"] = self.settings
         return data
-    
+
+
 @dataclass(slots=True)
 class AtmeexState:
-    """Normalized device state (condition + settings merged)."""
+    """Normalized state retaining the legacy outward device ID."""
 
-    id: int
+    id: int | str
     raw: dict[str, Any] = field(repr=False)
 
     @classmethod
     def from_device_dict(cls, device: dict[str, Any]) -> "AtmeexState":
-        """Build normalized state from raw device payload."""
-        normalized = _normalize_device_state(device)
-        return cls(id=int(device["id"]), raw=normalized)
+        try:
+            normalized = _normalize_device_state(device)
+            device_key = normalize_device_id(device.get("id"))
+            try:
+                device_id: int | str = int(device_key, 10)
+            except ValueError:
+                device_id = device_key
+        except ValueError as err:
+            raise AtmeexProtocolError(
+                "normalize_device_state", "invalid device state"
+            ) from err
+        return cls(id=device_id, raw=normalized)
 
     def to_ha_dict(self) -> dict[str, Any]:
         """State dict stored in coordinator.data['states'][id]."""
@@ -467,7 +497,7 @@ class AtmeexApi:
     async def _request(
         self,
         method: str,
-        path: str,
+        path: str | URL,
         *,
         timeout: int = 20,
         json: Any | None = None,
@@ -477,7 +507,7 @@ class AtmeexApi:
         Возвращает (status, payload), где payload = json (если <400) иначе text.
         """
         await self._ensure_token()
-        url = f"{API_BASE_URL}{path}"
+        url = path if isinstance(path, URL) else f"{API_BASE_URL}{path}"
 
         async def _do(retry_auth: bool = True) -> tuple[int, Any]:
             req_headers = self._headers()
@@ -628,7 +658,17 @@ class AtmeexApi:
     async def get_device(self, device_id: int | str) -> AtmeexDevice:
         """Получить полное описание одного устройства как AtmeexDevice."""
         async def _do_get():
-            status, data = await self._request("GET", f"/devices/{device_id}", timeout=20)
+            encoded_device_id = quote(
+                normalize_device_id(device_id),
+                safe="",
+            ).replace(".", "%2E")
+            device_url = URL(
+                f"{API_BASE_URL}/devices/{encoded_device_id}",
+                encoded=True,
+            )
+            status, data = await self._request(
+                "GET", device_url, timeout=20
+            )
 
             if status != 200:
                 if status in (401, 403):

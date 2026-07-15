@@ -134,14 +134,46 @@ def humidity_to_stage(val: int | float | None) -> int:
     return HUM_ALLOWED.index(q)
 
 
-def to_bool(v: Any) -> bool:
-    """Аккуратное приведение к bool (можно заменить твой _to_bool)."""
-    if isinstance(v, bool):
-        return v
+_TRUE_LITERALS = frozenset({"1", "true", "on", "yes"})
+_FALSE_LITERALS = frozenset({"", "0", "false", "off", "no"})
+
+
+def normalize_device_id(value: Any) -> str:
+    """Return the canonical string key used for all internal device maps."""
+    if isinstance(value, bool) or not isinstance(value, (int, str)):
+        raise ValueError("invalid Atmeex device id")
+    normalized = str(value).strip()
+    if not normalized:
+        raise ValueError("invalid Atmeex device id")
     try:
-        return bool(int(v))
-    except (TypeError, ValueError):
-        return bool(v)
+        return str(int(normalized, 10))
+    except ValueError:
+        pass
+    return normalized
+
+
+def parse_atmeex_bool(value: Any) -> bool:
+    """Parse the finite boolean vocabulary accepted by the Atmeex protocol."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int) and not isinstance(value, bool):
+        if value == 1:
+            return True
+        if value == 0:
+            return False
+        raise ValueError("unsupported Atmeex boolean literal")
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in _TRUE_LITERALS:
+            return True
+        if normalized in _FALSE_LITERALS:
+            return False
+    raise ValueError("unsupported Atmeex boolean literal")
+
+
+def to_bool(value: Any) -> bool:
+    """Compatibility name for strict protocol boolean parsing."""
+    return parse_atmeex_bool(value)
 
 
 def serialize_api_error(error: Any) -> str | None:
@@ -247,8 +279,16 @@ def apply_settings_update(
 
 def _normalize_device_state(item: dict[str, Any]) -> dict[str, Any]:
     """Merge condition + settings into a normalized HA state."""
-    cond = dict(item.get("condition") or {})
-    st = dict(item.get("settings") or {})
+    if not isinstance(item, dict):
+        raise ValueError("device state must be an object")
+    condition_raw = item.get("condition")
+    settings_raw = item.get("settings")
+    condition = {} if condition_raw is None else condition_raw
+    settings = {} if settings_raw is None else settings_raw
+    if not isinstance(condition, dict) or not isinstance(settings, dict):
+        raise ValueError("condition/settings must be objects")
+    cond = dict(condition)
+    st = dict(settings)
 
     pwr_cond = cond.get("pwr_on")
     pwr_settings = st.get("u_pwr_on")
@@ -298,6 +338,8 @@ def _normalize_device_state(item: dict[str, Any]) -> dict[str, Any]:
     temp_room = cond.get("temp_room")
 
     out = dict(cond) if cond else {}
+    if "no_water" in cond:
+        out["no_water"] = parse_atmeex_bool(cond["no_water"])
     if pwr is not None:
         out["pwr_on"] = bool(pwr)
     if fan is not None:
