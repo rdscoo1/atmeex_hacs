@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Awaitable, Callable
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 import logging
+import math
 import re
 import time
 from typing import Any
@@ -238,29 +239,87 @@ class AtmeexState:
         """State dict stored in coordinator.data['states'][id]."""
         return dict(self.raw)
 
+
+RefreshTokenChangedCallback = Callable[[str], None]
+
+
+@dataclass(frozen=True, slots=True)
+class _TokenSnapshot:
+    token: str
+    token_type: str
+    generation: int
+    recovery_attempt: int
+
+
+@dataclass(frozen=True, slots=True)
+class _RecoveryFailure:
+    generation: int
+    recovery_attempt: int
+    error_type: type[AtmeexApiError]
+    operation: str
+    status: int | None
+    retry_after: float | None
+
+    @classmethod
+    def from_error(
+        cls,
+        rejected: _TokenSnapshot,
+        error: AtmeexApiError,
+    ) -> _RecoveryFailure:
+        return cls(
+            generation=rejected.generation,
+            recovery_attempt=rejected.recovery_attempt,
+            error_type=type(error),
+            operation=error.operation,
+            status=error.status,
+            retry_after=(
+                error.retry_after
+                if isinstance(error, AtmeexRateLimitError)
+                else None
+            ),
+        )
+
+    def to_error(self) -> AtmeexApiError:
+        if self.error_type is AtmeexRateLimitError:
+            return AtmeexRateLimitError(
+                self.operation,
+                "authentication recovery failed",
+                status=self.status,
+                retry_after=self.retry_after,
+            )
+        return self.error_type(
+            self.operation,
+            "authentication recovery failed",
+            status=self.status,
+        )
+
+
 class AtmeexApi:
     """Клиент для облачного API Atmeex.
 
     Работает поверх aiohttp.ClientSession, предоставленной Home Assistant.
     """
 
-    def __init__(self, session: ClientSession):
-        """Сохранить сессию Home Assistant и проинициализировать состояние."""
+    def __init__(
+        self,
+        session: ClientSession,
+        *,
+        on_refresh_token_changed: RefreshTokenChangedCallback | None = None,
+    ) -> None:
         self._session = session
         self._token: str | None = None
-        self._token_type: str = "Bearer"
+        self._token_type = "Bearer"
+        self._token_generation = 0
+        self._recovery_attempt = 0
+        self._recovery_failure: _RecoveryFailure | None = None
         self._refresh_token: str | None = None
-        # Two credential kinds are supported:
-        #   email/password — `grant_type=basic` (long-lived: re-login on token expiry)
-        #   phone/phone_code — `grant_type=phone_code` (short-lived: SMS code can't be
-        #     reused, so once tokens expire and refresh fails, we surface ConfigEntryAuthFailed
-        #     and let the user re-request SMS via reauth)
+        self._on_refresh_token_changed = on_refresh_token_changed
         self._email: str | None = None
         self._password: str | None = None
         self._phone: str | None = None
         self._phone_code: str | None = None
-        self._retry_count: int = 0  # суммарное число сетевых ретраев
-        self._token_expires_at: float | None = None  # unix-time
+        self._retry_count = 0
+        self._token_expires_at: float | None = None
         self._lock = asyncio.Lock()
 
     async def async_init(self) -> None:
@@ -271,13 +330,37 @@ class AtmeexApi:
 
     @property
     def token(self) -> str:
-        """Return the current auth token (empty string if not set)."""
         return self._token or ""
 
     @property
+    def token_generation(self) -> int:
+        return self._token_generation
+
+    @property
     def refresh_token(self) -> str | None:
-        """Return the current refresh token (None if not set)."""
         return self._refresh_token
+
+    @property
+    def retry_count(self) -> int:
+        """Return the cumulative count of bounded HTTP retry attempts."""
+        return self._retry_count
+
+    def _token_snapshot(self) -> _TokenSnapshot:
+        if not self._token:
+            raise AtmeexAuthenticationError(
+                "request", "access token is unavailable"
+            )
+        return _TokenSnapshot(
+            self._token,
+            self._token_type,
+            self._token_generation,
+            self._recovery_attempt,
+        )
+
+    def _headers_for(self, snapshot: _TokenSnapshot) -> dict[str, str]:
+        headers = self._unauth_headers()
+        headers["Authorization"] = f"{snapshot.token_type} {snapshot.token}"
+        return headers
 
     def _token_is_valid(self) -> bool:
         """Проверить, что токен ещё жив и не протухнет прямо сейчас."""
@@ -299,33 +382,25 @@ class AtmeexApi:
         return bool(self._email and self._password)
 
     async def _ensure_token(self) -> None:
-        """Гарантировать, что у нас есть валидный токен.
-
-        Tries refresh token first (cheaper), falls back to full login.
-        Использует блокировку, чтобы не логиниться параллельно из разных корутин.
-        """
         if self._token_is_valid():
             return
-
+        rejected = (
+            self._token_snapshot()
+            if self._token
+            else _TokenSnapshot(
+                "",
+                self._token_type,
+                self._token_generation,
+                self._recovery_attempt,
+            )
+        )
         async with self._lock:
-            # второй раз проверяем внутри lock — вдруг кто-то уже залогинился
-            if self._token_is_valid():
+            if (
+                self._token_is_valid()
+                and self._token_generation > rejected.generation
+            ):
                 return
-
-            # Try refresh token first — it's cheaper than full login
-            if self._refresh_token:
-                try:
-                    await self._signin_refresh()
-                    return
-                except ApiError:
-                    _LOGGER.debug("Refresh token failed, falling back to basic login")
-
-            if not self._has_replayable_credentials():
-                raise AtmeexAuthenticationError(
-                    "ensure_token", "credentials are unavailable"
-                )
-
-            await self._sign_in()
+            await self._recover_locked(rejected, 401)
 
     @staticmethod
     def _unauth_headers() -> dict[str, str]:
@@ -335,13 +410,6 @@ class AtmeexApi:
             "Content-Type": "application/json",
             "User-Agent": USER_AGENT,
         }
-
-    def _headers(self) -> dict[str, str]:
-        """Сформировать заголовки запроса с учётом токена авторизации."""
-        headers = self._unauth_headers()
-        if self._token:
-            headers["Authorization"] = f"{self._token_type} {self._token}"
-        return headers
 
     async def _consume_response(
         self,
@@ -367,73 +435,50 @@ class AtmeexApi:
                 status=response.status,
             ) from err
 
-    async def _call_with_get_retries(
-        self,
-        operation: str,
-        call: Callable[[], Awaitable[Any]],
-        recover_auth: Callable[[], Awaitable[None]] | None = None,
-    ) -> Any:
-        delay = RETRY_BASE_DELAY_SEC
-        auth_recovered = False
-        for attempt in range(1, RETRY_MAX_ATTEMPTS + 1):
-            try:
-                return await call()
-            except AtmeexAuthenticationError:
-                if (
-                    recover_auth is None
-                    or auth_recovered
-                    or attempt == RETRY_MAX_ATTEMPTS
-                ):
-                    raise
-                # Authentication recovery is not a retryable GET transport
-                # failure. Its own error must propagate, while the following
-                # GET consumes the next slot in the same three-attempt budget.
-                await recover_auth()
-                auth_recovered = True
-                continue
-            except AtmeexRateLimitError as err:
-                retryable: AtmeexApiError = err
-            except AtmeexConnectionError as err:
-                retryable = err
-            except (asyncio.TimeoutError, ClientError) as err:
-                retryable = AtmeexConnectionError(operation, "transport failed")
-                retryable.__cause__ = err
-            if attempt == RETRY_MAX_ATTEMPTS:
-                raise retryable
-            self._retry_count += 1
-            wait = (
-                retryable.retry_after
-                if isinstance(retryable, AtmeexRateLimitError)
-                and retryable.retry_after is not None
-                else delay
-            )
-            await asyncio.sleep(min(wait, RETRY_MAX_DELAY_SEC))
-            delay = min(delay * 2, RETRY_MAX_DELAY_SEC)
-        raise AtmeexConnectionError(operation, "retry budget exhausted")
-
     def _apply_token_response(self, data: Any, operation: str) -> None:
-        """Extract and store token data from an auth response."""
         if not isinstance(data, dict):
-            raise AtmeexProtocolError(
-                operation,
-                "token response is not an object",
-            )
+            raise AtmeexProtocolError(operation, "token response is not an object")
         token = data.get("access_token") or data.get("token")
         if not isinstance(token, str) or not token:
             raise AtmeexProtocolError(operation, "access token is missing")
-        self._token = token
-        self._token_type = str(data.get("token_type") or "Bearer")
 
-        # Store refresh token if provided
-        rt = data.get("refresh_token")
-        if isinstance(rt, str) and rt:
-            self._refresh_token = rt
-
+        token_type = str(data.get("token_type") or "Bearer")
         expires_in = data.get("expires_in")
+        expires_at: float | None = None
         if isinstance(expires_in, (int, float)):
-            self._token_expires_at = time.time() + int(expires_in)
-        else:
-            self._token_expires_at = None
+            try:
+                expires_at = time.time() + int(expires_in)
+            except (OverflowError, ValueError) as err:
+                raise AtmeexProtocolError(
+                    operation,
+                    "token expiry is invalid",
+                ) from err
+            if not math.isfinite(expires_at):
+                raise AtmeexProtocolError(
+                    operation,
+                    "token expiry is invalid",
+                )
+        rotated = data.get("refresh_token")
+        refresh_changed = (
+            isinstance(rotated, str)
+            and bool(rotated)
+            and rotated != self._refresh_token
+        )
+        callback = self._on_refresh_token_changed if refresh_changed else None
+
+        self._token = token
+        self._token_type = token_type
+        self._token_generation += 1
+        self._token_expires_at = expires_at
+        if refresh_changed:
+            self._refresh_token = rotated
+        if callback is not None:
+            try:
+                callback(rotated)
+            except Exception:
+                _LOGGER.warning(
+                    "Atmeex refresh-token persistence callback failed"
+                )
 
     async def _sign_in(self) -> None:
         if not self._email or not self._password:
@@ -468,19 +513,84 @@ class AtmeexApi:
         self._apply_token_response(data, "login_phone")
 
     async def _signin_refresh(self) -> None:
-        if not self._refresh_token:
+        refresh_token = self._refresh_token
+        if not refresh_token:
             raise AtmeexAuthenticationError(
                 "refresh_token", "refresh token is unavailable"
             )
-        data = await self._auth_post(
-            "refresh_token",
-            {
-                "grant_type": "refresh_token",
-                "refresh_token": self._refresh_token,
-            },
-            expect_json=True,
-        )
+        try:
+            data = await self._auth_post(
+                "refresh_token",
+                {
+                    "grant_type": "refresh_token",
+                    "refresh_token": refresh_token,
+                },
+                expect_json=True,
+            )
+        except AtmeexAuthenticationError:
+            self._refresh_token = None
+            raise
         self._apply_token_response(data, "refresh_token")
+
+    async def _recover_locked(
+        self,
+        rejected: _TokenSnapshot,
+        status: int,
+    ) -> None:
+        if self._token and self._token_generation > rejected.generation:
+            return
+        failure = self._recovery_failure
+        if (
+            failure is not None
+            and failure.generation == rejected.generation
+            and failure.recovery_attempt >= rejected.recovery_attempt
+        ):
+            raise failure.to_error()
+        try:
+            await self._attempt_recovery_locked(status)
+        except AtmeexApiError as err:
+            self._recovery_attempt += 1
+            self._recovery_failure = _RecoveryFailure.from_error(rejected, err)
+            raise
+        else:
+            self._recovery_attempt += 1
+            self._recovery_failure = None
+
+    async def _attempt_recovery_locked(self, status: int) -> None:
+        refresh_error: AtmeexAuthenticationError | None = None
+        if self._refresh_token:
+            try:
+                await self._signin_refresh()
+                return
+            except AtmeexAuthenticationError as err:
+                refresh_error = err
+        if self._email and self._password:
+            await self._sign_in()
+            return
+        if refresh_error is not None:
+            raise refresh_error
+        raise AtmeexAuthenticationError(
+            "authenticated_request",
+            "authentication recovery exhausted",
+            status=status,
+        )
+
+    async def async_refresh_access_token(self) -> None:
+        """Recover credentials once under the shared token lock for HTTP or WS."""
+        observed = (
+            self._token_snapshot()
+            if self._token
+            else _TokenSnapshot(
+                "",
+                self._token_type,
+                self._token_generation,
+                self._recovery_attempt,
+            )
+        )
+        async with self._lock:
+            if self._token and self._token_generation > observed.generation:
+                return
+            await self._recover_locked(observed, 401)
     
     async def _request_once(
         self,
@@ -488,7 +598,8 @@ class AtmeexApi:
         path: str | URL,
         *,
         operation: str,
-        json_body: Any | None = None,
+        snapshot: _TokenSnapshot,
+        json_body: Any | None,
         expect_json: bool,
     ) -> Any:
         request_url = path if isinstance(path, URL) else f"{API_BASE_URL}{path}"
@@ -497,7 +608,7 @@ class AtmeexApi:
                 method,
                 request_url,
                 json=json_body,
-                headers=self._headers(),
+                headers=self._headers_for(snapshot),
                 timeout=API_REQUEST_TIMEOUT_SEC,
             ) as response:
                 return await self._consume_response(
@@ -520,43 +631,46 @@ class AtmeexApi:
         expect_json: bool = True,
     ) -> Any:
         await self._ensure_token()
-        attempted_token: str | None = None
+        max_attempts = RETRY_MAX_ATTEMPTS if method == "GET" else 2
+        retry_delay = RETRY_BASE_DELAY_SEC
+        recovered_auth = False
 
-        async def call() -> Any:
-            nonlocal attempted_token
-            attempted_token = self._token
-            return await self._request_once(
-                method,
-                path,
-                operation=operation,
-                json_body=json_body,
-                expect_json=expect_json,
-            )
-
-        async def recover_auth() -> None:
-            async with self._lock:
-                if self._token == attempted_token:
-                    self._token_expires_at = None
-                    await self._sign_in()
-
-        if method == "GET":
-            return await self._call_with_get_retries(
-                operation,
-                call,
-                recover_auth=(
-                    recover_auth
-                    if self._has_replayable_credentials()
-                    else None
-                ),
-            )
-
-        try:
-            return await call()
-        except AtmeexAuthenticationError:
-            if not self._has_replayable_credentials():
-                raise
-            await recover_auth()
-            return await call()
+        for attempt in range(1, max_attempts + 1):
+            snapshot = self._token_snapshot()
+            try:
+                return await self._request_once(
+                    method,
+                    path,
+                    operation=operation,
+                    snapshot=snapshot,
+                    json_body=json_body,
+                    expect_json=expect_json,
+                )
+            except AtmeexAuthenticationError as err:
+                if err.status != 401:
+                    raise
+                if recovered_auth or attempt == max_attempts:
+                    raise AtmeexAuthenticationError(
+                        operation,
+                        "authentication recovery exhausted",
+                        status=err.status,
+                    ) from err
+                async with self._lock:
+                    await self._recover_locked(snapshot, err.status or 401)
+                recovered_auth = True
+            except (AtmeexConnectionError, AtmeexRateLimitError) as err:
+                if method != "GET" or attempt == max_attempts:
+                    raise
+                self._retry_count += 1
+                wait = (
+                    err.retry_after
+                    if isinstance(err, AtmeexRateLimitError)
+                    and err.retry_after is not None
+                    else retry_delay
+                )
+                await asyncio.sleep(min(wait, RETRY_MAX_DELAY_SEC))
+                retry_delay = min(retry_delay * 2, RETRY_MAX_DELAY_SEC)
+        raise AtmeexConnectionError(operation, "retry budget exhausted")
 
     async def _auth_post(
         self,

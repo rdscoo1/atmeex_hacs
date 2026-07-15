@@ -1,6 +1,6 @@
 import asyncio
 import logging
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from aiohttp import ClientError
@@ -51,10 +51,11 @@ def test_api_error_remains_exact_compatibility_alias():
 async def test_get_retry_redacts_transport_exception_and_sanitizes_operation(
     caplog, monkeypatch
 ):
-    api = AtmeexApi(FakeSession())
-
-    async def fail_request():
-        raise ClientError("household-secret-response")
+    session = FakeSession()
+    for _index in range(3):
+        session.queue_response(ClientError("household-secret-response"))
+    api = AtmeexApi(session)
+    api._token = "access"
 
     async def no_sleep(_delay):
         return None
@@ -62,7 +63,11 @@ async def test_get_retry_redacts_transport_exception_and_sanitizes_operation(
     monkeypatch.setattr(asyncio, "sleep", no_sleep)
     with caplog.at_level(logging.WARNING, logger="custom_components.atmeex_cloud.api"):
         with pytest.raises(AtmeexConnectionError) as raised:
-            await api._call_with_get_retries("get devices\n", fail_request)
+            await api._request(
+                "GET",
+                "/devices",
+                operation="get devices\n",
+            )
 
     assert raised.value.operation == "get_devices"
     assert "household-secret-response" not in str(raised.value)
@@ -333,6 +338,39 @@ async def test_login_rejects_malformed_success_payload(payload):
     assert raised.value.operation == "login"
 
 
+@pytest.mark.parametrize(
+    "expires_in",
+    [float("nan"), float("inf"), 10**400],
+    ids=["nan", "infinity", "overflow"],
+)
+def test_invalid_token_expiry_does_not_mutate_any_token_state(expires_in):
+    persisted = MagicMock()
+    api = AtmeexApi(FakeSession(), on_refresh_token_changed=persisted)
+    api._token = "old-access"
+    api._token_type = "OldType"
+    api._token_generation = 7
+    api._token_expires_at = 12345.0
+    api._refresh_token = "old-refresh"
+
+    with pytest.raises(AtmeexProtocolError, match="refresh_token"):
+        api._apply_token_response(
+            {
+                "access_token": "new-access",
+                "token_type": "NewType",
+                "expires_in": expires_in,
+                "refresh_token": "new-refresh",
+            },
+            "refresh_token",
+        )
+
+    assert api._token == "old-access"
+    assert api._token_type == "OldType"
+    assert api.token_generation == 7
+    assert api._token_expires_at == 12345.0
+    assert api.refresh_token == "old-refresh"
+    persisted.assert_not_called()
+
+
 def test_device_normalization_overwrites_raw_id_and_rejects_bad_online_literal():
     device = AtmeexDevice.from_raw(
         {"id": 42, "name": "Breezer", "online": "off", "condition": {}, "settings": {}}
@@ -529,39 +567,358 @@ async def test_login_phone_clears_email_credentials():
 
 
 @pytest.mark.asyncio
-async def test_phone_account_does_not_replay_signin_on_401():
-    """Phone accounts cannot replay the SMS code, so 401 must not trigger _sign_in."""
-    sign_in_called = 0
+async def test_concurrent_401_uses_one_refresh_and_new_generation():
+    all_old_requests_started = asyncio.Event()
 
-    class Phone401Session:
-        def __init__(self):
+    class BarrierResponse(FakeResponse):
+        async def read(self):
+            await all_old_requests_started.wait()
+            return await super().read()
+
+    class Concurrent401Session:
+        def __init__(self) -> None:
             self.requests = []
+            self.old_get_count = 0
 
         def request(self, method, url, json=None, headers=None, timeout=None):
-            self.requests.append((method, url))
-            return FakeResponse(401, text_data="unauthorized")
+            self.requests.append((method, url, json, headers, timeout))
+            if method == "POST":
+                return FakeResponse(
+                    200,
+                    json_data={"access_token": "new", "refresh_token": "rotated"},
+                )
+            authorization = (headers or {}).get("Authorization")
+            if authorization == "Bearer new":
+                return FakeResponse(200, json_data=[])
+            self.old_get_count += 1
+            if self.old_get_count == 5:
+                all_old_requests_started.set()
+            return BarrierResponse(401, text_data="private-body")
 
         def post(self, url, json=None, headers=None, timeout=None):
             return self.request("POST", url, json=json, headers=headers, timeout=timeout)
 
-    session = Phone401Session()
+    session = Concurrent401Session()
+    persisted = MagicMock()
+    api = AtmeexApi(session, on_refresh_token_changed=persisted)
+    api._token = "old"
+    api._refresh_token = "refresh"
+
+    results = await asyncio.gather(*(api.get_devices() for _index in range(5)))
+
+    assert results == [[], [], [], [], []]
+    refresh_posts = [request for request in session.requests if request[0] == "POST"]
+    assert len(refresh_posts) == 1
+    assert api.token == "new"
+    assert api.token_generation == 1
+    persisted.assert_called_once_with("rotated")
+
+
+@pytest.mark.asyncio
+async def test_concurrent_401_shares_transient_refresh_failure_and_later_retries():
+    all_old_requests_started = asyncio.Event()
+
+    class BarrierResponse(FakeResponse):
+        async def read(self):
+            await all_old_requests_started.wait()
+            return await super().read()
+
+    class ConcurrentTransientRefreshSession:
+        def __init__(self) -> None:
+            self.requests = []
+            self.old_get_count = 0
+            self.allow_refresh_success = False
+
+        def request(self, method, url, json=None, headers=None, timeout=None):
+            self.requests.append((method, url, json, headers, timeout))
+            if method == "POST":
+                if self.allow_refresh_success:
+                    return FakeResponse(
+                        200,
+                        json_data={"access_token": "new-access"},
+                    )
+                return FakeResponse(503, text_data="private-outage-body")
+            if (headers or {}).get("Authorization") == "Bearer new-access":
+                return FakeResponse(200, json_data=[])
+            self.old_get_count += 1
+            if self.old_get_count == 5:
+                all_old_requests_started.set()
+            if self.old_get_count <= 5:
+                return BarrierResponse(401, text_data="private-auth-body")
+            return FakeResponse(401, text_data="private-auth-body")
+
+        def post(self, url, json=None, headers=None, timeout=None):
+            return self.request("POST", url, json=json, headers=headers, timeout=timeout)
+
+    session = ConcurrentTransientRefreshSession()
     api = AtmeexApi(session)
-    api._token = "t"
+    api._token = "old-access"
+    api._refresh_token = "keep-refresh"
+
+    results = await asyncio.gather(
+        *(api.get_devices() for _index in range(5)),
+        return_exceptions=True,
+    )
+
+    assert all(isinstance(result, AtmeexConnectionError) for result in results)
+    assert all(result.operation == "refresh_token" for result in results)
+    assert all(result.status == 503 for result in results)
+    assert [request[0] for request in session.requests].count("POST") == 1
+    assert api.refresh_token == "keep-refresh"
+
+    session.allow_refresh_success = True
+
+    assert await api.get_devices() == []
+    assert [request[0] for request in session.requests].count("POST") == 2
+
+
+@pytest.mark.asyncio
+async def test_delayed_stale_401_shares_newest_failure_for_same_generation():
+    delayed_request_started = asyncio.Event()
+    release_delayed_response = asyncio.Event()
+
+    class Delayed401Response(FakeResponse):
+        async def read(self):
+            delayed_request_started.set()
+            await release_delayed_response.wait()
+            return await super().read()
+
+    class InterleavedFailureSession:
+        def __init__(self) -> None:
+            self.requests = []
+            self.get_count = 0
+
+        def request(self, method, url, json=None, headers=None, timeout=None):
+            self.requests.append((method, url, json, headers, timeout))
+            if method == "POST":
+                return FakeResponse(503, text_data="private-outage-body")
+            self.get_count += 1
+            if self.get_count == 1:
+                return Delayed401Response(401, text_data="private-auth-body")
+            return FakeResponse(401, text_data="private-auth-body")
+
+        def post(self, url, json=None, headers=None, timeout=None):
+            return self.request("POST", url, json=json, headers=headers, timeout=timeout)
+
+    session = InterleavedFailureSession()
+    api = AtmeexApi(session)
+    api._token = "old-access"
+    api._refresh_token = "keep-refresh"
+
+    delayed_request = asyncio.create_task(api.get_devices())
+    await delayed_request_started.wait()
+
+    for _index in range(2):
+        with pytest.raises(AtmeexConnectionError):
+            await api.get_devices()
+
+    assert [request[0] for request in session.requests].count("POST") == 2
+
+    release_delayed_response.set()
+    with pytest.raises(AtmeexConnectionError):
+        await delayed_request
+
+    assert [request[0] for request in session.requests].count("POST") == 2
+
+
+@pytest.mark.asyncio
+async def test_phone_reactive_401_refreshes_without_replaying_sms_code():
+    session = FakeSession()
+    session.queue_response(FakeResponse(401))
+    session.queue_response(FakeResponse(200, json_data={"access_token": "new-phone"}))
+    session.queue_response(FakeResponse(200, json_data=[]))
+    api = AtmeexApi(session)
+    api._token = "old-phone"
+    api._refresh_token = "phone-refresh"
     api._phone = "+79991234567"
-    api._phone_code = "1234"  # already consumed but stored
+    api._phone_code = "already-consumed"
 
-    async def _counted_sign_in():
-        nonlocal sign_in_called
-        sign_in_called += 1
+    assert await api.get_devices() == []
 
-    api._sign_in = _counted_sign_in
+    signin_payloads = [request[2] for request in session.requests if request[0] == "POST"]
+    assert signin_payloads == [
+        {"grant_type": "refresh_token", "refresh_token": "phone-refresh"}
+    ]
 
-    with pytest.raises(AtmeexAuthenticationError):
-        await api._request("GET", "/devices", operation="get_devices")
 
-    assert sign_in_called == 0
-    # Only the one GET — no relogin attempt
-    assert len(session.requests) == 1
+@pytest.mark.asyncio
+async def test_refresh_transient_failure_retains_refresh_token():
+    session = FakeSession()
+    session.queue_response(FakeResponse(503, text_data="private-outage-body"))
+    api = AtmeexApi(session)
+    api._refresh_token = "keep-me"
+
+    with pytest.raises(AtmeexConnectionError, match="refresh_token"):
+        await api.async_refresh_access_token()
+
+    assert api.refresh_token == "keep-me"
+
+
+@pytest.mark.asyncio
+async def test_definitive_refresh_rejection_clears_runtime_token_only():
+    session = FakeSession()
+    session.queue_response(FakeResponse(401, text_data="private-auth-body"))
+    api = AtmeexApi(session)
+    api._refresh_token = "invalid"
+
+    with pytest.raises(AtmeexAuthenticationError, match="refresh_token"):
+        await api.async_refresh_access_token()
+
+    assert api.refresh_token is None
+
+
+@pytest.mark.asyncio
+async def test_refresh_403_clears_runtime_refresh_token():
+    session = FakeSession()
+    session.queue_response(FakeResponse(403, text_data="private-auth-body"))
+    api = AtmeexApi(session)
+    api._refresh_token = "invalid"
+
+    with pytest.raises(AtmeexAuthenticationError) as raised:
+        await api.async_refresh_access_token()
+
+    assert raised.value.operation == "refresh_token"
+    assert raised.value.status == 403
+    assert api.refresh_token is None
+
+
+@pytest.mark.asyncio
+async def test_transient_refresh_failure_does_not_fall_back_to_email_login():
+    session = FakeSession()
+    session.queue_response(FakeResponse(503, text_data="private-outage-body"))
+    session.queue_response(FakeResponse(200, json_data={"access_token": "email"}))
+    api = AtmeexApi(session)
+    api._token = "old-access"
+    api._refresh_token = "keep-refresh"
+    api._email = "user@example.com"
+    api._password = "password"
+
+    with pytest.raises(AtmeexConnectionError) as raised:
+        await api.async_refresh_access_token()
+
+    assert raised.value.operation == "refresh_token"
+    assert [request[2]["grant_type"] for request in session.requests] == [
+        "refresh_token"
+    ]
+    assert api.refresh_token == "keep-refresh"
+
+
+@pytest.mark.asyncio
+async def test_cancelled_refresh_releases_lock_without_poisoning_next_attempt():
+    refresh_started = asyncio.Event()
+    keep_refresh_pending = asyncio.Event()
+
+    class BlockingRefreshResponse(FakeResponse):
+        async def json(self, *, content_type=None):
+            refresh_started.set()
+            await keep_refresh_pending.wait()
+            return await super().json(content_type=content_type)
+
+    session = FakeSession()
+    session.queue_response(
+        BlockingRefreshResponse(200, json_data={"access_token": "cancelled"})
+    )
+    session.queue_response(FakeResponse(200, json_data={"access_token": "new-access"}))
+    api = AtmeexApi(session)
+    api._refresh_token = "keep-refresh"
+
+    cancelled_refresh = asyncio.create_task(api.async_refresh_access_token())
+    await refresh_started.wait()
+    cancelled_refresh.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await cancelled_refresh
+
+    assert api._recovery_attempt == 0
+    assert api._recovery_failure is None
+
+    await api.async_refresh_access_token()
+
+    assert api.token == "new-access"
+    assert api._recovery_attempt == 1
+    assert [request[0] for request in session.requests] == ["POST", "POST"]
+
+
+def test_unchanged_or_empty_refresh_token_does_not_notify_callback():
+    persisted = MagicMock()
+    api = AtmeexApi(FakeSession(), on_refresh_token_changed=persisted)
+    api._refresh_token = "same-refresh"
+
+    api._apply_token_response(
+        {"access_token": "first", "refresh_token": "same-refresh"},
+        "refresh_token",
+    )
+    api._apply_token_response(
+        {"access_token": "second", "refresh_token": ""},
+        "refresh_token",
+    )
+
+    assert api.refresh_token == "same-refresh"
+    persisted.assert_not_called()
+
+
+def test_refresh_callback_exception_is_tolerated_without_logging_secret(caplog):
+    secret = "private-rotated-refresh"
+    persisted = MagicMock(side_effect=RuntimeError(secret))
+    api = AtmeexApi(FakeSession(), on_refresh_token_changed=persisted)
+    api._token = "old-access"
+    api._refresh_token = "old-refresh"
+
+    with caplog.at_level(logging.WARNING, logger="custom_components.atmeex_cloud.api"):
+        api._apply_token_response(
+            {
+                "access_token": "new-access",
+                "token_type": "Custom",
+                "expires_in": 60,
+                "refresh_token": secret,
+            },
+            "refresh_token",
+        )
+
+    assert api.token == "new-access"
+    assert api._token_type == "Custom"
+    assert api.token_generation == 1
+    assert api.refresh_token == secret
+    persisted.assert_called_once_with(secret)
+    assert "persistence callback failed" in caplog.text
+    assert secret not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_put_401_replays_once_with_identical_encoded_url():
+    session = FakeSession()
+    session.queue_response(FakeResponse(401, text_data="expired"))
+    session.queue_response(FakeResponse(200, json_data={"access_token": "new"}))
+    session.queue_response(FakeResponse(204))
+    api = AtmeexApi(session)
+    api._token = "old"
+    api._refresh_token = "refresh"
+
+    await api.set_power("..", True)
+
+    assert [request[0] for request in session.requests] == ["PUT", "POST", "PUT"]
+    put_requests = [request for request in session.requests if request[0] == "PUT"]
+    assert put_requests[0][1] is put_requests[1][1]
+    assert str(put_requests[0][1]).endswith("/devices/%2E%2E/params")
+    assert put_requests[0][2] == put_requests[1][2] == {"u_pwr_on": True}
+
+
+@pytest.mark.asyncio
+async def test_put_403_does_not_refresh_or_replay():
+    session = FakeSession()
+    session.queue_response(FakeResponse(403, text_data="forbidden"))
+    session.queue_response(FakeResponse(200, json_data={"access_token": "new"}))
+    session.queue_response(FakeResponse(204))
+    api = AtmeexApi(session)
+    api._token = "old"
+    api._refresh_token = "refresh"
+
+    with pytest.raises(AtmeexAuthenticationError) as raised:
+        await api.set_power("..", True)
+
+    assert raised.value.status == 403
+    assert [request[0] for request in session.requests] == ["PUT"]
+    assert api.token == "old"
+    assert api.refresh_token == "refresh"
 
 
 @pytest.mark.asyncio
@@ -764,66 +1121,6 @@ async def test_set_commands_not_retried_on_network_timeout():
 
     # The critical invariant: the PUT was issued exactly ONCE, not retried
     assert call_count == 1, f"set_power made {call_count} requests; expected 1 (no retry on network timeout)"
-
-
-@pytest.mark.asyncio
-async def test_concurrent_401_sign_in_called_once():
-    """Concurrent _request() calls that each receive 401 must only trigger _sign_in once.
-
-    Without serialization under self._lock, N concurrent callers each call
-    _sign_in independently — last writer wins, stale token can escape.
-    """
-    sign_in_calls = 0
-    new_token = "new-token"
-
-    class SlowAuthSession:
-        """Returns 401 until sign_in sets a valid token, then returns 200."""
-
-        def __init__(self):
-            self.requests = []
-
-        def request(self, method, url, json=None, headers=None, timeout=None):
-            self.requests.append((method, url, headers))
-            auth = (headers or {}).get("Authorization", "")
-            if new_token in auth:
-                return FakeResponse(200, json_data=[])
-            return FakeResponse(401, text_data="unauthorized")
-
-        def post(self, url, json=None, headers=None, timeout=None):
-            return self.request("POST", url, json=json, headers=headers, timeout=timeout)
-
-    session = SlowAuthSession()
-    api = AtmeexApi(session)
-    await api.async_init()
-    api._token = "old-token"
-    api._email = "u@example.com"
-    api._password = "pw"
-
-    original_sign_in = api._sign_in
-
-    async def _counted_sign_in():
-        nonlocal sign_in_calls
-        sign_in_calls += 1
-        await asyncio.sleep(0)  # yield so other coroutines can proceed
-        api._token = new_token
-
-    api._sign_in = _counted_sign_in
-
-    # Fire 5 concurrent GET /devices calls — all will see 401 with old token
-    tasks = [
-        asyncio.create_task(
-            api._request("GET", "/devices", operation="get_devices")
-        )
-        for _ in range(5)
-    ]
-    results = await asyncio.gather(*tasks, return_exceptions=True)
-
-    # All requests should ultimately succeed (200 with new token)
-    for r in results:
-        assert not isinstance(r, Exception), f"Unexpected exception: {r}"
-
-    # The critical invariant: sign-in was called exactly once, not 5 times
-    assert sign_in_calls == 1, f"_sign_in called {sign_in_calls} times, expected 1"
 
 
 # ---------------------------------------------------------------------------
