@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from copy import deepcopy
 from dataclasses import dataclass
 from types import MappingProxyType
@@ -112,7 +112,6 @@ class AtmeexStateStore:
             return StateStoreUpdate(self._data, False)
         for device_id in removed:
             self._field_revisions.pop(device_id, None)
-            self._absence_counts.pop(device_id, None)
         self._data = {
             "devices": [deepcopy(item.to_ha_dict()) for item in device_map.values()],
             "device_map": dict(device_map),
@@ -256,3 +255,59 @@ class AtmeexStateStore:
             changed,
             touched_paths=touched,
         )
+
+    def apply_inventory(
+        self,
+        devices: Sequence[AtmeexDevice],
+        baselines: Mapping[str, FieldRevisionBaseline],
+    ) -> StateStoreUpdate:
+        device_map = dict(self._data.get("device_map", {}))
+        states = dict(self._data.get("states", {}))
+        absence_counts = dict(self._absence_counts)
+        canonical_baselines = {
+            normalize_device_id(device_id): baseline
+            for device_id, baseline in baselines.items()
+        }
+        changed: set[tuple[str, str]] = set()
+        touched: set[tuple[str, str]] = set()
+        seen: set[str] = set()
+
+        for item in devices:
+            key = normalize_device_id(item.id)
+            seen.add(key)
+            baseline = canonical_baselines.get(key) or FieldRevisionBaseline(
+                key,
+                MappingProxyType({}),
+            )
+            item_changed, item_touched = self._merge_device(
+                item,
+                baseline,
+                device_map,
+                states,
+            )
+            changed.update(item_changed)
+            touched.update(item_touched)
+            absence_counts[key] = 0
+
+        removed: set[str] = set()
+        for key in tuple(device_map):
+            if key in seen:
+                continue
+            count = absence_counts.get(key, 0) + 1
+            absence_counts[key] = count
+            if count < 2:
+                continue
+            device_map.pop(key, None)
+            states.pop(key, None)
+            absence_counts.pop(key, None)
+            removed.add(key)
+
+        update = self._commit(
+            device_map,
+            states,
+            changed,
+            touched_paths=touched,
+            removed=frozenset(removed),
+        )
+        self._absence_counts = absence_counts
+        return update

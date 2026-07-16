@@ -399,3 +399,126 @@ def test_refresh_copies_only_the_changed_target_state():
     assert update.data["states"]["1"] is not before_target
     assert update.data["states"]["1"]["temp_in"] == 225
     assert update.data["states"]["2"] is before_unaffected
+
+
+def test_device_is_removed_only_after_two_successful_absent_inventories():
+    store = seed_store(device())
+
+    first = store.apply_inventory([], store.capture_all())
+    second = store.apply_inventory([], store.capture_all())
+    assert first.changed is False
+    assert "1" in first.data["device_map"]
+    assert second.changed is True
+    assert second.removed_device_ids == frozenset({"1"})
+    assert second.data == {"devices": [], "device_map": {}, "states": {}}
+
+
+def test_targeted_refresh_does_not_reset_authoritative_absence_count():
+    current = device()
+    store = seed_store(current)
+
+    first = store.apply_inventory([], store.capture_all())
+    store.apply_refresh(current, store.capture_device("1"))
+    second = store.apply_inventory([], store.capture_all())
+
+    assert first.changed is False
+    assert second.removed_device_ids == frozenset({"1"})
+
+
+def test_inventory_rolls_back_when_a_later_baseline_is_malformed():
+    store = seed_store(device(1), device(2, name="Second"))
+    store.apply_websocket_delta("1", state_delta={"pwr_on": True})
+    store._absence_counts = {"1": 1, "2": 1}
+    before = store.data
+    before_revision = store._revision
+    before_revisions = {
+        key: dict(baseline.revisions)
+        for key, baseline in store.capture_all().items()
+    }
+    baselines = store.capture_all()
+    baselines["2"] = FieldRevisionBaseline("999", MappingProxyType({}))
+
+    with pytest.raises(ValueError, match="baseline device id"):
+        store.apply_inventory(
+            [device(1, name="Rejected"), device(2, name="Rejected Second")],
+            baselines,
+        )
+
+    assert store.data is before
+    assert store._revision == before_revision
+    assert {
+        key: dict(baseline.revisions)
+        for key, baseline in store.capture_all().items()
+    } == before_revisions
+    assert store._absence_counts == {"1": 1, "2": 1}
+
+
+def test_inventory_reappearance_resets_consecutive_absence_count():
+    current = device()
+    store = seed_store(current)
+    before = store.data
+
+    first_absence = store.apply_inventory([], store.capture_all())
+    reappeared = store.apply_inventory([current], store.capture_all())
+    absence_after_reappearance = store.apply_inventory([], store.capture_all())
+
+    assert first_absence == StateStoreUpdate(before, False)
+    assert first_absence.data is before
+    assert reappeared.removed_device_ids == frozenset()
+    assert absence_after_reappearance.changed is False
+    assert absence_after_reappearance.data is store.data
+    assert "1" in absence_after_reappearance.data["device_map"]
+    assert store._absence_counts == {"1": 1}
+
+
+def test_inventory_absence_count_is_not_reset_by_websocket_updates():
+    store = seed_store(device())
+
+    first = store.apply_inventory([], store.capture_all())
+    store.apply_websocket_delta("1", state_delta={"pwr_on": False})
+    second = store.apply_inventory([], store.capture_all())
+
+    assert first.changed is False
+    assert second.removed_device_ids == frozenset({"1"})
+    assert "1" not in store._field_revisions
+    assert store.capture_all() == {}
+
+
+def test_inventory_preserves_newer_push_fields_and_applies_unrelated_fields():
+    store = seed_store(device(fan_speed=1, temp_in=170))
+    baselines = store.capture_all()
+    store.apply_websocket_delta(
+        "1",
+        state_delta={"fan_speed": 7},
+        device_delta={"condition": {"fan_speed": 6}},
+    )
+    before = store.data
+
+    update = store.apply_inventory(
+        [device(fan_speed=1, temp_in=225)],
+        baselines,
+    )
+
+    assert before["states"]["1"]["fan_speed"] == 7
+    assert before["states"]["1"]["temp_in"] == 170
+    assert update.data["states"]["1"]["fan_speed"] == 7
+    assert update.data["states"]["1"]["temp_in"] == 225
+    assert update.data["device_map"]["1"].condition["fan_speed"] == 6
+    assert update.data["device_map"]["1"].condition["temp_in"] == 225
+    revisions = store.capture_device("1").revisions
+    assert revisions["state.temp_in"] == revisions["device.condition.temp_in"]
+
+
+def test_inventory_owns_new_devices_under_canonical_keys():
+    store = AtmeexStateStore()
+    incoming = device("0007")
+    incoming.raw["condition"]["history"] = {"samples": [18]}
+
+    update = store.apply_inventory([incoming], store.capture_all())
+    stored = update.data["device_map"]["7"]
+    incoming.raw["condition"]["history"]["samples"].append(19)
+
+    assert stored is not incoming
+    assert set(update.data["device_map"]) == {"7"}
+    assert set(update.data["states"]) == {"7"}
+    assert stored.condition["history"] == {"samples": [18]}
