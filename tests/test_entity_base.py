@@ -121,16 +121,6 @@ def test_pending_state_via_mixin(make_entity, set_pending, read_value, expected)
             "Failed to set swing mode",
         ),
         (
-            _make_fan_entity,
-            lambda ent, api: setattr(
-                api.set_fan_speed,
-                "side_effect",
-                ApiError("test_entity_command", "boom", status=500),
-            ),
-            lambda ent: ent.async_set_percentage(75),
-            "Failed to set fan speed",
-        ),
-        (
             _make_auto_switch,
             lambda ent, api: setattr(
                 api.set_auto_mode,

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import math
 from typing import Any, Awaitable, Callable
 
 from .helpers import fan_speed_to_percent, percent_to_fan_speed
@@ -20,10 +21,6 @@ from homeassistant.helpers.update_coordinator import (
 )
 
 _LOGGER = logging.getLogger(__name__)
-
-# Tolerance for pending command expiration (seconds)
-# Increased to 8s because API condition updates are slow
-PENDING_COMMAND_TTL = 8.0
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_entities):
     """Set up Atmeex fan entities from a config entry."""
@@ -88,7 +85,8 @@ class AtmeexFanEntity(AtmeexEntityMixin, CoordinatorEntity, FanEntity):
         return fan_speed_to_percent(speed)
 
     def _percentage_to_speed(self, percentage: int | float) -> int:
-        return percent_to_fan_speed(percentage)
+        speed = percent_to_fan_speed(percentage)
+        return max(1, speed) if percentage > 0 else speed
 
     # ----- properties -----
 
@@ -103,7 +101,6 @@ class AtmeexFanEntity(AtmeexEntityMixin, CoordinatorEntity, FanEntity):
         effective_pwr = self._state_with_pending(
             "pwr_on",
             confirmed_pwr,
-            tolerance=PENDING_COMMAND_TTL,
         )
         if effective_pwr != confirmed_pwr:
             _LOGGER.debug(
@@ -127,7 +124,6 @@ class AtmeexFanEntity(AtmeexEntityMixin, CoordinatorEntity, FanEntity):
         effective_speed = self._state_with_pending(
             "fan_speed",
             confirmed_speed,
-            tolerance=PENDING_COMMAND_TTL,
         )
         if effective_speed != confirmed_speed:
             _LOGGER.debug(
@@ -139,46 +135,90 @@ class AtmeexFanEntity(AtmeexEntityMixin, CoordinatorEntity, FanEntity):
 
     # ----- commands -----
 
-    async def async_turn_on(self, percentage: int | None = None, preset_mode: str | None = None, **kwargs) -> None:
-        if percentage is not None:
-            speed = self._percentage_to_speed(percentage)
-            await self._execute_command(
-                self.api.set_fan_speed(self._device_id, speed),
-                pending_attr="fan_speed",
-                pending_value=speed,
-                error_message="Failed to set fan speed",
-            )
+    def _validated_percentage(
+        self,
+        percentage: Any,
+        *,
+        allow_none: bool = False,
+        allow_zero: bool = True,
+    ) -> int | float | None:
+        if allow_none and percentage is None:
+            return None
+        if (
+            isinstance(percentage, bool)
+            or not isinstance(percentage, (int, float))
+            or not 0 <= percentage <= 100
+            or not math.isfinite(float(percentage))
+            or not allow_zero and percentage == 0
+        ):
+            try:
+                error = self._invalid_value("percentage", percentage)
+            except (TypeError, ValueError, OverflowError):
+                error = self._invalid_value(
+                    "percentage",
+                    f"<{type(percentage).__name__} outside supported range>",
+                )
+            raise error
+        return percentage
+
+    async def async_turn_on(
+        self,
+        percentage: int | None = None,
+        preset_mode: str | None = None,
+        **kwargs,
+    ) -> None:
+        percentage = self._validated_percentage(
+            percentage,
+            allow_none=True,
+            allow_zero=False,
+        )
+        speed = (
+            self._percentage_to_speed(percentage)
+            if percentage is not None
+            else None
+        )
+
+        async def operation() -> None:
+            if speed is not None:
+                await self.api.set_fan_speed(self._device_id, speed)
+            await self.api.set_power(self._device_id, True)
+
+        pending: dict[str, Any] = {"pwr_on": True}
+        if speed is not None:
+            pending["fan_speed"] = speed
         await self._execute_command(
-            self.api.set_power(self._device_id, True),
-            pending_attr="pwr_on",
-            pending_value=True,
-            error_message="Failed to turn on fan",
+            operation,
+            pending=pending,
+            translation_placeholders={"action": "turn on the fan"},
         )
 
     async def async_turn_off(self, **kwargs) -> None:
+        async def operation() -> None:
+            await self.api.set_power(self._device_id, False)
+
         await self._execute_command(
-            self.api.set_power(self._device_id, False),
-            pending_attr="pwr_on",
-            pending_value=False,
-            error_message="Failed to turn off fan",
+            operation,
+            pending={"pwr_on": False},
+            translation_placeholders={"action": "turn off the fan"},
         )
 
     async def async_set_percentage(self, percentage: int) -> None:
+        percentage = self._validated_percentage(percentage)
         if percentage == 0:
             await self.async_turn_off()
             return
         speed = self._percentage_to_speed(percentage)
-        turn_on_after_speed = not self.is_on
+
+        async def operation() -> None:
+            await self.api.set_fan_speed(self._device_id, speed)
+            # Always assert power after changing speed. The coordinator can be
+            # stale after a predecessor's successful write but failed
+            # confirmation refresh, so its confirmed power value cannot safely
+            # decide whether this idempotent write is needed.
+            await self.api.set_power(self._device_id, True)
+
         await self._execute_command(
-            self.api.set_fan_speed(self._device_id, speed),
-            pending_attr="fan_speed",
-            pending_value=speed,
-            error_message="Failed to set fan speed",
+            operation,
+            pending={"fan_speed": speed, "pwr_on": True},
+            translation_placeholders={"action": "set the fan speed"},
         )
-        if turn_on_after_speed:
-            await self._execute_command(
-                self.api.set_power(self._device_id, True),
-                pending_attr="pwr_on",
-                pending_value=True,
-                error_message="Failed to turn on fan",
-            )
