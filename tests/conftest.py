@@ -32,13 +32,12 @@ class DummyCoordinator:
         # Attributes that AtmeexCoordinator adds
         self.last_api_error = kwargs.get("last_api_error")
         self.last_success_ts = kwargs.get("last_success_ts")
-        self._ws_device_update_ts = {}
-        self._refresh_device_update_ts = {}
         # Extra counter used by some WS tests
         self.update_calls = 0
 
-    def setup_update(self, *, api, fire_logbook_event):
+    def setup_update(self, *, api, state_store, fire_logbook_event):
         self._api = api
+        self.state_store = state_store
         self._fire_logbook_event = fire_logbook_event
         self._api_error_last_ts = float("-inf")
         self._api_error_suppressed = 0
@@ -141,6 +140,7 @@ def make_runtime(hass, entry, api, coordinator, *, websocket_manager=None):
         api=api,
         coordinator=coordinator,
         refresh_device=AsyncMock(),
+        state_store=getattr(coordinator, "state_store", None),
         websocket_manager=websocket_manager,
     )
     entry.runtime_data = runtime

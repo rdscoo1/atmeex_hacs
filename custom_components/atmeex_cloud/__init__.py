@@ -15,14 +15,13 @@ from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.const import CONF_EMAIL, CONF_PASSWORD
 
 from .api import (
-    ApiError,
     AtmeexApi,
+    AtmeexApiError,
     AtmeexAuthenticationError,
     AtmeexConnectionError,
     AtmeexDevice,
     AtmeexProtocolError,
     AtmeexRateLimitError,
-    AtmeexState,
 )
 from .coordinator import AtmeexCoordinator, AtmeexCoordinatorData
 from .const import (
@@ -42,7 +41,12 @@ from .const import (
     AUTH_METHOD_EMAIL,
     AUTH_METHOD_PHONE,
 )
-from .helpers import apply_condition_update, apply_settings_update
+from .helpers import (
+    normalize_condition_delta,
+    normalize_device_id,
+    normalize_settings_delta,
+)
+from .state_store import AtmeexStateStore
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -158,13 +162,18 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         options_snapshot = current_options
         await hass.config_entries.async_reload(updated_entry.entry_id)
 
+    state_store = AtmeexStateStore()
     coordinator = AtmeexCoordinator(
         hass,
         _LOGGER,
         name="Atmeex Cloud",
         update_interval=timedelta(seconds=update_interval_seconds),
     )
-    coordinator.setup_update(api=api, fire_logbook_event=_fire_logbook_event)
+    coordinator.setup_update(
+        api=api,
+        state_store=state_store,
+        fire_logbook_event=_fire_logbook_event,
+    )
 
     await coordinator.async_config_entry_first_refresh()
 
@@ -172,7 +181,6 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     entry.async_on_unload(entry.add_update_listener(_update_listener))
 
     refresh_tasks: dict[str, asyncio.Task[None]] = {}
-    state_update_lock = asyncio.Lock()
     websocket_message_queue: deque[dict[str, Any]] = deque(maxlen=500)
     # Mutable container avoids nonlocal and keeps runtime_data in sync automatically.
     _ws_task_ref: dict[str, asyncio.Task[None] | None] = {"task": None}
@@ -218,96 +226,57 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     async def _refresh_device_once(device_id: int | str) -> None:
         """Fetch one device and merge it into coordinator state."""
+        baseline = state_store.capture_device(device_id)
         try:
             full: AtmeexDevice = await api.get_device(device_id)
-        except ApiError as e:
-            _LOGGER.warning("Failed to refresh device %s: %s", device_id, e)
+            update = state_store.apply_refresh(full, baseline)
+        except AtmeexApiError as err:
+            _LOGGER.warning("Failed to refresh device %s: %s", device_id, err)
             coordinator._fire_api_error_event(
                 {
-                    "message": str(e),
-                    "status": getattr(e, "status", None),
+                    "message": str(err),
+                    "status": err.status,
                     "source": "refresh_device",
                     "device_id": str(device_id),
                 }
             )
-            return
-        except Exception as e:  # noqa: BLE001
+            recovery_coro = coordinator.async_request_refresh()
+            try:
+                hass.async_create_task(
+                    recovery_coro,
+                    name="atmeex targeted-refresh recovery",
+                )
+            except BaseException:
+                recovery_coro.close()
+                raise
+            raise
+        except Exception as err:  # noqa: BLE001
             _LOGGER.warning(
-                "Unexpected error in refresh_device(%s): %s", device_id, e)
+                "Unexpected error in refresh_device(%s): %s", device_id, err
+            )
             coordinator._fire_api_error_event(
                 {
-                    "message": str(e),
+                    "message": str(err),
                     "source": "refresh_device",
                     "device_id": str(device_id),
                 }
             )
             return
-
-        # Ключ по id устройства
-        key = str(full.id)
-        payload = full.to_ha_dict()
-
-        # Пересчитываем нормализованное состояние
-        normalized_state: dict[str, Any] | None = None
-        try:
-            st = AtmeexState.from_device_dict(payload)
-            normalized_state = st.to_ha_dict()
-        except Exception as e:  # noqa: BLE001
-            _LOGGER.warning("Failed to normalize refreshed state for %s: %s", device_id, e)
-
-        # Serialize coordinator writes to avoid lost updates vs websocket updates.
-        async with state_update_lock:
-            # Текущее состояние координатора (fallback на пустую структуру)
-            cur: AtmeexCoordinatorData = coordinator.data or {
-                "devices": [],
-                "device_map": {},
-                "states": {},
-                "last_success_ts": None,
-                "avg_latency_ms": None,
-                "request_retries": 0,
-            }
-
-            devices_raw: list[dict[str, Any]] = list(cur.get("devices", []))
-            device_map: dict[str, AtmeexDevice] = dict(cur.get("device_map", {}))
-            states: dict[str, dict[str, Any]] = dict(cur.get("states", {}))
-
-            # Обновляем device_map
-            device_map[key] = full
-
-            # Обновляем/добавляем запись в devices_raw (для обратной совместимости/диагностики)
-            for idx, d in enumerate(devices_raw):
-                if d.get("id") == full.id:
-                    devices_raw[idx] = payload
-                    break
-            else:
-                devices_raw.append(payload)
-
-            if normalized_state is not None:
-                states[key] = normalized_state
-
-            # Применяем обновление к координатору, диагностические поля не трогаем
-            coordinator.async_set_updated_data(
-                {
-                    "devices": devices_raw,
-                    "device_map": device_map,
-                    "states": states,
-                    "last_success_ts": cur.get("last_success_ts"),
-                    "avg_latency_ms": cur.get("avg_latency_ms"),
-                    "request_retries": cur.get("request_retries", 0),
-                }
-            )
-            # Record timestamp so _async_update_data can detect a fresher
-            # targeted refresh and avoid overwriting it during the next poll.
-            coordinator._refresh_device_update_ts[key] = time.monotonic()
-            device_name = full.name if hasattr(full, "name") else None
-            _fire_logbook_event(
-                EVENT_DEVICE_UPDATED,
-                {"device_id": key, "device_name": device_name, "source": "refresh_device"},
-            )
+        if not update.changed:
+            return
+        coordinator.async_set_updated_data(update.data)
+        _fire_logbook_event(
+            EVENT_DEVICE_UPDATED,
+            {
+                "device_id": full.id,
+                "device_name": full.name,
+                "source": "refresh_device",
+            },
+        )
 
     async def refresh_device(device_id: int | str) -> None:
         """Refresh one device with per-device request coalescing."""
-        key = str(device_id)
+        key = normalize_device_id(device_id)
 
         in_flight = refresh_tasks.get(key)
         if in_flight and not in_flight.done():
@@ -349,75 +318,38 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             _LOGGER.warning("WebSocket message has unexpected data format: %s", payload)
             return
 
-        async with state_update_lock:
-            cur: AtmeexCoordinatorData = coordinator.data or {
-                "devices": [],
-                "device_map": {},
-                "states": {},
-                "last_success_ts": None,
-                "avg_latency_ms": None,
-                "request_retries": 0,
-            }
-            device_map = cur.get("device_map", {}) or {}
-            if not device_map:
-                return
-
-            states: dict[str, dict[str, Any]] = dict(cur.get("states", {}))
-            changed = False
-            changed_device_ids: list[str] = []
-
-            for device_data in payload:
-                if not isinstance(device_data, dict):
+        changed_device_ids: list[str] = []
+        for device_data in payload:
+            if not isinstance(device_data, dict) or "id" not in device_data:
+                continue
+            try:
+                key = normalize_device_id(device_data["id"])
+            except ValueError:
+                continue
+            current_state = state_store.data.get("states", {}).get(key, {})
+            if msg_type == "condition":
+                source = device_data.get("condition")
+                if not isinstance(source, dict) or not source:
                     continue
-
-                device_id = device_data.get("id")
-                if device_id is None:
+                state_delta, device_delta = normalize_condition_delta(source)
+            else:
+                source = device_data.get("settings")
+                if not isinstance(source, dict) or not source:
                     continue
-
-                key = str(device_id)
-                if key not in device_map:
-                    _LOGGER.debug(
-                        "WebSocket: device %s not in current map, skipping message",
-                        device_id,
-                    )
-                    continue
-
-                if msg_type == "condition":
-                    source = device_data.get("condition")
-                    if not isinstance(source, dict) or not source:
-                        continue
-                    updated_state = apply_condition_update(states.get(key, {}), source)
-                else:
-                    source = device_data.get("settings")
-                    if not isinstance(source, dict) or not source:
-                        continue
-                    updated_state = apply_settings_update(states.get(key, {}), source)
-
-                if updated_state != states.get(key, {}):
-                    states[key] = updated_state
-                    changed = True
-                    changed_device_ids.append(key)
-
-            if not changed:
-                return
-
-            # Record per-device WS update timestamp so polling knows not to
-            # overwrite this fresher state.
-            ws_now = time.monotonic()
-            _ws_ts_store = coordinator._ws_device_update_ts
-            for did in changed_device_ids:
-                _ws_ts_store[did] = ws_now
-
-            coordinator.async_set_updated_data(
-                {
-                    "devices": cur.get("devices", []),
-                    "device_map": dict(device_map),
-                    "states": states,
-                    "last_success_ts": cur.get("last_success_ts"),
-                    "avg_latency_ms": cur.get("avg_latency_ms"),
-                    "request_retries": cur.get("request_retries", 0),
-                }
+                state_delta, device_delta = normalize_settings_delta(
+                    source,
+                    current_state,
+                )
+            update = state_store.apply_websocket_delta(
+                key,
+                state_delta=state_delta,
+                device_delta=device_delta,
             )
+            if update.changed:
+                changed_device_ids.append(key)
+
+        if changed_device_ids:
+            coordinator.async_set_updated_data(state_store.data)
             _fire_websocket_device_updated(changed_device_ids, msg_type)
 
     if enable_websocket:
@@ -524,6 +456,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         api=api,
         coordinator=coordinator,
         refresh_device=refresh_device,
+        state_store=state_store,
         websocket_manager=websocket_manager,
         websocket_start_task=websocket_start_task,
     )

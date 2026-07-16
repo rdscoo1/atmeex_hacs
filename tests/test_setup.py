@@ -59,12 +59,11 @@ async def test_async_setup_entry_happy_path(monkeypatch):
             self.last_update_success = False
             self.last_api_error = None
             self.last_success_ts = None
-            self._ws_device_update_ts = {}
-
-        def setup_update(self, *, api, fire_logbook_event):
+        def setup_update(self, *, api, state_store, fire_logbook_event):
             import types
             from custom_components.atmeex_cloud.coordinator import AtmeexCoordinator as _Real
             self._api = api
+            self.state_store = state_store
             self._fire_logbook_event = fire_logbook_event
             self._api_error_last_ts = float("-inf")
             self._api_error_suppressed = 0
@@ -118,7 +117,10 @@ async def test_async_setup_entry_happy_path(monkeypatch):
     # Новое поведение: данные лежат в entry.runtime_data
     runtime = entry.runtime_data
     assert runtime.api is created_apis[0]
+    assert runtime.state_store is runtime.coordinator.state_store
+    assert runtime.state_store.data is runtime.coordinator.data
     assert runtime.coordinator.data["devices"][0]["id"] == 1
+    assert runtime.state_store.data["states"]["1"]["pwr_on"] is True
     assert runtime.coordinator.data["states"]["1"]["pwr_on"] is True
     assert runtime.coordinator.data["states"]["1"]["fan_speed"] == 4  # API 3 → HA 4
 
@@ -161,12 +163,11 @@ async def test_async_setup_entry_uses_options_update_interval(
             self.last_update_success = False
             self.last_api_error = None
             self.last_success_ts = None
-            self._ws_device_update_ts = {}
-
-        def setup_update(self, *, api, fire_logbook_event):
+        def setup_update(self, *, api, state_store, fire_logbook_event):
             import types
             from custom_components.atmeex_cloud.coordinator import AtmeexCoordinator as _Real
             self._api = api
+            self.state_store = state_store
             self._fire_logbook_event = fire_logbook_event
             self._api_error_last_ts = float("-inf")
             self._api_error_suppressed = 0
@@ -322,12 +323,11 @@ async def test_setup_entry_uses_authoritative_inventory_and_hydration_fallback(
             self.last_update_success = False
             self.last_api_error = None
             self.last_success_ts = None
-            self._ws_device_update_ts = {}
-
-        def setup_update(self, *, api, fire_logbook_event):
+        def setup_update(self, *, api, state_store, fire_logbook_event):
             import types
             from custom_components.atmeex_cloud.coordinator import AtmeexCoordinator as _Real
             self._api = api
+            self.state_store = state_store
             self._fire_logbook_event = fire_logbook_event
             self._api_error_last_ts = float("-inf")
             self._api_error_suppressed = 0
@@ -396,12 +396,11 @@ async def test_setup_entry_reauth_on_authoritative_inventory_auth_error(monkeypa
             self.last_update_success = False
             self.last_api_error = None
             self.last_success_ts = None
-            self._ws_device_update_ts = {}
-
-        def setup_update(self, *, api, fire_logbook_event):
+        def setup_update(self, *, api, state_store, fire_logbook_event):
             import types
             from custom_components.atmeex_cloud.coordinator import AtmeexCoordinator as _Real
             self._api = api
+            self.state_store = state_store
             self._fire_logbook_event = fire_logbook_event
             self._api_error_last_ts = float("-inf")
             self._api_error_suppressed = 0
@@ -455,12 +454,11 @@ async def test_setup_entry_reload_listener_reloads_for_options_change(monkeypatc
             self.last_update_success = False
             self.last_api_error = None
             self.last_success_ts = None
-            self._ws_device_update_ts = {}
-
-        def setup_update(self, *, api, fire_logbook_event):
+        def setup_update(self, *, api, state_store, fire_logbook_event):
             import types
             from custom_components.atmeex_cloud.coordinator import AtmeexCoordinator as _Real
             self._api = api
+            self.state_store = state_store
             self._fire_logbook_event = fire_logbook_event
             self._api_error_last_ts = float("-inf")
             self._api_error_suppressed = 0
@@ -515,10 +513,7 @@ def _setup_test_coordinator_class():
             self.last_update_success = False
             self.last_api_error = None
             self.last_success_ts = None
-            self._ws_device_update_ts = {}
-            self._refresh_device_update_ts = {}
-
-        def setup_update(self, *, api, fire_logbook_event):
+        def setup_update(self, *, api, state_store, fire_logbook_event):
             import types
 
             from custom_components.atmeex_cloud.coordinator import (
@@ -526,6 +521,7 @@ def _setup_test_coordinator_class():
             )
 
             self._api = api
+            self.state_store = state_store
             self._fire_logbook_event = fire_logbook_event
             self._api_error_last_ts = float("-inf")
             self._api_error_suppressed = 0
@@ -650,12 +646,11 @@ async def test_refresh_token_persistence_failure_is_logged_not_raised(monkeypatc
             self.last_update_success = False
             self.last_api_error = None
             self.last_success_ts = None
-            self._ws_device_update_ts = {}
-
-        def setup_update(self, *, api, fire_logbook_event):
+        def setup_update(self, *, api, state_store, fire_logbook_event):
             import types
             from custom_components.atmeex_cloud.coordinator import AtmeexCoordinator as _Real
             self._api = api
+            self.state_store = state_store
             self._fire_logbook_event = fire_logbook_event
             self._api_error_last_ts = float("-inf")
             self._api_error_suppressed = 0
@@ -728,12 +723,11 @@ async def test_setup_entry_websocket_skipped_without_ws_connect(monkeypatch):
             self.last_update_success = False
             self.last_api_error = None
             self.last_success_ts = None
-            self._ws_device_update_ts = {}
-
-        def setup_update(self, *, api, fire_logbook_event):
+        def setup_update(self, *, api, state_store, fire_logbook_event):
             import types
             from custom_components.atmeex_cloud.coordinator import AtmeexCoordinator as _Real
             self._api = api
+            self.state_store = state_store
             self._fire_logbook_event = fire_logbook_event
             self._api_error_last_ts = float("-inf")
             self._api_error_suppressed = 0
@@ -797,12 +791,11 @@ async def test_setup_entry_websocket_skipped_without_token(monkeypatch):
             self.last_update_success = False
             self.last_api_error = None
             self.last_success_ts = None
-            self._ws_device_update_ts = {}
-
-        def setup_update(self, *, api, fire_logbook_event):
+        def setup_update(self, *, api, state_store, fire_logbook_event):
             import types
             from custom_components.atmeex_cloud.coordinator import AtmeexCoordinator as _Real
             self._api = api
+            self.state_store = state_store
             self._fire_logbook_event = fire_logbook_event
             self._api_error_last_ts = float("-inf")
             self._api_error_suppressed = 0

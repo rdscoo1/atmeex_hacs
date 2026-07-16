@@ -11,6 +11,8 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable
 
+from .state_store import AtmeexStateStore
+
 _LOGGER = logging.getLogger(__name__)
 
 
@@ -28,6 +30,9 @@ class AtmeexRuntimeData:
     api: Any  # AtmeexApi
     coordinator: Any  # AtmeexCoordinator
     refresh_device: Callable[[int | str], Awaitable[None]] | None
+    # Optional only as a temporary bridge for lightweight platform-test fakes.
+    # Production setup always injects the entry-owned store.
+    state_store: AtmeexStateStore | None = None
     # Per-device locks to serialize set+refresh operations
     device_locks: dict[str, asyncio.Lock] = field(default_factory=dict)
     # Per-device pending commands: device_id -> {attribute -> PendingCommand}

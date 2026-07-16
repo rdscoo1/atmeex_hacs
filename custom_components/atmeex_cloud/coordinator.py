@@ -67,21 +67,11 @@ class AtmeexCoordinator(DataUpdateCoordinator[AtmeexCoordinatorData]):
         *,
         api: AtmeexApi,
         fire_logbook_event: Callable[[str, dict[str, Any]], None],
-        state_store: AtmeexStateStore | None = None,
+        state_store: AtmeexStateStore,
     ) -> None:
-        """Inject dependencies needed by _async_update_data.
-
-        Called once from async_setup_entry after the coordinator is created.
-
-        ``state_store`` is temporarily optional while callers migrate to the
-        entry-owned store; omitting it creates a coordinator-owned store.
-        """
+        """Inject dependencies needed by _async_update_data."""
         self._api = api
-        # Public because the composition root and command executor share this
-        # same entry-owned store.
-        self.state_store = (
-            state_store if state_store is not None else AtmeexStateStore()
-        )
+        self.state_store = state_store
         self._fire_logbook_event = fire_logbook_event
 
     def _fire_api_error_event(self, data: dict[str, Any]) -> None:
@@ -122,10 +112,6 @@ class AtmeexCoordinator(DataUpdateCoordinator[AtmeexCoordinatorData]):
     async def _async_update_data(self) -> AtmeexCoordinatorData:
         """Плановый опрос: тянем устройства, при ошибке кидаем UpdateFailed / AuthFailed."""
 
-        if not hasattr(self, "state_store"):
-            # Temporary compatibility for coordinator-like test/migration
-            # adapters that bind this method without calling setup_update().
-            self.state_store = AtmeexStateStore()
         state_store = self.state_store
         if state_store is None:
             raise UpdateFailed("Atmeex state store is not configured")

@@ -97,13 +97,13 @@ async def test_websocket_batch_message_updates_coordinator_once(monkeypatch):
             self.last_update_success = False
             self.last_api_error = None
             self.last_success_ts = None
-            self._ws_device_update_ts = {}
             self.update_calls = 0
 
-        def setup_update(self, *, api, fire_logbook_event):
+        def setup_update(self, *, api, state_store, fire_logbook_event):
             import types
             from custom_components.atmeex_cloud.coordinator import AtmeexCoordinator as _Real
             self._api = api
+            self.state_store = state_store
             self._fire_logbook_event = fire_logbook_event
             self._api_error_last_ts = float("-inf")
             self._api_error_suppressed = 0
@@ -165,6 +165,14 @@ async def test_websocket_batch_message_updates_coordinator_once(monkeypatch):
     assert coordinator.update_calls == 1
     assert coordinator.data["states"]["1"]["fan_speed"] == 4
     assert coordinator.data["states"]["2"]["fan_speed"] == 5
+    assert coordinator.data["device_map"]["1"].condition["fan_speed"] == 3
+    assert coordinator.data["device_map"]["2"].condition["fan_speed"] == 4
+    device_events = [
+        call
+        for call in hass.bus.async_fire.call_args_list
+        if call.args and call.args[0] == atmeex_init.EVENT_DEVICE_UPDATED
+    ]
+    assert len(device_events) == 1
     assert any(
         call.args and call.args[0] == atmeex_init.EVENT_DEVICE_UPDATED
         for call in hass.bus.async_fire.call_args_list
@@ -226,12 +234,11 @@ async def test_setup_entry_websocket_auth_failure_starts_reauth(monkeypatch):
             self.last_update_success = False
             self.last_api_error = None
             self.last_success_ts = None
-            self._ws_device_update_ts = {}
-
-        def setup_update(self, *, api, fire_logbook_event):
+        def setup_update(self, *, api, state_store, fire_logbook_event):
             import types
             from custom_components.atmeex_cloud.coordinator import AtmeexCoordinator as _Real
             self._api = api
+            self.state_store = state_store
             self._fire_logbook_event = fire_logbook_event
             self._api_error_last_ts = float("-inf")
             self._api_error_suppressed = 0
@@ -339,12 +346,11 @@ async def test_ws_reauth_can_trigger_again_after_successful_reconnect(monkeypatc
             self.last_update_success = False
             self.last_api_error = None
             self.last_success_ts = None
-            self._ws_device_update_ts = {}
-
-        def setup_update(self, *, api, fire_logbook_event):
+        def setup_update(self, *, api, state_store, fire_logbook_event):
             import types
             from custom_components.atmeex_cloud.coordinator import AtmeexCoordinator as _Real
             self._api = api
+            self.state_store = state_store
             self._fire_logbook_event = fire_logbook_event
             self._api_error_last_ts = float("-inf")
             self._api_error_suppressed = 0
@@ -468,13 +474,13 @@ async def test_websocket_settings_message_updates_state(monkeypatch):
             self.last_update_success = False
             self.last_api_error = None
             self.last_success_ts = None
-            self._ws_device_update_ts = {}
             self.update_calls = 0
 
-        def setup_update(self, *, api, fire_logbook_event):
+        def setup_update(self, *, api, state_store, fire_logbook_event):
             import types
             from custom_components.atmeex_cloud.coordinator import AtmeexCoordinator as _Real
             self._api = api
+            self.state_store = state_store
             self._fire_logbook_event = fire_logbook_event
             self._api_error_last_ts = float("-inf")
             self._api_error_suppressed = 0
@@ -547,6 +553,9 @@ async def test_websocket_settings_message_updates_state(monkeypatch):
     assert state["u_temp_room"] == 215
     assert state["hum_stg"] == 2
     assert state["damp_pos"] == 1
+    settings = runtime.coordinator.data["device_map"]["1"].settings
+    assert settings["u_fan_speed"] == 3
+    assert settings["u_pwr_on"] is True
 
 async def test_websocket_logbook_device_events_are_throttled(monkeypatch):
     import custom_components.atmeex_cloud.websocket as websocket_mod
@@ -609,12 +618,11 @@ async def test_websocket_logbook_device_events_are_throttled(monkeypatch):
             self.last_update_success = False
             self.last_api_error = None
             self.last_success_ts = None
-            self._ws_device_update_ts = {}
-
-        def setup_update(self, *, api, fire_logbook_event):
+        def setup_update(self, *, api, state_store, fire_logbook_event):
             import types
             from custom_components.atmeex_cloud.coordinator import AtmeexCoordinator as _Real
             self._api = api
+            self.state_store = state_store
             self._fire_logbook_event = fire_logbook_event
             self._api_error_last_ts = float("-inf")
             self._api_error_suppressed = 0
@@ -745,12 +753,13 @@ async def _build_ws_runtime(monkeypatch, *, initial_condition=None):
             self.last_update_success = False
             self.last_api_error = None
             self.last_success_ts = None
-            self._ws_device_update_ts = {}
+            self.update_calls = 0
 
-        def setup_update(self, *, api, fire_logbook_event):
+        def setup_update(self, *, api, state_store, fire_logbook_event):
             import types
             from custom_components.atmeex_cloud.coordinator import AtmeexCoordinator as _Real
             self._api = api
+            self.state_store = state_store
             self._fire_logbook_event = fire_logbook_event
             self._api_error_last_ts = float("-inf")
             self._api_error_suppressed = 0
@@ -762,6 +771,7 @@ async def _build_ws_runtime(monkeypatch, *, initial_condition=None):
             self.last_update_success = True
 
         def async_set_updated_data(self, data):
+            self.update_calls += 1
             self.data = data
 
         async def async_request_refresh(self):
@@ -798,6 +808,69 @@ async def _fire_and_drain(runtime, callback, message):
     callback(message)
     if runtime.websocket_message_task:
         await runtime.websocket_message_task
+
+
+async def test_websocket_invalid_boolean_keeps_valid_sibling_and_device_model(
+    monkeypatch,
+):
+    runtime, callback, _hass = await _build_ws_runtime(monkeypatch)
+
+    await _fire_and_drain(
+        runtime,
+        callback,
+        {
+            "type": "condition",
+            "data": [
+                {
+                    "id": "01",
+                    "condition": {
+                        "pwr_on": "not-a-boolean",
+                        "fan_speed": 4,
+                    },
+                }
+            ],
+        },
+    )
+
+    state = runtime.coordinator.data["states"]["1"]
+    device = runtime.coordinator.data["device_map"]["1"]
+    assert runtime.coordinator.update_calls == 1
+    assert state["pwr_on"] is True
+    assert state["fan_speed"] == 5
+    assert device.condition["pwr_on"] == 1
+    assert device.condition["fan_speed"] == 4
+
+
+async def test_websocket_equivalent_delta_does_not_publish_but_touches_revision(
+    monkeypatch,
+):
+    runtime, callback, _hass = await _build_ws_runtime(monkeypatch)
+    baseline = runtime.state_store.capture_device("1")
+    publish_count = runtime.coordinator.update_calls
+
+    await _fire_and_drain(
+        runtime,
+        callback,
+        {
+            "type": "condition",
+            "data": [{"id": 1, "condition": {"pwr_on": 1, "fan_speed": 2}}],
+        },
+    )
+
+    assert runtime.coordinator.update_calls == publish_count
+    stale = AtmeexDevice.from_raw(
+        {
+            "id": 1,
+            "name": "Dev1",
+            "model": "m",
+            "online": True,
+            "condition": {"pwr_on": 0, "fan_speed": 2},
+            "settings": {},
+        }
+    )
+    update = runtime.state_store.apply_refresh(stale, baseline)
+    assert update.changed is False
+    assert runtime.state_store.data["states"]["1"]["pwr_on"] is True
 
 async def test_apply_condition_update_sets_online_always_true(monkeypatch):
     """A WS condition message always marks the device as online, even without a time field."""
@@ -970,12 +1043,11 @@ async def test_refresh_device_coalesces_parallel_requests(monkeypatch):
             self.last_update_success = False
             self.last_api_error = None
             self.last_success_ts = None
-            self._ws_device_update_ts = {}
-
-        def setup_update(self, *, api, fire_logbook_event):
+        def setup_update(self, *, api, state_store, fire_logbook_event):
             import types
             from custom_components.atmeex_cloud.coordinator import AtmeexCoordinator as _Real
             self._api = api
+            self.state_store = state_store
             self._fire_logbook_event = fire_logbook_event
             self._api_error_last_ts = float("-inf")
             self._api_error_suppressed = 0
@@ -1083,12 +1155,11 @@ async def test_refresh_device_hung_task_times_out_for_second_caller(monkeypatch)
             self.last_update_success = False
             self.last_api_error = None
             self.last_success_ts = None
-            self._ws_device_update_ts = {}
-
-        def setup_update(self, *, api, fire_logbook_event):
+        def setup_update(self, *, api, state_store, fire_logbook_event):
             import types
             from custom_components.atmeex_cloud.coordinator import AtmeexCoordinator as _Real
             self._api = api
+            self.state_store = state_store
             self._fire_logbook_event = fire_logbook_event
             self._api_error_last_ts = float("-inf")
             self._api_error_suppressed = 0
