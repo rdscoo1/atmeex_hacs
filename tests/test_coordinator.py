@@ -1,4 +1,5 @@
 """Unit tests for AtmeexCoordinator._async_update_data."""
+import asyncio
 import logging
 import time
 
@@ -18,6 +19,7 @@ from custom_components.atmeex_cloud.api import (
 )
 from custom_components.atmeex_cloud.const import EVENT_API_ERROR, WS_LOGBOOK_MIN_INTERVAL_SEC
 from custom_components.atmeex_cloud.coordinator import AtmeexCoordinator
+from custom_components.atmeex_cloud.state_store import AtmeexStateStore
 
 
 def _make_coordinator(devices=None, get_device_side_effect=None):
@@ -43,8 +45,217 @@ def _make_coordinator(devices=None, get_device_side_effect=None):
         hass, logging.getLogger("test"), name="test",
         update_interval=None,
     )
-    coord.setup_update(api=api, fire_logbook_event=MagicMock())
+    coord.setup_update(
+        api=api,
+        state_store=AtmeexStateStore(),
+        fire_logbook_event=MagicMock(),
+    )
     return coord, api
+
+
+@pytest.mark.asyncio
+async def test_poll_baseline_preserves_later_websocket_field_with_event_barrier():
+    stale = AtmeexDevice.from_raw(
+        {
+            "id": 1,
+            "online": True,
+            "condition": {"pwr_on": 1, "fan_speed": 1, "temp_in": 230},
+            "settings": {},
+        }
+    )
+    store = AtmeexStateStore()
+    store.apply_inventory([stale], store.capture_all())
+    started = asyncio.Event()
+    release = asyncio.Event()
+    coord, api = _make_coordinator(devices=[stale])
+    coord.setup_update(
+        api=api,
+        state_store=store,
+        fire_logbook_event=MagicMock(),
+    )
+
+    async def blocked_inventory():
+        started.set()
+        await release.wait()
+        return [stale]
+
+    api.get_devices = AsyncMock(side_effect=blocked_inventory)
+    api.get_device = AsyncMock(return_value=stale)
+    update_task = asyncio.create_task(coord._async_update_data())
+    await started.wait()
+    store.apply_websocket_delta("1", state_delta={"pwr_on": False})
+    release.set()
+    data = await update_task
+    assert data["states"]["1"]["pwr_on"] is False
+    assert data["states"]["1"]["temp_in"] == 230
+    assert coord.state_store is store
+
+
+@pytest.mark.asyncio
+async def test_poll_race_accepts_unrelated_field_while_preserving_websocket_field():
+    current = AtmeexDevice.from_raw(
+        {
+            "id": 1,
+            "online": True,
+            "condition": {"pwr_on": 1, "fan_speed": 1, "temp_in": 170},
+            "settings": {},
+        }
+    )
+    polled = AtmeexDevice.from_raw(
+        {
+            "id": 1,
+            "online": True,
+            "condition": {"pwr_on": 1, "fan_speed": 1, "temp_in": 230},
+            "settings": {},
+        }
+    )
+    store = AtmeexStateStore()
+    store.apply_inventory([current], store.capture_all())
+    started = asyncio.Event()
+    release = asyncio.Event()
+    coord, api = _make_coordinator(devices=[polled])
+    coord.setup_update(
+        api=api,
+        state_store=store,
+        fire_logbook_event=MagicMock(),
+    )
+
+    async def blocked_inventory():
+        started.set()
+        await release.wait()
+        return [polled]
+
+    api.get_devices = AsyncMock(side_effect=blocked_inventory)
+    api.get_device = AsyncMock(return_value=polled)
+    update_task = asyncio.create_task(coord._async_update_data())
+    await started.wait()
+    store.apply_websocket_delta("1", state_delta={"pwr_on": False})
+    release.set()
+
+    data = await update_task
+
+    assert data["states"]["1"]["pwr_on"] is False
+    assert data["states"]["1"]["temp_in"] == 230
+
+
+@pytest.mark.asyncio
+async def test_malformed_nested_inventory_maps_to_update_failed_and_preserves_snapshot():
+    valid = AtmeexDevice.from_raw(
+        {
+            "id": 1,
+            "online": True,
+            "condition": {"pwr_on": 1, "fan_speed": 1},
+            "settings": {},
+        }
+    )
+    malformed = AtmeexDevice.from_raw(
+        {
+            "id": 1,
+            "online": True,
+            "condition": {"pwr_on": "sometimes", "fan_speed": 2},
+            "settings": {},
+        }
+    )
+    store = AtmeexStateStore()
+    store.apply_inventory([valid], store.capture_all())
+    store.apply_websocket_delta("1", state_delta={"fan_speed": 7})
+    before = store.data
+    before_revisions = dict(store.capture_device("1").revisions)
+    coord, api = _make_coordinator(devices=[malformed])
+    coord.setup_update(
+        api=api,
+        state_store=store,
+        fire_logbook_event=MagicMock(),
+    )
+
+    with pytest.raises(UpdateFailed, match="Atmeex API update failed") as exc_info:
+        await coord._async_update_data()
+
+    assert isinstance(exc_info.value.__cause__, AtmeexProtocolError)
+    assert store.data is before
+    assert store.capture_device("1").revisions == before_revisions
+
+
+@pytest.mark.asyncio
+async def test_authoritative_absence_removes_device_after_two_successful_polls():
+    device = AtmeexDevice.from_raw(
+        {
+            "id": 1,
+            "online": True,
+            "condition": {"pwr_on": 1},
+            "settings": {},
+        }
+    )
+    coord, api = _make_coordinator(devices=[device])
+    initial = await coord._async_update_data()
+    assert "1" in initial["device_map"]
+    api.get_devices = AsyncMock(return_value=[])
+    api.get_device = AsyncMock()
+
+    first_absence = await coord._async_update_data()
+    second_absence = await coord._async_update_data()
+
+    assert "1" in first_absence["device_map"]
+    assert second_absence == {"devices": [], "device_map": {}, "states": {}}
+    api.get_device.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_failed_poll_does_not_advance_authoritative_absence():
+    device = AtmeexDevice.from_raw(
+        {
+            "id": 1,
+            "online": True,
+            "condition": {"pwr_on": 1},
+            "settings": {},
+        }
+    )
+    coord, api = _make_coordinator(devices=[device])
+    initial = await coord._async_update_data()
+    api.get_devices = AsyncMock(return_value=[])
+    first_absence = await coord._async_update_data()
+    api.get_devices = AsyncMock(
+        side_effect=AtmeexConnectionError("get_devices", "offline")
+    )
+
+    with pytest.raises(UpdateFailed):
+        await coord._async_update_data()
+
+    assert coord.state_store.data is first_absence
+    assert coord.state_store.data is initial
+    assert "1" in coord.state_store.data["device_map"]
+    api.get_devices = AsyncMock(return_value=[])
+    second_absence = await coord._async_update_data()
+    assert "1" not in second_absence["device_map"]
+
+
+@pytest.mark.asyncio
+async def test_metrics_are_not_part_of_comparable_coordinator_data():
+    coord, api = _make_coordinator()
+    api._retry_count = 3
+
+    first = await coord._async_update_data()
+    second = await coord._async_update_data()
+
+    assert set(first) == {"devices", "device_map", "states"}
+    assert second is first
+    assert coord.always_update is False
+    assert coord.last_success_ts is not None
+    assert coord.avg_latency_ms is not None
+    assert coord.request_retries == 3
+
+
+@pytest.mark.asyncio
+async def test_unexpected_coordinator_programming_error_propagates():
+    coord, api = _make_coordinator()
+
+    class _UnexpectedBug(RuntimeError):
+        pass
+
+    api.get_devices = AsyncMock(side_effect=_UnexpectedBug("programming bug"))
+
+    with pytest.raises(_UnexpectedBug, match="programming bug"):
+        await coord._async_update_data()
 
 
 @pytest.mark.asyncio
@@ -119,32 +330,6 @@ async def test_update_data_maps_typed_auth_error_to_config_entry_auth_failed():
 
     with pytest.raises(ConfigEntryAuthFailed, match="Atmeex authentication failed"):
         await coord._async_update_data()
-
-
-@pytest.mark.asyncio
-async def test_poll_does_not_overwrite_fresher_targeted_refresh_state():
-    """A targeted device refresh recorded after poll_start_mono must not be overwritten.
-
-    Mirrors the _ws_device_update_ts guard but for _refresh_device_update_ts.
-    """
-    coord, api = _make_coordinator()
-
-    # First poll to establish coordinator.data
-    data1 = await coord._async_update_data()
-    coord.data = data1
-    coord.last_update_success = True
-
-    # Simulate a targeted refresh that wrote a fresher state after the poll began
-    fresh_state = dict(data1["states"]["1"])
-    fresh_state["fan_speed"] = 99  # sentinel value the poll can never produce
-    coord.data["states"]["1"] = fresh_state
-    coord._refresh_device_update_ts["1"] = float("inf")  # always newer than any poll
-
-    # Second poll — API still returns original stale data
-    data2 = await coord._async_update_data()
-
-    # The targeted-refresh state must be preserved, not overwritten by stale poll
-    assert data2["states"]["1"]["fan_speed"] == 99
 
 
 @pytest.mark.asyncio
