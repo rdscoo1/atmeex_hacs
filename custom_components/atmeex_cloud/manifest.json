@@ -8,6 +8,6 @@
   "iot_class": "cloud_polling",
   "issue_tracker": "https://github.com/rdscoo1/atmeex_hacs/issues",
   "loggers": ["custom_components.atmeex_cloud"],
-  "requirements": ["aiohttp>=3.9.0"],
+  "requirements": [],
   "version": "0.9.5"
 }

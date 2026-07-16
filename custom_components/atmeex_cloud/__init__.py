@@ -754,19 +754,37 @@ async def async_remove_config_entry_device(
     config_entry: ConfigEntry,
     device_entry: DeviceEntry,
 ) -> bool:
-    """Remove a device from the integration.
+    """Authoritatively allow device removal only when the cloud confirms absence.
 
-    This allows users to remove individual devices that are no longer
-    connected or needed. Per-device runtime state (locks, pending commands)
-    is dropped here so it doesn't accumulate across add/remove cycles.
+    A device is refused while it is still in the authoritative inventory (and
+    throughout the one-miss grace period, since the store keeps publishing it
+    until the second successful absence). An absent device is allowed, and its
+    per-device executor state is dropped so it doesn't accumulate across
+    add/remove cycles.
     """
     runtime: AtmeexRuntimeData | None = getattr(config_entry, "runtime_data", None)
-    if runtime is not None:
-        for domain, ident in device_entry.identifiers:
-            if domain != DOMAIN:
-                continue
-            if runtime.command_executor is not None:
-                runtime.command_executor.remove_device(ident)
+    if runtime is None:
+        return False
 
-    # The device will reappear on next poll if it's still connected to the account.
+    atmeex_ids = {
+        str(identifier)
+        for domain, identifier in device_entry.identifiers
+        if domain == DOMAIN
+    }
+    if not atmeex_ids:
+        return False
+
+    state_store = getattr(runtime, "state_store", None)
+    current_ids = (
+        set(state_store.data.get("device_map", {}))
+        if state_store is not None
+        else set()
+    )
+    if not atmeex_ids.isdisjoint(current_ids):
+        # Still present in the authoritative inventory — refuse removal.
+        return False
+
+    if runtime.command_executor is not None:
+        for ident in atmeex_ids:
+            runtime.command_executor.remove_device(ident)
     return True

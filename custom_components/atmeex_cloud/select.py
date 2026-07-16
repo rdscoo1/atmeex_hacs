@@ -15,6 +15,10 @@ HUM_OPTIONS = HUMIDIFICATION_OPTIONS
 BREEZER_OPTIONS = BREEZER_MODES
 
 
+# Coordinator-driven updates; no per-entity update serialization needed.
+PARALLEL_UPDATES = 0
+
+
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_entities):
     """Set up Atmeex select entities (humidifier + breezer mode)."""
     runtime: AtmeexRuntimeData = entry.runtime_data

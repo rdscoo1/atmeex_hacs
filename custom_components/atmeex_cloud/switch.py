@@ -13,6 +13,10 @@ from .entity_base import AtmeexEntityMixin, setup_dynamic_device_entities
 from . import AtmeexRuntimeData
 
 
+# Coordinator-driven updates; no per-entity update serialization needed.
+PARALLEL_UPDATES = 0
+
+
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_entities):
     """Set up Atmeex switch entities (AutoNanny + Sleep Mode)."""
     runtime: AtmeexRuntimeData = entry.runtime_data

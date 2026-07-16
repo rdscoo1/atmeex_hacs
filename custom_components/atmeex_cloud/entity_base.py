@@ -110,7 +110,17 @@ class AtmeexEntityMixin:
 
     @property
     def available(self) -> bool:
-        """Entity is available only when device is reported online."""
+        """Entity availability = coordinator health AND device online.
+
+        Honors coordinator health so a stale integration (e.g. the cloud has
+        been unreachable for several polls) does not keep presenting last-known
+        device state as if it were live.
+        """
+        coordinator = getattr(self, "coordinator", None)
+        if coordinator is not None and not getattr(
+            coordinator, "last_update_success", True
+        ):
+            return False
         st = self._device_state
         if "online" in st:
             return bool(st["online"])

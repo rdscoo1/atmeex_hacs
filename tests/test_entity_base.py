@@ -307,3 +307,41 @@ def test_command_exception_translations_match():
                 if field_name is not None
             }
             assert actual_placeholders == placeholders
+
+
+# --- Coordinator-aware availability truth table (Plan 5) ---
+from types import SimpleNamespace  # noqa: E402
+
+from custom_components.atmeex_cloud.entity_base import AtmeexEntityMixin  # noqa: E402
+
+
+class _BareEntity(AtmeexEntityMixin):
+    def __init__(self, coordinator, device_id, meta):
+        self.coordinator = coordinator
+        self._device_id = device_id
+        self._device_meta = meta
+
+
+def _availability_coordinator(*, success: bool, online: bool):
+    dev = AtmeexDevice.from_raw(
+        {"id": 1, "online": online, "condition": {}, "settings": {}}
+    )
+    return SimpleNamespace(
+        data={"states": {"1": {"online": online}}, "device_map": {"1": dev}},
+        last_update_success=success,
+    ), dev
+
+
+@pytest.mark.parametrize(
+    ("success", "online", "expected"),
+    [
+        (True, True, True),    # healthy + online -> available
+        (True, False, False),  # healthy + offline -> unavailable
+        (False, True, False),  # coordinator unhealthy -> unavailable regardless
+        (False, False, False),
+    ],
+)
+def test_available_honors_coordinator_health_and_online(success, online, expected):
+    coordinator, dev = _availability_coordinator(success=success, online=online)
+    entity = _BareEntity(coordinator, 1, dev)
+    assert entity.available is expected

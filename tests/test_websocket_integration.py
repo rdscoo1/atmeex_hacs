@@ -89,6 +89,10 @@ class _IntegrationCoordinatorFake:
             RealAtmeexCoordinator._hydrate_devices,
             self,
         )
+        self._remove_confirmed_stale_devices = MethodType(
+            RealAtmeexCoordinator._remove_confirmed_stale_devices,
+            self,
+        )
         self._async_update_data = MethodType(
             RealAtmeexCoordinator._async_update_data,
             self,

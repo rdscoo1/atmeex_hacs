@@ -14,6 +14,7 @@ from typing import Any, TypedDict
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import ConfigEntryAuthFailed
+from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers.update_coordinator import (
     DataUpdateCoordinator,
     UpdateFailed,
@@ -28,7 +29,7 @@ from .api import (
     AtmeexProtocolError,
     AtmeexRateLimitError,
 )
-from .const import EVENT_API_ERROR, WS_LOGBOOK_MIN_INTERVAL_SEC
+from .const import DOMAIN, EVENT_API_ERROR, WS_LOGBOOK_MIN_INTERVAL_SEC
 from .helpers import normalize_device_id, parse_atmeex_bool
 from .state_store import AtmeexStateStore
 
@@ -308,6 +309,48 @@ class AtmeexCoordinator(DataUpdateCoordinator[AtmeexCoordinatorData]):
             self._last_detail_failure_count = len(detail_failures)
         return results
 
+    def _remove_confirmed_stale_devices(
+        self,
+        removed_device_ids: frozenset[str],
+    ) -> None:
+        """Drop this entry's association from devices confirmed absent.
+
+        Home Assistant purges a device once no config entry references it. The
+        store only reports an ID here after two consecutive successful
+        authoritative polls saw it absent, so a transient outage cannot retire
+        a device.
+        """
+        if not removed_device_ids:
+            return
+        hass = getattr(self, "hass", None)
+        if hass is None:
+            return
+        try:
+            registry = dr.async_get(hass)
+            stale_entries = dr.async_entries_for_config_entry(
+                registry,
+                self.config_entry_id,
+            )
+        except Exception:  # noqa: BLE001 - registry cleanup is best-effort
+            # Never let device-registry housekeeping break a successful poll
+            # (e.g. under a minimal test hass with no registry).
+            self.logger.debug(
+                "Skipping stale-device cleanup: registry unavailable"
+            )
+            return
+        for device_entry in stale_entries:
+            atmeex_ids = {
+                str(identifier)
+                for domain, identifier in device_entry.identifiers
+                if domain == DOMAIN
+            }
+            if atmeex_ids.isdisjoint(removed_device_ids):
+                continue
+            registry.async_update_device(
+                device_entry.id,
+                remove_config_entry_id=self.config_entry_id,
+            )
+
     async def _async_update_data(self) -> AtmeexCoordinatorData:
         """Fetch one authoritative inventory or report a truthful failure."""
         baselines = self.state_store.capture_all()
@@ -335,6 +378,11 @@ class AtmeexCoordinator(DataUpdateCoordinator[AtmeexCoordinatorData]):
             self.last_api_error = err
             self._fire_api_error_event(self._safe_error_event(err))
             raise UpdateFailed(f"{err.operation} failed") from err
+
+        # Disassociate only devices the store confirmed absent across two
+        # consecutive successful authoritative polls. This is below the typed
+        # exception handlers, so a failed inventory can never retire a device.
+        self._remove_confirmed_stale_devices(update.removed_device_ids)
 
         self.avg_latency_ms = round(
             (time.perf_counter() - started) * 1000.0,

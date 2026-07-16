@@ -460,14 +460,18 @@ async def test_async_remove_config_entry_device_drops_per_device_state():
     assert "99" in runtime.pending_commands
 
 async def test_async_remove_config_entry_device_handles_missing_runtime():
-    """Removal must not crash when runtime_data is unset (e.g. failed setup)."""
+    """Removal must not crash when runtime_data is unset (e.g. failed setup).
+
+    Without runtime we cannot confirm the device is absent from the
+    authoritative inventory, so removal is refused rather than allowed.
+    """
     entry = SimpleNamespace()  # no runtime_data attribute
     device_entry = SimpleNamespace(identifiers={(DOMAIN, "42")})
 
     result = await atmeex_init.async_remove_config_entry_device(
         hass=SimpleNamespace(), config_entry=entry, device_entry=device_entry
     )
-    assert result is True
+    assert result is False
 
 async def test_async_remove_config_entry_device_unknown_device_is_noop():
     """Removing a device that was never tracked must not raise."""

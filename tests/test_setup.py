@@ -79,6 +79,7 @@ class _SetupCoordinatorFake:
             "_previous_device",
             "_hydrate_one",
             "_hydrate_devices",
+            "_remove_confirmed_stale_devices",
             "_async_update_data",
         ):
             setattr(

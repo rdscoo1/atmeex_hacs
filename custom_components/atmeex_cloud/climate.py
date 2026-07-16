@@ -49,6 +49,11 @@ _PRESET_RESTORE_FAN = "preset_restore_fan"
 BREEZER_SWING_MODES = BREEZER_MODES
 
 
+# Entities are updated centrally by the coordinator, so Home Assistant does not
+# need to serialize per-entity updates.
+PARALLEL_UPDATES = 0
+
+
 async def async_setup_entry(
     hass: HomeAssistant,
     entry: ConfigEntry,

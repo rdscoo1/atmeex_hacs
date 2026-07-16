@@ -20,6 +20,10 @@ from .entity_base import AtmeexEntityMixin, setup_dynamic_device_entities, suppo
 _LOGGER = logging.getLogger(__name__)
 
 
+# Coordinator-driven updates; no per-entity update serialization needed.
+PARALLEL_UPDATES = 0
+
+
 async def async_setup_entry(
     hass: HomeAssistant,
     entry: ConfigEntry,

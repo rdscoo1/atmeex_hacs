@@ -22,6 +22,10 @@ from homeassistant.helpers.update_coordinator import (
 
 _LOGGER = logging.getLogger(__name__)
 
+# Coordinator-driven updates; no per-entity update serialization needed.
+PARALLEL_UPDATES = 0
+
+
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_entities):
     """Set up Atmeex fan entities from a config entry."""
     runtime: AtmeexRuntimeData = entry.runtime_data 

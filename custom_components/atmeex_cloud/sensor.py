@@ -66,6 +66,10 @@ _DEVICE_SENSOR_SPECS: tuple[_SensorSpec, ...] = (
 _SPEC_BY_SUFFIX: dict[str, _SensorSpec] = {s.unique_suffix: s for s in _DEVICE_SENSOR_SPECS}
 
 
+# Coordinator-driven updates; no per-entity update serialization needed.
+PARALLEL_UPDATES = 0
+
+
 async def async_setup_entry(
     hass: HomeAssistant,
     entry: ConfigEntry,
