@@ -351,6 +351,44 @@ class AtmeexCoordinator(DataUpdateCoordinator[AtmeexCoordinatorData]):
                 remove_config_entry_id=self.config_entry_id,
             )
 
+    async def async_ensure_inventory_fresh(
+        self,
+        *,
+        now_mono: float | None = None,
+    ) -> bool:
+        """Force an authoritative refresh if the inventory is older than the age cap.
+
+        Continuous WebSocket push traffic keeps device *state* fresh without any
+        authoritative ``/devices`` poll, so a removed or renamed device could
+        otherwise linger indefinitely. Returns True when a refresh was requested.
+        """
+        now = time.monotonic() if now_mono is None else now_mono
+        last_success = self.last_inventory_success_mono
+        if (
+            last_success is not None
+            and now - last_success < self._max_inventory_age_seconds
+        ):
+            return False
+        await self.async_request_refresh()
+        return True
+
+    async def async_inventory_watchdog(
+        self,
+        check_interval: float | None = None,
+    ) -> None:
+        """Entry-owned loop that enforces the maximum inventory age.
+
+        Cancelled by runtime cleanup on unload; no internal stop flag needed.
+        """
+        interval = (
+            check_interval
+            if check_interval is not None
+            else max(self._max_inventory_age_seconds / 2, 1.0)
+        )
+        while True:
+            await asyncio.sleep(interval)
+            await self.async_ensure_inventory_fresh()
+
     async def _async_update_data(self) -> AtmeexCoordinatorData:
         """Fetch one authoritative inventory or report a truthful failure."""
         baselines = self.state_store.capture_all()
