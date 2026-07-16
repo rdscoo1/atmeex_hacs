@@ -300,3 +300,102 @@ def test_websocket_state_copy_on_write_shares_unaffected_device_state():
     assert before_target["pwr_on"] is True
     assert update.data["states"]["1"]["pwr_on"] is False
     assert update.data["states"]["2"] is before_unaffected
+
+
+def test_refresh_preserves_newer_websocket_fields_but_accepts_unrelated_fields():
+    store = seed_store(device(name="Original", fan_speed=1, temp_in=170))
+    baseline = store.capture_device("1")
+    store.apply_websocket_delta(
+        "1",
+        state_delta={"fan_speed": 7},
+        device_delta={"name": "Push Name", "condition": {"fan_speed": 6}},
+    )
+    result = store.apply_refresh(
+        device(name="Stale Name", fan_speed=1, temp_in=225),
+        baseline,
+    )
+    assert result.changed is True
+    assert result.data["states"]["1"]["fan_speed"] == 7
+    assert result.data["states"]["1"]["temp_in"] == 225
+    assert result.data["device_map"]["1"].name == "Push Name"
+    assert result.data["device_map"]["1"].condition["temp_in"] == 225
+
+
+def test_same_value_newer_push_still_blocks_an_older_different_refresh():
+    store = seed_store(device(pwr_on=1))
+    baseline = store.capture_device("1")
+    store.apply_websocket_delta("1", state_delta={"pwr_on": True})
+
+    result = store.apply_refresh(device(pwr_on=0), baseline)
+
+    assert result.data["states"]["1"]["pwr_on"] is True
+
+
+def test_refresh_baseline_device_mismatch_is_atomic():
+    store = seed_store(device())
+    store.apply_websocket_delta("1", state_delta={"pwr_on": True})
+    store._absence_counts["1"] = 1
+    before = store.data
+    before_revisions = dict(store.capture_device("1").revisions)
+    mismatch = FieldRevisionBaseline("2", MappingProxyType({}))
+
+    with pytest.raises(ValueError, match="baseline device id"):
+        store.apply_refresh(device(1, name="Rejected"), mismatch)
+
+    assert store.data is before
+    assert store.capture_device("1").revisions == before_revisions
+    assert store._absence_counts == {"1": 1}
+
+
+def test_refresh_adds_an_owned_clone_for_an_unknown_device():
+    store = AtmeexStateStore()
+    incoming = device("0007")
+    incoming.raw["condition"]["history"] = {"samples": [18]}
+    baseline = store.capture_device("7")
+
+    update = store.apply_refresh(incoming, baseline)
+    stored = update.data["device_map"]["7"]
+    incoming.raw["condition"]["history"]["samples"].append(19)
+
+    assert update.changed is True
+    assert stored is not incoming
+    assert stored.id == 7
+    assert set(update.data["device_map"]) == {"7"}
+    assert set(update.data["states"]) == {"7"}
+    assert stored.condition["history"] == {"samples": [18]}
+    assert "device.id" not in store.capture_device("7").revisions
+
+
+def test_unchanged_refresh_advances_accepted_revisions_without_publishing():
+    store = seed_store(device())
+    store._absence_counts["1"] = 1
+    before = store.data
+    baseline = store.capture_device("1")
+
+    update = store.apply_refresh(device(), baseline)
+
+    assert update == StateStoreUpdate(before, False)
+    revisions = store.capture_device("1").revisions
+    assert revisions["device.name"] > baseline.revisions.get("device.name", 0)
+    assert revisions["state.pwr_on"] > baseline.revisions.get("state.pwr_on", 0)
+    assert "device.id" not in revisions
+    assert "state.id" not in revisions
+    assert store._absence_counts == {"1": 1}
+
+
+def test_refresh_copies_only_the_changed_target_state():
+    store = seed_store(
+        device(1, temp_in=170),
+        device(2, name="Second", temp_in=180),
+    )
+    before = store.data
+    before_target = before["states"]["1"]
+    before_unaffected = before["states"]["2"]
+    baseline = store.capture_device("1")
+
+    update = store.apply_refresh(device(1, temp_in=225), baseline)
+
+    assert before_target["temp_in"] == 170
+    assert update.data["states"]["1"] is not before_target
+    assert update.data["states"]["1"]["temp_in"] == 225
+    assert update.data["states"]["2"] is before_unaffected

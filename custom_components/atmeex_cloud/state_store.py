@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any
 
-from .api import AtmeexDevice
+from .api import AtmeexDevice, AtmeexState
 from .helpers import normalize_device_id
 
 if TYPE_CHECKING:
@@ -164,6 +164,92 @@ class AtmeexStateStore:
             if replacements:
                 device_map[key] = _rebuild_device(current_device, replacements)
 
+        return self._commit(
+            device_map,
+            states,
+            changed,
+            touched_paths=touched,
+        )
+
+    def _merge_device(
+        self,
+        incoming: AtmeexDevice,
+        baseline: FieldRevisionBaseline,
+        device_map: dict[str, AtmeexDevice],
+        states: dict[str, dict[str, Any]],
+    ) -> tuple[set[tuple[str, str]], set[tuple[str, str]]]:
+        key = normalize_device_id(incoming.id)
+        if baseline.device_id != key:
+            raise ValueError("baseline device id does not match response device id")
+
+        changed: set[tuple[str, str]] = set()
+        touched: set[tuple[str, str]] = set()
+        current_device = device_map.get(key)
+        current_fields = (
+            {}
+            if current_device is None
+            else _flatten_device(current_device.to_ha_dict())
+        )
+        incoming_fields = _flatten_device(incoming.to_ha_dict())
+        incoming_fields.pop("device.id", None)
+        replacements: dict[str, Any] = {}
+        revisions = self._field_revisions.get(key, {})
+
+        for path, value in incoming_fields.items():
+            if revisions.get(path, 0) != baseline.revisions.get(path, 0):
+                continue
+            touched.add((key, path))
+            if path not in current_fields or current_fields[path] != value:
+                replacements[path] = deepcopy(value)
+                changed.add((key, path))
+
+        if current_device is not None and replacements:
+            device_map[key] = _rebuild_device(current_device, replacements)
+        elif current_device is None:
+            accepted_device_paths = {
+                path for item_key, path in touched if item_key == key
+            }
+            if accepted_device_paths != set(incoming_fields):
+                return set(), set()
+            device_map[key] = AtmeexDevice.from_raw(
+                deepcopy(incoming.to_ha_dict())
+            )
+
+        incoming_state = AtmeexState.from_device_dict(
+            incoming.to_ha_dict()
+        ).to_ha_dict()
+        current_state = states.get(key, {})
+        state_replacements: dict[str, Any] = {}
+        for field, value in incoming_state.items():
+            if field == "id":
+                continue
+            path = f"state.{field}"
+            if revisions.get(path, 0) != baseline.revisions.get(path, 0):
+                continue
+            touched.add((key, path))
+            if field not in current_state or current_state[field] != value:
+                state_replacements[field] = deepcopy(value)
+                changed.add((key, path))
+        if state_replacements:
+            merged_state = deepcopy(current_state)
+            merged_state.update(state_replacements)
+            states[key] = merged_state
+
+        return changed, touched
+
+    def apply_refresh(
+        self,
+        device: AtmeexDevice,
+        baseline: FieldRevisionBaseline,
+    ) -> StateStoreUpdate:
+        device_map = dict(self._data.get("device_map", {}))
+        states = dict(self._data.get("states", {}))
+        changed, touched = self._merge_device(
+            device,
+            baseline,
+            device_map,
+            states,
+        )
         return self._commit(
             device_map,
             states,
