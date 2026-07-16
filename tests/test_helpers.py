@@ -14,7 +14,9 @@ from custom_components.atmeex_cloud.const import (
 )
 from custom_components.atmeex_cloud.helpers import (
     _normalize_device_state,
+    normalize_condition_delta,
     normalize_device_id,
+    normalize_settings_delta,
     parse_atmeex_bool,
 )
 from homeassistant.exceptions import ConfigEntryAuthFailed, ConfigEntryNotReady
@@ -61,6 +63,118 @@ def test_normalize_device_id_returns_stable_string_key(value, expected):
 def test_normalize_device_id_rejects_missing_or_boolean_ids(value):
     with pytest.raises(ValueError, match="invalid Atmeex device id"):
         normalize_device_id(value)
+
+
+def test_condition_delta_ignores_bad_boolean_but_keeps_valid_sibling():
+    state_delta, device_delta = normalize_condition_delta(
+        {"pwr_on": "unknown", "temp_in": "215"}
+    )
+    assert "pwr_on" not in state_delta
+    assert state_delta == {"temp_in": 215, "online": True}
+    assert device_delta == {"condition": {"temp_in": 215}, "online": True}
+
+
+def test_condition_delta_isolates_invalid_fields_and_ignores_unknown_fields():
+    condition = {
+        "pwr_on": "unknown",
+        "no_water": 2,
+        "u_auto": False,
+        "u_night": "false",
+        "fan_speed": "fast",
+        "temp_room": "warm",
+        "temp_in": "215",
+        "unknown": {"preserve": "input"},
+    }
+    original = {
+        **condition,
+        "unknown": dict(condition["unknown"]),
+    }
+
+    state_delta, device_delta = normalize_condition_delta(condition)
+
+    assert condition == original
+    assert state_delta == {
+        "u_auto": False,
+        "u_night": False,
+        "temp_in": 215,
+        "online": True,
+    }
+    assert device_delta == {
+        "condition": {"u_auto": False, "u_night": False, "temp_in": 215},
+        "online": True,
+    }
+
+
+def test_condition_delta_accepts_false_protocol_booleans():
+    state_delta, device_delta = normalize_condition_delta(
+        {"pwr_on": 0, "no_water": "off"}
+    )
+
+    assert state_delta == {"pwr_on": False, "no_water": False, "online": True}
+    assert device_delta == {
+        "condition": {"pwr_on": False, "no_water": False},
+        "online": True,
+    }
+
+
+@pytest.mark.parametrize(
+    ("power", "expected_fan_speed"),
+    [(False, None), (True, 5)],
+)
+def test_settings_delta_uses_accepted_power_before_fan_speed(
+    power, expected_fan_speed
+):
+    settings = {"u_pwr_on": power, "u_fan_speed": "4"}
+    current_state = {"pwr_on": not power, "fan_speed": 2}
+    original_settings = dict(settings)
+    original_state = dict(current_state)
+
+    state_delta, device_delta = normalize_settings_delta(settings, current_state)
+
+    assert settings == original_settings
+    assert current_state == original_state
+    assert state_delta == {
+        "pwr_on": power,
+        "u_fan_speed": 5,
+        **({"fan_speed": expected_fan_speed} if expected_fan_speed is not None else {}),
+        "online": True,
+    }
+    assert device_delta == {
+        "settings": {"u_pwr_on": power, "u_fan_speed": 4},
+        "online": True,
+    }
+
+
+def test_settings_delta_isolates_invalid_fields_and_keeps_valid_siblings():
+    settings = {
+        "u_pwr_on": "unknown",
+        "u_fan_speed": "fast",
+        "u_temp_room": "215",
+        "u_hum_stg": float("inf"),
+        "u_damp_pos": None,
+        "u_auto": "invalid",
+        "u_night": False,
+        "unknown": 42,
+    }
+    current_state = {"pwr_on": True, "fan_speed": 4}
+
+    state_delta, device_delta = normalize_settings_delta(settings, current_state)
+
+    assert state_delta == {"u_temp_room": 215, "u_night": False, "online": True}
+    assert device_delta == {
+        "settings": {"u_temp_room": 215, "u_night": False},
+        "online": True,
+    }
+
+
+def test_settings_delta_ignores_bad_fan_speed_instead_of_defaulting_to_minimum():
+    state_delta, device_delta = normalize_settings_delta(
+        {"u_fan_speed": "not-a-speed"}, {"pwr_on": True}
+    )
+
+    assert state_delta == {"online": True}
+    assert device_delta == {"online": True}
+
 
 def test_normalize_device_state_basic():
     """Test normalization converts API fan_speed (0-6) to HA fan_speed (1-7).
