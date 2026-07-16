@@ -1,7 +1,8 @@
 """Shared entity mixin contract tests."""
 from __future__ import annotations
 
-from unittest.mock import MagicMock
+import asyncio
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from homeassistant.components.climate import HVACMode
@@ -14,6 +15,7 @@ from custom_components.atmeex_cloud.binary_sensor import AtmeexOnlineSensor
 from custom_components.atmeex_cloud.fan import AtmeexFanEntity
 from custom_components.atmeex_cloud.sensor import AtmeexCO2Sensor
 from custom_components.atmeex_cloud.select import AtmeexBreezerSelect, BREEZER_OPTIONS
+from custom_components.atmeex_cloud.runtime import AtmeexRuntimeData
 from tests.test_climate import _make_entity, _make_entity_with_runtime
 from tests.test_fan import _make_fan_entity
 from tests.test_select import _make_selects
@@ -190,6 +192,346 @@ async def test_api_error_translates_to_home_assistant_error(
 
     with pytest.raises(HomeAssistantError, match=match):
         await action(ent)
+
+
+@pytest.mark.asyncio
+async def test_entity_passes_a_factory_to_the_entry_executor():
+    ent, _cond, api, runtime = _make_entity_with_runtime()
+    operation_started = False
+    captured_factory = None
+
+    async def capture_execute(
+        device_id,
+        operation,
+        *,
+        pending,
+        translation_key,
+        translation_placeholders=None,
+    ):
+        nonlocal captured_factory
+        captured_factory = operation
+        assert device_id == 1
+        assert pending == {"fan_speed": 5}
+        assert translation_key == "command_failed"
+
+    runtime.command_executor.async_execute = AsyncMock(side_effect=capture_execute)
+
+    async def set_fan_speed(device_id, speed):
+        nonlocal operation_started
+        operation_started = True
+
+    api.set_fan_speed.side_effect = set_fan_speed
+    await ent._execute_command(
+        lambda: api.set_fan_speed(1, 5),
+        pending={"fan_speed": 5},
+        translation_key="command_failed",
+    )
+
+    assert operation_started is False
+    assert callable(captured_factory)
+    await captured_factory()
+    assert operation_started is True
+
+
+@pytest.mark.asyncio
+async def test_entity_reuses_one_fallback_executor():
+    ent, _cond, _api = _make_entity()
+
+    async def operation() -> None:
+        return
+
+    await ent._execute_command(
+        operation,
+        pending={"fan_speed": 3},
+        translation_key="command_failed",
+    )
+    first = ent._fallback_command_executor
+    await ent._execute_command(
+        operation,
+        pending={"fan_speed": 5},
+        translation_key="command_failed",
+    )
+
+    assert ent._fallback_command_executor is first
+
+
+@pytest.mark.asyncio
+async def test_legacy_waiter_cancellation_closes_unstarted_coroutine():
+    ent, _cond, api, runtime = _make_entity_with_runtime()
+    lock = runtime.get_device_lock(1)
+    await lock.acquire()
+    runtime.set_pending(1, "fan_speed", 3)
+
+    waiter = asyncio.create_task(
+        ent._execute_command(
+            api.set_fan_speed(1, 5),
+            pending_attr="fan_speed",
+            pending_value=5,
+        )
+    )
+    await asyncio.sleep(0)
+    waiter.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await waiter
+    api.set_fan_speed.assert_not_awaited()
+    assert runtime.get_pending(1, "fan_speed").value == 3
+    lock.release()
+
+
+@pytest.mark.asyncio
+async def test_legacy_waiter_cancellation_preserves_newer_generation():
+    ent, _cond, api, runtime = _make_entity_with_runtime()
+    lock = runtime.get_device_lock(1)
+    await lock.acquire()
+    waiter = asyncio.create_task(
+        ent._execute_command(
+            api.set_fan_speed(1, 5),
+            pending_attr="fan_speed",
+            pending_value=5,
+        )
+    )
+    await asyncio.sleep(0)
+    newer_generation = runtime.set_pending(1, "fan_speed", 7)
+    waiter.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await waiter
+    pending = runtime.get_pending(1, "fan_speed")
+    assert pending is not None
+    assert pending.value == 7
+    assert pending.generation == newer_generation
+    api.set_fan_speed.assert_not_awaited()
+    lock.release()
+
+
+@pytest.mark.asyncio
+async def test_legacy_future_waiter_cancellation_cancels_unstarted_future():
+    ent, _cond, _api, runtime = _make_entity_with_runtime()
+    lock = runtime.get_device_lock(1)
+    await lock.acquire()
+    future = asyncio.get_running_loop().create_future()
+    waiter = asyncio.create_task(
+        ent._execute_command(
+            future,
+            pending_attr="fan_speed",
+            pending_value=5,
+        )
+    )
+    await asyncio.sleep(0)
+    waiter.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await waiter
+    assert future.cancelled()
+    assert runtime.get_pending(1, "fan_speed") is None
+    lock.release()
+
+
+@pytest.mark.asyncio
+async def test_legacy_api_error_survives_failed_recovery_refresh():
+    ent, _cond, _api, runtime = _make_entity_with_runtime()
+    command_error = ApiError("legacy_command", "boom", status=500)
+    runtime.refresh_device.side_effect = ApiError(
+        "legacy_recovery",
+        "unavailable",
+        status=503,
+    )
+
+    async def fail_command() -> None:
+        raise command_error
+
+    with pytest.raises(HomeAssistantError) as raised:
+        await ent._execute_command(
+            fail_command(),
+            pending_attr="fan_speed",
+            pending_value=5,
+        )
+
+    assert raised.value.__cause__ is command_error
+    runtime.refresh_device.assert_awaited_once()
+    assert runtime.get_pending(1, "fan_speed") is None
+
+
+@pytest.mark.asyncio
+async def test_legacy_api_error_survives_unexpected_recovery_failure():
+    ent, _cond, _api, runtime = _make_entity_with_runtime()
+    command_error = ApiError("legacy_command", "boom", status=500)
+    runtime.refresh_device.side_effect = RuntimeError("recovery bug")
+
+    async def fail_command() -> None:
+        raise command_error
+
+    with pytest.raises(HomeAssistantError) as raised:
+        await ent._execute_command(
+            fail_command(),
+            pending_attr="fan_speed",
+            pending_value=5,
+        )
+
+    assert raised.value.__cause__ is command_error
+    runtime.refresh_device.assert_awaited_once()
+    assert runtime.get_pending(1, "fan_speed") is None
+
+
+@pytest.mark.asyncio
+async def test_legacy_cancellation_survives_failed_recovery_refresh():
+    ent, _cond, _api, runtime = _make_entity_with_runtime()
+    operation_started = asyncio.Event()
+    never_release = asyncio.Event()
+    runtime.refresh_device.side_effect = ApiError(
+        "legacy_recovery",
+        "unavailable",
+        status=503,
+    )
+
+    async def partial_command() -> None:
+        operation_started.set()
+        await never_release.wait()
+
+    task = asyncio.create_task(
+        ent._execute_command(
+            partial_command(),
+            pending_attr="fan_speed",
+            pending_value=5,
+        )
+    )
+    await operation_started.wait()
+    task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    runtime.refresh_device.assert_awaited_once()
+    assert runtime.get_pending(1, "fan_speed") is None
+
+
+@pytest.mark.asyncio
+async def test_legacy_command_runs_lockless_when_runtime_has_no_executor():
+    ent, _cond, api = _make_entity()
+    runtime = AtmeexRuntimeData(
+        api=api,
+        coordinator=ent.coordinator,
+        refresh_device=None,
+        command_executor=None,
+    )
+    ent._runtime = runtime
+    ent._refresh = AsyncMock()
+
+    await ent._execute_command(
+        api.set_fan_speed(1, 5),
+        pending_attr="fan_speed",
+        pending_value=5,
+    )
+
+    api.set_fan_speed.assert_awaited_once_with(1, 5)
+    ent._refresh.assert_awaited_once()
+    assert runtime.command_executor is None
+
+
+@pytest.mark.asyncio
+async def test_legacy_cancellation_during_confirmation_recovers_and_keeps_newer():
+    ent, _cond, _api, runtime = _make_entity_with_runtime()
+    confirmation_started = asyncio.Event()
+    recovery_started = asyncio.Event()
+    never_release = asyncio.Event()
+    refresh_calls = 0
+
+    async def refresh_device(device_id: int | str) -> None:
+        nonlocal refresh_calls
+        refresh_calls += 1
+        assert runtime.get_device_lock(device_id).locked()
+        if refresh_calls == 1:
+            confirmation_started.set()
+            await never_release.wait()
+        else:
+            recovery_started.set()
+
+    runtime.refresh_device.side_effect = refresh_device
+
+    async def completed_write() -> None:
+        return
+
+    task = asyncio.create_task(
+        ent._execute_command(
+            completed_write(),
+            pending_attr="fan_speed",
+            pending_value=5,
+        )
+    )
+    await confirmation_started.wait()
+    newer_generation = runtime.set_pending(1, "fan_speed", 7)
+    task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert recovery_started.is_set()
+    assert refresh_calls == 2
+    pending = runtime.get_pending(1, "fan_speed")
+    assert pending is not None
+    assert pending.value == 7
+    assert pending.generation == newer_generation
+    assert runtime.get_device_lock(1).locked() is False
+
+
+@pytest.mark.asyncio
+async def test_legacy_cancellation_during_api_error_recovery_wins():
+    ent, _cond, _api, runtime = _make_entity_with_runtime()
+    command_error = ApiError("legacy_command", "boom", status=500)
+    recovery_started = asyncio.Event()
+    never_release = asyncio.Event()
+
+    async def refresh_device(device_id: int | str) -> None:
+        assert runtime.get_device_lock(device_id).locked()
+        recovery_started.set()
+        await never_release.wait()
+
+    runtime.refresh_device.side_effect = refresh_device
+
+    async def failed_write() -> None:
+        raise command_error
+
+    task = asyncio.create_task(
+        ent._execute_command(
+            failed_write(),
+            pending_attr="fan_speed",
+            pending_value=5,
+        )
+    )
+    await recovery_started.wait()
+    task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert runtime.get_pending(1, "fan_speed") is None
+    assert runtime.get_device_lock(1).locked() is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "refresh_error",
+    [
+        ApiError("legacy_confirmation", "unavailable", status=503),
+        asyncio.TimeoutError(),
+    ],
+)
+async def test_legacy_success_ignores_typed_confirmation_failure(refresh_error):
+    ent, _cond, api, runtime = _make_entity_with_runtime()
+    runtime.refresh_device.side_effect = refresh_error
+
+    await ent._execute_command(
+        api.set_fan_speed(1, 5),
+        pending_attr="fan_speed",
+        pending_value=5,
+    )
+
+    api.set_fan_speed.assert_awaited_once_with(1, 5)
+    runtime.refresh_device.assert_awaited_once_with(1)
+    pending = runtime.get_pending(1, "fan_speed")
+    assert pending is not None
+    assert pending.value == 5
+    assert runtime.get_device_lock(1).locked() is False
 
 
 def _make_lifecycle_coordinator():

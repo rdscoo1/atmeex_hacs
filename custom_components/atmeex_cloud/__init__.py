@@ -46,6 +46,7 @@ from .helpers import (
     normalize_device_id,
     normalize_settings_delta,
 )
+from .command_executor import AtmeexCommandExecutor, PendingCommand
 from .state_store import AtmeexStateStore
 
 _LOGGER = logging.getLogger(__name__)
@@ -59,7 +60,7 @@ _UNLOAD_TASK_TIMEOUT_SEC: float = 5.0
 # Module-level so tests can monkeypatch it without touching the closure.
 _REFRESH_TASK_TIMEOUT_SEC: float = 65.0
 
-from .runtime import PendingCommand, AtmeexRuntimeData
+from .runtime import AtmeexRuntimeData
 
 __all__ = [
     "async_setup_entry",
@@ -452,11 +453,13 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     else:
         _LOGGER.info("WebSocket disabled in options, using HTTP polling only")
     
+    command_executor = AtmeexCommandExecutor(refresh_device)
     runtime_data = AtmeexRuntimeData(
         api=api,
         coordinator=coordinator,
         refresh_device=refresh_device,
         state_store=state_store,
+        command_executor=command_executor,
         websocket_manager=websocket_manager,
         websocket_start_task=websocket_start_task,
     )
@@ -512,9 +515,8 @@ async def async_remove_config_entry_device(
         for domain, ident in device_entry.identifiers:
             if domain != DOMAIN:
                 continue
-            key = str(ident)
-            runtime.pending_commands.pop(key, None)
-            runtime.device_locks.pop(key, None)
+            if runtime.command_executor is not None:
+                runtime.command_executor.remove_device(ident)
 
     # The device will reappear on next poll if it's still connected to the account.
     return True

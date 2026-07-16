@@ -1,4 +1,3 @@
-import time
 import pytest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
@@ -9,7 +8,8 @@ from homeassistant.const import ATTR_TEMPERATURE
 from homeassistant.exceptions import HomeAssistantError
 from typing import Any
 
-from custom_components.atmeex_cloud import AtmeexRuntimeData, PendingCommand
+from custom_components.atmeex_cloud import AtmeexRuntimeData
+import custom_components.atmeex_cloud.command_executor as command_executor_module
 from custom_components.atmeex_cloud.api import ApiError
 import custom_components.atmeex_cloud.climate as climate_module
 from custom_components.atmeex_cloud.climate import (
@@ -372,33 +372,29 @@ async def test_async_set_swing_mode_valid_and_invalid():
 
 
 
-def test_climate_hvac_mode_clears_expired_pending():
+def test_climate_hvac_mode_clears_expired_pending(monkeypatch):
+    now = 100.0
+    monkeypatch.setattr(command_executor_module.time, "monotonic", lambda: now)
     ent, cond, api, runtime = _make_entity_with_runtime({"pwr_on": False})
-    runtime.pending_commands["1"] = {
-        "pwr_on": PendingCommand(
-            value=True,
-            timestamp=time.monotonic() - 20.0,
-            attribute="pwr_on",
-        )
-    }
+    runtime.set_pending(1, "pwr_on", True)
+
+    now = 120.0
 
     assert ent.hvac_mode == HVACMode.OFF
     assert runtime.get_pending(1, "pwr_on") is None
 
 
-def test_climate_hvac_mode_uses_runtime_helper():
+def test_climate_hvac_mode_uses_entry_executor():
     ent, cond, api, runtime = _make_entity_with_runtime({"pwr_on": True})
-    runtime.clear_pending_if_confirmed = MagicMock(
-        wraps=runtime.clear_pending_if_confirmed
+    runtime.command_executor.value_with_pending = MagicMock(
+        wraps=runtime.command_executor.value_with_pending
     )
 
     # pwr_on=True, u_temp_room=225 (valid), damp_pos=2 → HEAT
     assert ent.hvac_mode == HVACMode.HEAT
     # hvac_mode checks pending for pwr_on first, then u_temp_room
-    calls = runtime.clear_pending_if_confirmed.call_args_list
-    assert any(
-        c == ((1, "pwr_on", True), {"tolerance": 8.0}) for c in calls
-    )
+    calls = runtime.command_executor.value_with_pending.call_args_list
+    assert any(c == ((1, "pwr_on", True), {}) for c in calls)
 
 
 def test_climate_fan_mode_uses_and_clears_pending():

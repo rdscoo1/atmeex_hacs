@@ -109,13 +109,17 @@ async def test_async_remove_config_entry_device_drops_per_device_state():
     Without this cleanup, runtime.device_locks / runtime.pending_commands grow
     unboundedly across add/remove cycles for the lifetime of the loaded entry.
     """
-    from custom_components.atmeex_cloud.runtime import AtmeexRuntimeData, PendingCommand
+    from custom_components.atmeex_cloud.runtime import AtmeexRuntimeData
 
-    runtime = AtmeexRuntimeData(api=None, coordinator=None, refresh_device=None)
-    runtime.device_locks["42"] = asyncio.Lock()
-    runtime.device_locks["99"] = asyncio.Lock()
-    runtime.pending_commands["42"] = {"pwr_on": PendingCommand(value=True, timestamp=0.0, attribute="pwr_on")}
-    runtime.pending_commands["99"] = {"pwr_on": PendingCommand(value=False, timestamp=0.0, attribute="pwr_on")}
+    runtime = AtmeexRuntimeData(
+        api=None,
+        coordinator=None,
+        refresh_device=AsyncMock(),
+    )
+    runtime.get_device_lock("42")
+    runtime.get_device_lock("99")
+    runtime.set_pending("42", "pwr_on", True)
+    runtime.set_pending("99", "pwr_on", False)
 
     entry = SimpleNamespace(runtime_data=runtime)
     device_entry = SimpleNamespace(identifiers={(DOMAIN, "42"), ("other_domain", "ignored")})
@@ -145,7 +149,11 @@ async def test_async_remove_config_entry_device_unknown_device_is_noop():
     """Removing a device that was never tracked must not raise."""
     from custom_components.atmeex_cloud.runtime import AtmeexRuntimeData
 
-    runtime = AtmeexRuntimeData(api=None, coordinator=None, refresh_device=None)
+    runtime = AtmeexRuntimeData(
+        api=None,
+        coordinator=None,
+        refresh_device=AsyncMock(),
+    )
     entry = SimpleNamespace(runtime_data=runtime)
     device_entry = SimpleNamespace(identifiers={(DOMAIN, "never_seen")})
 
@@ -155,3 +163,32 @@ async def test_async_remove_config_entry_device_unknown_device_is_noop():
     assert result is True
     assert runtime.device_locks == {}
     assert runtime.pending_commands == {}
+
+
+async def test_async_remove_config_entry_device_uses_canonical_executor_cleanup():
+    """Removal must preserve a held compatibility lock until it is released."""
+    from custom_components.atmeex_cloud.runtime import AtmeexRuntimeData
+
+    runtime = AtmeexRuntimeData(
+        api=None,
+        coordinator=None,
+        refresh_device=AsyncMock(),
+    )
+    lock = runtime.get_device_lock("0042")
+    await lock.acquire()
+    runtime.set_pending(42, "pwr_on", True)
+    entry = SimpleNamespace(runtime_data=runtime)
+    device_entry = SimpleNamespace(identifiers={(DOMAIN, "42")})
+
+    assert await atmeex_init.async_remove_config_entry_device(
+        hass=SimpleNamespace(),
+        config_entry=entry,
+        device_entry=device_entry,
+    ) is True
+
+    assert runtime.get_pending(42, "pwr_on") is None
+    assert runtime.get_device_lock(42) is lock
+    lock.release()
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+    assert runtime.device_locks == {}

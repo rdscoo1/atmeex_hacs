@@ -1,12 +1,15 @@
 from __future__ import annotations
 
-from typing import Any, Awaitable, Callable, Iterable
+import asyncio
+from collections.abc import Awaitable, Mapping
+from typing import Any, Callable, Iterable
 
-from homeassistant.exceptions import HomeAssistantError
+from homeassistant.exceptions import HomeAssistantError, ServiceValidationError
 from homeassistant.helpers.device_registry import DeviceInfo
 
-from .const import DOMAIN
 from .api import ApiError, AtmeexDevice
+from .command_executor import AtmeexCommandExecutor, CommandCoroutineFactory
+from .const import DOMAIN
 
 
 class AtmeexEntityMixin:
@@ -45,75 +48,152 @@ class AtmeexEntityMixin:
         attribute: str,
         confirmed_value: Any,
         *,
-        tolerance: float,
+        tolerance: float | None = None,
     ) -> Any:
-        """Return effective value considering pending commands.
-
-        Uses runtime.clear_pending_if_confirmed() as the single decision point.
-        """
+        """Return the executor's optimistic value while it awaits confirmation."""
+        del tolerance
         runtime = getattr(self, "_runtime", None)
-        if (
-            runtime is None
-            or not hasattr(runtime, "clear_pending_if_confirmed")
-            or not hasattr(runtime, "get_pending")
-        ):
+        executor = getattr(runtime, "command_executor", None)
+        if executor is None:
             return confirmed_value
-
-        use_confirmed = runtime.clear_pending_if_confirmed(
+        return executor.value_with_pending(
             self._device_id,
             attribute,
             confirmed_value,
-            tolerance=tolerance,
         )
-        if use_confirmed:
-            return confirmed_value
-
-        pending = runtime.get_pending(self._device_id, attribute)
-        if pending is None:
-            return confirmed_value
-        return pending.value
 
     async def _execute_command(
         self,
-        api_coro: Awaitable[None],
+        operation: CommandCoroutineFactory | Awaitable[None],
         *,
+        pending: Mapping[str, Any] | None = None,
+        translation_key: str = "command_failed",
+        translation_placeholders: Mapping[str, str] | None = None,
         pending_attr: str | None = None,
         pending_value: Any = None,
         error_message: str = "Command failed",
     ) -> None:
-        """Execute an API command with device lock when available, pending tracking, and refresh.
-
-        Parameters:
-            api_coro: awaitable that performs the API call.
-            pending_attr: state attribute name to track as pending (e.g. "fan_speed").
-            pending_value: value to record as pending before the call.
-            error_message: human-readable message for HomeAssistantError on failure.
-        """
+        """Execute a lazy command, with a temporary eager-awaitable adapter."""
         runtime = getattr(self, "_runtime", None)
+        if callable(operation):
+            if pending is None:
+                raise TypeError("factory commands require a pending mapping")
+            executor = getattr(runtime, "command_executor", None)
+            if executor is None:
+                executor = getattr(self, "_fallback_command_executor", None)
+                if executor is None:
+                    executor = AtmeexCommandExecutor(
+                        lambda _device_id: self._refresh()
+                    )
+                    self._fallback_command_executor = executor
+            await executor.async_execute(
+                self._device_id,
+                operation,
+                pending=pending,
+                translation_key=translation_key,
+                translation_placeholders=translation_placeholders,
+            )
+            return
 
+        legacy_generation = None
         if pending_attr is not None and runtime is not None:
-            runtime.set_pending(self._device_id, pending_attr, pending_value)
+            legacy_generation = runtime.set_pending(
+                self._device_id,
+                pending_attr,
+                pending_value,
+            )
 
-        lock = runtime.get_device_lock(self._device_id) if runtime is not None else None
+        executor = getattr(runtime, "command_executor", None)
+        lock = (
+            runtime.get_device_lock(self._device_id)
+            if executor is not None
+            else None
+        )
 
-        async def _do() -> None:
+        def cancel_legacy_generation() -> None:
+            if runtime is not None:
+                runtime.cancel_legacy_generation(
+                    self._device_id,
+                    legacy_generation,
+                )
+
+        async def recover_legacy_best_effort() -> None:
+            """Reconcile a possible partial write without masking its cause."""
             try:
-                await api_coro
+                await self._refresh()
+            except (ApiError, asyncio.TimeoutError):
+                return
+            except Exception:
+                return
+
+        operation_started = False
+
+        async def run_legacy() -> None:
+            nonlocal operation_started
+            operation_started = True
+            try:
+                await operation
+            except asyncio.CancelledError:
+                try:
+                    await recover_legacy_best_effort()
+                finally:
+                    cancel_legacy_generation()
+                raise
             except ApiError as err:
-                if pending_attr is not None and runtime is not None:
-                    runtime.clear_pending(self._device_id, pending_attr)
+                try:
+                    await recover_legacy_best_effort()
+                finally:
+                    cancel_legacy_generation()
                 raise HomeAssistantError(error_message) from err
             except Exception:
-                if pending_attr is not None and runtime is not None:
-                    runtime.clear_pending(self._device_id, pending_attr)
+                try:
+                    await recover_legacy_best_effort()
+                finally:
+                    cancel_legacy_generation()
                 raise
-            await self._refresh()
+            try:
+                await self._refresh()
+            except (ApiError, asyncio.TimeoutError):
+                # The write succeeded. Keep its optimistic generation until a
+                # later authoritative refresh confirms or expires it.
+                return
+            except asyncio.CancelledError:
+                try:
+                    await recover_legacy_best_effort()
+                finally:
+                    cancel_legacy_generation()
+                raise
 
-        if lock is not None:
-            async with lock:
-                await _do()
-        else:
-            await _do()
+        try:
+            if lock is None:
+                await run_legacy()
+            else:
+                async with lock:
+                    await run_legacy()
+        except asyncio.CancelledError:
+            if not operation_started:
+                if asyncio.iscoroutine(operation):
+                    operation.close()
+                elif isinstance(operation, asyncio.Future):
+                    operation.cancel()
+                cancel_legacy_generation()
+            raise
+
+    @staticmethod
+    def _invalid_value(field: str, value: Any) -> ServiceValidationError:
+        return ServiceValidationError(
+            translation_domain=DOMAIN,
+            translation_key="invalid_command_value",
+            translation_placeholders={"field": field, "value": str(value)},
+        )
+
+    @staticmethod
+    def _unsupported_feature(feature: str) -> ServiceValidationError:
+        return ServiceValidationError(
+            translation_domain=DOMAIN,
+            translation_key="unsupported_device_feature",
+            translation_placeholders={"feature": feature},
+        )
 
     @property
     def available(self) -> bool:
