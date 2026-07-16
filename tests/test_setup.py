@@ -1,5 +1,5 @@
 import asyncio
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -18,7 +18,104 @@ from custom_components.atmeex_cloud.const import (
     PLATFORMS,
 )
 from custom_components.atmeex_cloud.helpers import to_bool, _normalize_device_state
+from custom_components.atmeex_cloud.coordinator import (
+    AtmeexCoordinator as RealAtmeexCoordinator,
+)
+from custom_components.atmeex_cloud.runtime import AtmeexRuntimeData
 from homeassistant.exceptions import ConfigEntryAuthFailed, ConfigEntryNotReady
+
+
+class _SetupCoordinatorFake:
+    """Lightweight fake honoring the constructor-injected coordinator contract."""
+
+    def __init__(
+        self,
+        hass,
+        logger,
+        *,
+        api,
+        state_store,
+        config_entry_id,
+        config_entry=None,
+        name,
+        update_interval,
+        fire_logbook_event=None,
+        **_kwargs,
+    ):
+        self.hass = hass
+        self.logger = logger
+        self.name = name
+        self.update_interval = update_interval
+        self.api = api
+        self.state_store = state_store
+        self.config_entry_id = config_entry_id
+        self.config_entry = config_entry
+        self.data = None
+        self.last_update_success = False
+        self.last_api_error = None
+        self.last_success_ts = None
+        self.last_inventory_success_mono = None
+        self.avg_latency_ms = None
+        self.request_retries = 0
+        self._fire_logbook_event = fire_logbook_event
+        self._api_error_last_ts = float("-inf")
+        self._api_error_suppressed = 0
+        self._last_detail_error = None
+        self._last_detail_failure_count = 0
+        self.async_update_listeners = MagicMock()
+        for static_name in (
+            "_safe_detail_error",
+            "_needs_detail",
+            "_merge_detail_source",
+            "_exception_leaves",
+        ):
+            setattr(
+                self,
+                static_name,
+                getattr(RealAtmeexCoordinator, static_name),
+            )
+        for method_name in (
+            "_fire_api_error_event",
+            "_previous_device",
+            "_hydrate_one",
+            "_hydrate_devices",
+            "_async_update_data",
+        ):
+            setattr(
+                self,
+                method_name,
+                MethodType(
+                    getattr(RealAtmeexCoordinator, method_name),
+                    self,
+                ),
+            )
+        self._safe_error_event = RealAtmeexCoordinator._safe_error_event
+
+    async def async_config_entry_first_refresh(self):
+        self.data = await self._async_update_data()
+        self.last_update_success = True
+
+    def async_set_updated_data(self, data):
+        self.data = data
+
+    async def async_request_refresh(self):
+        inventory_success_before = self.last_inventory_success_mono
+        self.last_update_success = False
+        self.data = await self._async_update_data()
+        self.last_update_success = True
+        if (
+            self.last_inventory_success_mono is None
+            or (
+                inventory_success_before is not None
+                and self.last_inventory_success_mono
+                <= inventory_success_before
+            )
+        ):
+            self.last_inventory_success_mono = (
+                0.0
+                if inventory_success_before is None
+                else inventory_success_before + 1.0
+            )
 
 
 async def test_async_setup_entry_happy_path(monkeypatch):
@@ -51,36 +148,11 @@ async def test_async_setup_entry_happy_path(monkeypatch):
 
     monkeypatch.setattr(atmeex_init, "AtmeexApi", FakeApi)
 
-    # подменяем DataUpdateCoordinator на простую реализацию
-    class DummyCoordinator:
-        def __init__(self, hass, logger, name, update_interval, **kwargs):
-            self.hass = hass
-            self.data = None
-            self.last_update_success = False
-            self.last_api_error = None
-            self.last_success_ts = None
-        def setup_update(self, *, api, state_store, fire_logbook_event):
-            import types
-            from custom_components.atmeex_cloud.coordinator import AtmeexCoordinator as _Real
-            self._api = api
-            self.state_store = state_store
-            self._fire_logbook_event = fire_logbook_event
-            self._api_error_last_ts = float("-inf")
-            self._api_error_suppressed = 0
-            for m in ("_fetch_devices_safely", "_fire_api_error_event", "_async_update_data"):
-                setattr(self, m, types.MethodType(getattr(_Real, m), self))
-
-        async def async_config_entry_first_refresh(self):
-            self.data = await self._async_update_data()
-            self.last_update_success = True
-
-        def async_set_updated_data(self, data):
-            self.data = data
-
-        async def async_request_refresh(self):
-            self.data = await self._async_update_data()
-
-    monkeypatch.setattr(atmeex_init, "AtmeexCoordinator", DummyCoordinator)
+    monkeypatch.setattr(
+        atmeex_init,
+        "AtmeexCoordinator",
+        _SetupCoordinatorFake,
+    )
 
     # подменяем async_get_clientsession
     monkeypatch.setattr(atmeex_init, "async_get_clientsession", lambda hass: object())
@@ -155,34 +227,15 @@ async def test_async_setup_entry_uses_options_update_interval(
 
     captured = {}
 
-    class DummyCoordinator:
-        def __init__(self, hass, logger, name, update_interval, **kwargs):
+    class DummyCoordinator(_SetupCoordinatorFake):
+        def __init__(self, hass, logger, *, update_interval, **kwargs):
             captured["update_interval"] = update_interval
-            self.hass = hass
-            self.data = None
-            self.last_update_success = False
-            self.last_api_error = None
-            self.last_success_ts = None
-        def setup_update(self, *, api, state_store, fire_logbook_event):
-            import types
-            from custom_components.atmeex_cloud.coordinator import AtmeexCoordinator as _Real
-            self._api = api
-            self.state_store = state_store
-            self._fire_logbook_event = fire_logbook_event
-            self._api_error_last_ts = float("-inf")
-            self._api_error_suppressed = 0
-            for m in ("_fetch_devices_safely", "_fire_api_error_event", "_async_update_data"):
-                setattr(self, m, types.MethodType(getattr(_Real, m), self))
-
-        async def async_config_entry_first_refresh(self):
-            self.data = await self._async_update_data()
-            self.last_update_success = True
-
-        def async_set_updated_data(self, data):
-            self.data = data
-
-        async def async_request_refresh(self):
-            self.data = await self._async_update_data()
+            super().__init__(
+                hass,
+                logger,
+                update_interval=update_interval,
+                **kwargs,
+            )
 
     monkeypatch.setattr(atmeex_init, "AtmeexCoordinator", DummyCoordinator)
 
@@ -283,7 +336,7 @@ async def test_setup_entry_raises_not_ready_on_non_auth_error(monkeypatch):
     with pytest.raises(ConfigEntryNotReady):
         await atmeex_init.async_setup_entry(hass, entry)
 
-async def test_setup_entry_uses_authoritative_inventory_and_hydration_fallback(
+async def test_setup_entry_uses_complete_authoritative_inventory_without_detail(
     monkeypatch,
 ):
     class FakeApi:
@@ -316,35 +369,11 @@ async def test_setup_entry_uses_authoritative_inventory_and_hydration_fallback(
     monkeypatch.setattr(atmeex_init, "AtmeexApi", FakeApi)
     monkeypatch.setattr(atmeex_init, "async_get_clientsession", lambda _hass: object())
 
-    class DummyCoordinator:
-        def __init__(self, hass, logger, name, update_interval, **kwargs):
-            self.hass = hass
-            self.data = None
-            self.last_update_success = False
-            self.last_api_error = None
-            self.last_success_ts = None
-        def setup_update(self, *, api, state_store, fire_logbook_event):
-            import types
-            from custom_components.atmeex_cloud.coordinator import AtmeexCoordinator as _Real
-            self._api = api
-            self.state_store = state_store
-            self._fire_logbook_event = fire_logbook_event
-            self._api_error_last_ts = float("-inf")
-            self._api_error_suppressed = 0
-            for m in ("_fetch_devices_safely", "_fire_api_error_event", "_async_update_data"):
-                setattr(self, m, types.MethodType(getattr(_Real, m), self))
-
-        async def async_config_entry_first_refresh(self):
-            self.data = await self._async_update_data()
-            self.last_update_success = True
-
-        def async_set_updated_data(self, data):
-            self.data = data
-
-        async def async_request_refresh(self):
-            self.data = await self._async_update_data()
-
-    monkeypatch.setattr(atmeex_init, "AtmeexCoordinator", DummyCoordinator)
+    monkeypatch.setattr(
+        atmeex_init,
+        "AtmeexCoordinator",
+        _SetupCoordinatorFake,
+    )
 
     hass = SimpleNamespace(
         data={},
@@ -365,7 +394,7 @@ async def test_setup_entry_uses_authoritative_inventory_and_hydration_fallback(
     runtime = entry.runtime_data
 
     runtime.api.get_devices.assert_awaited_once_with()
-    runtime.api.get_device.assert_awaited_once_with(1)
+    runtime.api.get_device.assert_not_awaited()
     assert runtime.coordinator.data["device_map"]["1"].id == 1
     assert runtime.coordinator.data["states"]["1"]["fan_speed"] == 3
 
@@ -389,29 +418,11 @@ async def test_setup_entry_reauth_on_authoritative_inventory_auth_error(monkeypa
     monkeypatch.setattr(atmeex_init, "AtmeexApi", FakeApi)
     monkeypatch.setattr(atmeex_init, "async_get_clientsession", lambda _hass: object())
 
-    class DummyCoordinator:
-        def __init__(self, hass, logger, name, update_interval, **kwargs):
-            self.hass = hass
-            self.data = None
-            self.last_update_success = False
-            self.last_api_error = None
-            self.last_success_ts = None
-        def setup_update(self, *, api, state_store, fire_logbook_event):
-            import types
-            from custom_components.atmeex_cloud.coordinator import AtmeexCoordinator as _Real
-            self._api = api
-            self.state_store = state_store
-            self._fire_logbook_event = fire_logbook_event
-            self._api_error_last_ts = float("-inf")
-            self._api_error_suppressed = 0
-            for m in ("_fetch_devices_safely", "_fire_api_error_event", "_async_update_data"):
-                setattr(self, m, types.MethodType(getattr(_Real, m), self))
-
-        async def async_config_entry_first_refresh(self):
-            self.data = await self._async_update_data()
-            self.last_update_success = True
-
-    monkeypatch.setattr(atmeex_init, "AtmeexCoordinator", DummyCoordinator)
+    monkeypatch.setattr(
+        atmeex_init,
+        "AtmeexCoordinator",
+        _SetupCoordinatorFake,
+    )
 
     hass = SimpleNamespace(
         data={},
@@ -447,35 +458,11 @@ async def test_setup_entry_reload_listener_reloads_for_options_change(monkeypatc
     monkeypatch.setattr(atmeex_init, "AtmeexApi", FakeApi)
     monkeypatch.setattr(atmeex_init, "async_get_clientsession", lambda _hass: object())
 
-    class DummyCoordinator:
-        def __init__(self, hass, logger, name, update_interval, **kwargs):
-            self.hass = hass
-            self.data = None
-            self.last_update_success = False
-            self.last_api_error = None
-            self.last_success_ts = None
-        def setup_update(self, *, api, state_store, fire_logbook_event):
-            import types
-            from custom_components.atmeex_cloud.coordinator import AtmeexCoordinator as _Real
-            self._api = api
-            self.state_store = state_store
-            self._fire_logbook_event = fire_logbook_event
-            self._api_error_last_ts = float("-inf")
-            self._api_error_suppressed = 0
-            for m in ("_fetch_devices_safely", "_fire_api_error_event", "_async_update_data"):
-                setattr(self, m, types.MethodType(getattr(_Real, m), self))
-
-        async def async_config_entry_first_refresh(self):
-            self.data = await self._async_update_data()
-            self.last_update_success = True
-
-        def async_set_updated_data(self, data):
-            self.data = data
-
-        async def async_request_refresh(self):
-            self.data = await self._async_update_data()
-
-    monkeypatch.setattr(atmeex_init, "AtmeexCoordinator", DummyCoordinator)
+    monkeypatch.setattr(
+        atmeex_init,
+        "AtmeexCoordinator",
+        _SetupCoordinatorFake,
+    )
 
     captured_listener = {}
 
@@ -506,44 +493,7 @@ async def test_setup_entry_reload_listener_reloads_for_options_change(monkeypatc
 
 
 def _setup_test_coordinator_class():
-    class DummyCoordinator:
-        def __init__(self, hass, logger, name, update_interval, **kwargs):
-            self.hass = hass
-            self.data = None
-            self.last_update_success = False
-            self.last_api_error = None
-            self.last_success_ts = None
-        def setup_update(self, *, api, state_store, fire_logbook_event):
-            import types
-
-            from custom_components.atmeex_cloud.coordinator import (
-                AtmeexCoordinator as RealCoordinator,
-            )
-
-            self._api = api
-            self.state_store = state_store
-            self._fire_logbook_event = fire_logbook_event
-            self._api_error_last_ts = float("-inf")
-            self._api_error_suppressed = 0
-            for method_name in (
-                "_fetch_devices_safely",
-                "_fire_api_error_event",
-                "_async_update_data",
-            ):
-                method = getattr(RealCoordinator, method_name)
-                setattr(self, method_name, types.MethodType(method, self))
-
-        async def async_config_entry_first_refresh(self):
-            self.data = await self._async_update_data()
-            self.last_update_success = True
-
-        def async_set_updated_data(self, data):
-            self.data = data
-
-        async def async_request_refresh(self):
-            self.data = await self._async_update_data()
-
-    return DummyCoordinator
+    return _SetupCoordinatorFake
 
 
 async def test_rotated_refresh_token_persists_without_entry_reload(monkeypatch):
@@ -639,35 +589,11 @@ async def test_refresh_token_persistence_failure_is_logged_not_raised(monkeypatc
     monkeypatch.setattr(atmeex_init, "AtmeexApi", FakeApi)
     monkeypatch.setattr(atmeex_init, "async_get_clientsession", lambda _hass: object())
 
-    class DummyCoordinator:
-        def __init__(self, hass, logger, name, update_interval, **kwargs):
-            self.hass = hass
-            self.data = None
-            self.last_update_success = False
-            self.last_api_error = None
-            self.last_success_ts = None
-        def setup_update(self, *, api, state_store, fire_logbook_event):
-            import types
-            from custom_components.atmeex_cloud.coordinator import AtmeexCoordinator as _Real
-            self._api = api
-            self.state_store = state_store
-            self._fire_logbook_event = fire_logbook_event
-            self._api_error_last_ts = float("-inf")
-            self._api_error_suppressed = 0
-            for m in ("_fetch_devices_safely", "_fire_api_error_event", "_async_update_data"):
-                setattr(self, m, types.MethodType(getattr(_Real, m), self))
-
-        async def async_config_entry_first_refresh(self):
-            self.data = await self._async_update_data()
-            self.last_update_success = True
-
-        def async_set_updated_data(self, data):
-            self.data = data
-
-        async def async_request_refresh(self):
-            self.data = await self._async_update_data()
-
-    monkeypatch.setattr(atmeex_init, "AtmeexCoordinator", DummyCoordinator)
+    monkeypatch.setattr(
+        atmeex_init,
+        "AtmeexCoordinator",
+        _SetupCoordinatorFake,
+    )
 
     persist_calls = []
 
@@ -716,35 +642,11 @@ async def test_setup_entry_websocket_skipped_without_ws_connect(monkeypatch):
     monkeypatch.setattr(atmeex_init, "AtmeexApi", FakeApi)
     monkeypatch.setattr(atmeex_init, "async_get_clientsession", lambda _hass: SessionNoWS())
 
-    class DummyCoordinator:
-        def __init__(self, hass, logger, name, update_interval, **kwargs):
-            self.hass = hass
-            self.data = None
-            self.last_update_success = False
-            self.last_api_error = None
-            self.last_success_ts = None
-        def setup_update(self, *, api, state_store, fire_logbook_event):
-            import types
-            from custom_components.atmeex_cloud.coordinator import AtmeexCoordinator as _Real
-            self._api = api
-            self.state_store = state_store
-            self._fire_logbook_event = fire_logbook_event
-            self._api_error_last_ts = float("-inf")
-            self._api_error_suppressed = 0
-            for m in ("_fetch_devices_safely", "_fire_api_error_event", "_async_update_data"):
-                setattr(self, m, types.MethodType(getattr(_Real, m), self))
-
-        async def async_config_entry_first_refresh(self):
-            self.data = await self._async_update_data()
-            self.last_update_success = True
-
-        def async_set_updated_data(self, data):
-            self.data = data
-
-        async def async_request_refresh(self):
-            self.data = await self._async_update_data()
-
-    monkeypatch.setattr(atmeex_init, "AtmeexCoordinator", DummyCoordinator)
+    monkeypatch.setattr(
+        atmeex_init,
+        "AtmeexCoordinator",
+        _SetupCoordinatorFake,
+    )
 
     hass = SimpleNamespace(
         data={},
@@ -781,38 +683,18 @@ async def test_setup_entry_websocket_skipped_without_token(monkeypatch):
             self.get_devices = AsyncMock(return_value=[dev])
             self.get_device = AsyncMock(return_value=dev)
 
+        @property
+        def token(self):
+            return self._token or ""
+
     monkeypatch.setattr(atmeex_init, "AtmeexApi", FakeApi)
     monkeypatch.setattr(atmeex_init, "async_get_clientsession", lambda _hass: SessionWS())
 
-    class DummyCoordinator:
-        def __init__(self, hass, logger, name, update_interval, **kwargs):
-            self.hass = hass
-            self.data = None
-            self.last_update_success = False
-            self.last_api_error = None
-            self.last_success_ts = None
-        def setup_update(self, *, api, state_store, fire_logbook_event):
-            import types
-            from custom_components.atmeex_cloud.coordinator import AtmeexCoordinator as _Real
-            self._api = api
-            self.state_store = state_store
-            self._fire_logbook_event = fire_logbook_event
-            self._api_error_last_ts = float("-inf")
-            self._api_error_suppressed = 0
-            for m in ("_fetch_devices_safely", "_fire_api_error_event", "_async_update_data"):
-                setattr(self, m, types.MethodType(getattr(_Real, m), self))
-
-        async def async_config_entry_first_refresh(self):
-            self.data = await self._async_update_data()
-            self.last_update_success = True
-
-        def async_set_updated_data(self, data):
-            self.data = data
-
-        async def async_request_refresh(self):
-            self.data = await self._async_update_data()
-
-    monkeypatch.setattr(atmeex_init, "AtmeexCoordinator", DummyCoordinator)
+    monkeypatch.setattr(
+        atmeex_init,
+        "AtmeexCoordinator",
+        _SetupCoordinatorFake,
+    )
 
     hass = SimpleNamespace(
         data={},
@@ -831,3 +713,268 @@ async def test_setup_entry_websocket_skipped_without_token(monkeypatch):
 
     assert await atmeex_init.async_setup_entry(hass, entry) is True
     assert entry.runtime_data.websocket_manager is None
+
+
+def _setup_lifecycle_fakes(monkeypatch, order):
+    import custom_components.atmeex_cloud.websocket as websocket_mod
+    from custom_components.atmeex_cloud.state_store import AtmeexStateStore
+
+    device = AtmeexDevice.from_raw(
+        {
+            "id": 1,
+            "name": "Device",
+            "model": "m",
+            "online": True,
+            "condition": {"pwr_on": 1},
+            "settings": {},
+        }
+    )
+
+    class FakeApi:
+        def __init__(self, session, *, on_refresh_token_changed=None):
+            self.async_init = AsyncMock()
+            self.login = AsyncMock()
+            self.refresh_token = None
+            self.token = "token"
+            self.get_devices = AsyncMock(return_value=[device])
+            self.get_device = AsyncMock(return_value=device)
+            self.async_refresh_access_token = AsyncMock()
+
+    class FakeCoordinator:
+        def __init__(
+            self,
+            hass,
+            logger,
+            *,
+            api,
+            state_store,
+            config_entry_id,
+            config_entry=None,
+            name,
+            update_interval,
+            fire_logbook_event=None,
+            **kwargs,
+        ):
+            state_store.apply_inventory(
+                [device],
+                state_store.capture_all(),
+            )
+            self.api = api
+            self.state_store = state_store
+            self.config_entry_id = config_entry_id
+            self.data = state_store.data
+            self.async_request_refresh = AsyncMock()
+
+        async def async_config_entry_first_refresh(self):
+            return
+
+        def async_set_updated_data(self, data):
+            self.data = data
+
+    manager = SimpleNamespace(
+        connect=AsyncMock(),
+        disconnect=AsyncMock(),
+        on_auth_failure=None,
+        on_token_refresh=None,
+    )
+    monkeypatch.setattr(atmeex_init, "AtmeexApi", FakeApi)
+    monkeypatch.setattr(atmeex_init, "AtmeexCoordinator", FakeCoordinator)
+    def create_manager(**kwargs):
+        manager.on_auth_failure = kwargs.get("on_auth_failure")
+        manager.on_token_refresh = kwargs.get("on_token_refresh")
+        return manager
+
+    monkeypatch.setattr(websocket_mod, "WebSocketManager", create_manager)
+    monkeypatch.setattr(
+        atmeex_init,
+        "async_get_clientsession",
+        lambda hass: SimpleNamespace(ws_connect=AsyncMock()),
+    )
+
+    config_entries = SimpleNamespace(
+        async_forward_entry_setups=AsyncMock(),
+        async_unload_platforms=AsyncMock(return_value=True),
+    )
+    hass = SimpleNamespace(
+        bus=SimpleNamespace(async_fire=MagicMock()),
+        config_entries=config_entries,
+        async_create_task=lambda coro, **kwargs: asyncio.create_task(coro),
+    )
+    unload_callbacks = []
+    entry = SimpleNamespace(
+        data={"email": "user@example.com", "password": "secret"},
+        options={"enable_websocket": True},
+        entry_id="entry1",
+        runtime_data=None,
+        add_update_listener=lambda callback: lambda: None,
+        async_on_unload=unload_callbacks.append,
+        async_start_reauth=MagicMock(),
+        unload_callbacks=unload_callbacks,
+    )
+    return entry, hass, manager
+
+
+@pytest.mark.asyncio
+async def test_websocket_starts_only_after_platforms(monkeypatch):
+    runtime_order: list[str] = []
+    entry, hass, manager = _setup_lifecycle_fakes(monkeypatch, runtime_order)
+
+    async def forward_platforms(entry, platforms):
+        runtime_order.append("platforms")
+        await asyncio.sleep(0)
+        assert manager.connect.await_count == 0
+
+    hass.config_entries.async_forward_entry_setups.side_effect = (
+        forward_platforms
+    )
+    manager.connect.side_effect = (
+        lambda: runtime_order.append("websocket") or True
+    )
+
+    assert await atmeex_init.async_setup_entry(hass, entry) is True
+    await entry.runtime_data.websocket_start_task
+
+    assert runtime_order == ["platforms", "websocket"]
+    assert len(entry.unload_callbacks) == 1
+
+
+@pytest.mark.asyncio
+async def test_platform_failure_rolls_back_runtime(monkeypatch):
+    entry, hass, manager = _setup_lifecycle_fakes(monkeypatch, [])
+    hass.config_entries.async_forward_entry_setups.side_effect = RuntimeError(
+        "platform failed"
+    )
+
+    with pytest.raises(RuntimeError, match="platform failed"):
+        await atmeex_init.async_setup_entry(hass, entry)
+
+    manager.disconnect.assert_awaited_once()
+    hass.config_entries.async_unload_platforms.assert_awaited_once_with(
+        entry,
+        PLATFORMS,
+    )
+    assert entry.runtime_data is None
+    assert entry.unload_callbacks == []
+
+
+@pytest.mark.asyncio
+async def test_start_task_creation_failure_closes_coroutine(monkeypatch):
+    entry, hass, manager = _setup_lifecycle_fakes(monkeypatch, [])
+    monkeypatch.setattr(
+        atmeex_init,
+        "async_create_background_task",
+        MagicMock(side_effect=RuntimeError("scheduler stopped")),
+    )
+
+    with pytest.raises(RuntimeError, match="scheduler stopped"):
+        await atmeex_init.async_setup_entry(hass, entry)
+
+    manager.disconnect.assert_awaited_once()
+    hass.config_entries.async_unload_platforms.assert_awaited_once_with(
+        entry,
+        PLATFORMS,
+    )
+    assert entry.runtime_data is None
+    assert entry.unload_callbacks == []
+
+
+@pytest.mark.asyncio
+async def test_websocket_reauth_is_one_shot(monkeypatch):
+    entry, hass, manager = _setup_lifecycle_fakes(monkeypatch, [])
+    monotonic = MagicMock(side_effect=[0.0, 301.0])
+    monkeypatch.setattr(
+        atmeex_init,
+        "time",
+        SimpleNamespace(monotonic=monotonic),
+    )
+
+    assert await atmeex_init.async_setup_entry(hass, entry) is True
+    await entry.runtime_data.websocket_start_task
+    assert manager.on_auth_failure is not None
+
+    manager.on_auth_failure()
+    manager.on_auth_failure()
+
+    entry.async_start_reauth.assert_called_once_with(hass)
+    await atmeex_init._async_cleanup_runtime(entry.runtime_data)
+
+
+@pytest.mark.asyncio
+async def test_websocket_reauth_is_suppressed_while_stopping(monkeypatch):
+    entry, hass, manager = _setup_lifecycle_fakes(monkeypatch, [])
+
+    assert await atmeex_init.async_setup_entry(hass, entry) is True
+    await entry.runtime_data.websocket_start_task
+    entry.runtime_data.stopping = True
+    assert manager.on_auth_failure is not None
+
+    manager.on_auth_failure()
+
+    entry.async_start_reauth.assert_not_called()
+    await atmeex_init._async_cleanup_runtime(entry.runtime_data)
+
+
+@pytest.mark.asyncio
+async def test_cleanup_bounds_websocket_disconnect(monkeypatch):
+    runtime = AtmeexRuntimeData(
+        api=None,
+        coordinator=None,
+        refresh_device=None,
+    )
+    never = asyncio.Event()
+    runtime.websocket_manager = SimpleNamespace(
+        disconnect=AsyncMock(side_effect=never.wait),
+    )
+    monkeypatch.setattr(atmeex_init, "_UNLOAD_TASK_TIMEOUT_SEC", 0.01)
+
+    await asyncio.wait_for(
+        atmeex_init._async_cleanup_runtime(runtime),
+        timeout=0.1,
+    )
+
+    assert runtime.stopping is True
+
+
+@pytest.mark.asyncio
+async def test_listener_failure_cleans_eager_completed_startup(monkeypatch):
+    entry, hass, manager = _setup_lifecycle_fakes(monkeypatch, [])
+    loop = asyncio.get_running_loop()
+    captured_runtime = None
+
+    def eager_create_task(coro, **kwargs):
+        return asyncio.eager_task_factory(
+            loop,
+            coro,
+            name=kwargs.get("name"),
+        )
+
+    def fail_listener_registration(_listener):
+        nonlocal captured_runtime
+        captured_runtime = entry.runtime_data
+        startup = captured_runtime.websocket_start_task
+        assert startup is not None
+        assert startup.done()
+        captured_runtime.refresh_tasks["1"] = startup
+        raise RuntimeError("listener registration failed")
+
+    hass.async_create_task = eager_create_task
+    manager.connect.return_value = True
+    entry.add_update_listener = fail_listener_registration
+
+    with pytest.raises(RuntimeError, match="listener registration failed"):
+        await atmeex_init.async_setup_entry(hass, entry)
+
+    assert captured_runtime is not None
+    assert captured_runtime.tasks == set()
+    assert captured_runtime.refresh_tasks == {}
+    assert captured_runtime.websocket_start_task is None
+    assert captured_runtime.websocket_message_task is None
+    assert captured_runtime.websocket_resync_task is None
+    assert captured_runtime.inventory_watchdog_task is None
+    manager.disconnect.assert_awaited_once()
+    hass.config_entries.async_unload_platforms.assert_awaited_once_with(
+        entry,
+        PLATFORMS,
+    )
+    assert entry.runtime_data is None
+    assert entry.unload_callbacks == []

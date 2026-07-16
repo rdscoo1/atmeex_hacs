@@ -192,5 +192,16 @@
         }
       }
     }
+  },
+  "exceptions": {
+    "command_failed": {
+      "message": "Не удалось выполнить действие «{action}»: команда Atmeex Cloud завершилась ошибкой."
+    },
+    "invalid_command_value": {
+      "message": "Значение {value} недопустимо для поля {field}."
+    },
+    "unsupported_device_feature": {
+      "message": "Устройство Atmeex не поддерживает функцию {feature}."
+    }
   }
 }

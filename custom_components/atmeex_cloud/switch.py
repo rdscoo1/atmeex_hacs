@@ -12,8 +12,6 @@ from .entity_base import AtmeexEntityMixin, setup_dynamic_device_entities
 
 from . import AtmeexRuntimeData
 
-_PENDING_TTL = 8.0
-
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_entities):
     """Set up Atmeex switch entities (AutoNanny + Sleep Mode)."""
@@ -63,6 +61,23 @@ class _BaseSwitch(AtmeexEntityMixin, CoordinatorEntity, SwitchEntity):
         self._refresh_device_cb = refresh_device_cb
         self._runtime = runtime
 
+    async def _set_boolean(
+        self,
+        api_method,
+        *,
+        attribute: str,
+        value: bool,
+        action: str,
+    ) -> None:
+        async def operation() -> None:
+            await api_method(self._device_id, value)
+
+        await self._execute_command(
+            operation,
+            pending={attribute: value},
+            translation_placeholders={"action": action},
+        )
+
 
 class AtmeexAutoNannySwitch(_BaseSwitch):
     _attr_translation_key = "auto_nanny"
@@ -81,22 +96,22 @@ class AtmeexAutoNannySwitch(_BaseSwitch):
     @property
     def is_on(self) -> bool | None:
         confirmed = self._device_state.get("u_auto", False)
-        return bool(self._state_with_pending("u_auto", confirmed, tolerance=_PENDING_TTL))
+        return bool(self._state_with_pending("u_auto", confirmed))
 
     async def async_turn_on(self, **kwargs: Any) -> None:
-        await self._execute_command(
-            self.api.set_auto_mode(self._device_id, True),
-            pending_attr="u_auto",
-            pending_value=True,
-            error_message="Failed to enable AutoNanny",
+        await self._set_boolean(
+            self.api.set_auto_mode,
+            attribute="u_auto",
+            value=True,
+            action="enable AutoNanny",
         )
 
     async def async_turn_off(self, **kwargs: Any) -> None:
-        await self._execute_command(
-            self.api.set_auto_mode(self._device_id, False),
-            pending_attr="u_auto",
-            pending_value=False,
-            error_message="Failed to disable AutoNanny",
+        await self._set_boolean(
+            self.api.set_auto_mode,
+            attribute="u_auto",
+            value=False,
+            action="disable AutoNanny",
         )
 
 
@@ -117,22 +132,22 @@ class AtmeexSleepModeSwitch(_BaseSwitch):
     @property
     def is_on(self) -> bool | None:
         confirmed = self._device_state.get("u_night", False)
-        return bool(self._state_with_pending("u_night", confirmed, tolerance=_PENDING_TTL))
+        return bool(self._state_with_pending("u_night", confirmed))
 
     async def async_turn_on(self, **kwargs: Any) -> None:
-        await self._execute_command(
-            self.api.set_sleep_mode(self._device_id, True),
-            pending_attr="u_night",
-            pending_value=True,
-            error_message="Failed to enable Sleep Mode",
+        await self._set_boolean(
+            self.api.set_sleep_mode,
+            attribute="u_night",
+            value=True,
+            action="enable sleep mode",
         )
 
     async def async_turn_off(self, **kwargs: Any) -> None:
-        await self._execute_command(
-            self.api.set_sleep_mode(self._device_id, False),
-            pending_attr="u_night",
-            pending_value=False,
-            error_message="Failed to disable Sleep Mode",
+        await self._set_boolean(
+            self.api.set_sleep_mode,
+            attribute="u_night",
+            value=False,
+            action="disable sleep mode",
         )
 
 
@@ -154,20 +169,20 @@ class AtmeexPowerSwitch(_BaseSwitch):
     @property
     def is_on(self) -> bool | None:
         confirmed = self._device_state.get("pwr_on", False)
-        return bool(self._state_with_pending("pwr_on", confirmed, tolerance=_PENDING_TTL))
+        return bool(self._state_with_pending("pwr_on", confirmed))
 
     async def async_turn_on(self, **kwargs: Any) -> None:
-        await self._execute_command(
-            self.api.set_power(self._device_id, True),
-            pending_attr="pwr_on",
-            pending_value=True,
-            error_message="Failed to turn on",
+        await self._set_boolean(
+            self.api.set_power,
+            attribute="pwr_on",
+            value=True,
+            action="turn on the device",
         )
 
     async def async_turn_off(self, **kwargs: Any) -> None:
-        await self._execute_command(
-            self.api.set_power(self._device_id, False),
-            pending_attr="pwr_on",
-            pending_value=False,
-            error_message="Failed to turn off",
+        await self._set_boolean(
+            self.api.set_power,
+            attribute="pwr_on",
+            value=False,
+            action="turn off the device",
         )

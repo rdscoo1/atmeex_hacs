@@ -12,15 +12,18 @@ Architecture:
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Awaitable, Callable, Coroutine
+from contextlib import suppress
+from dataclasses import dataclass
 import json
 import logging
 import time
-from contextlib import suppress
-from typing import Any, Callable, Optional
-from dataclasses import dataclass
+from typing import Any
 
 import aiohttp
-from aiohttp import WSMsgType, ClientWebSocketResponse
+from aiohttp import ClientWebSocketResponse, WSMsgType
+
+from .api import ApiError
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -30,13 +33,33 @@ WS_RECONNECT_DELAY_MIN = 1.0  # seconds
 WS_RECONNECT_DELAY_MAX = 60.0  # seconds
 WS_PING_INTERVAL = 30.0  # seconds
 WS_PING_TIMEOUT = 10.0  # seconds
-WS_MAX_UNAUTHORIZED_BEFORE_REAUTH = 5  # trigger reauth after this many consecutive failures
+WS_MAX_UNAUTHORIZED_BEFORE_REAUTH = 5
+
+MessageCallback = Callable[[dict[str, Any]], bool]
+TokenRecoveryCallback = Callable[[], Awaitable[None]]
+TaskFactory = Callable[
+    [Coroutine[Any, Any, None], str], asyncio.Task[None]
+]
+
+
+try:
+    from aiohttp import ClientWSTimeout
+
+    def _ws_handshake_timeout(seconds: float) -> Any:
+        """Build the timeout object required by current aiohttp."""
+        return ClientWSTimeout(ws_close=seconds)
+
+except ImportError:
+
+    def _ws_handshake_timeout(seconds: float) -> float:
+        """Use the float timeout required by Home Assistant 2024.8."""
+        return seconds
 
 
 @dataclass
 class WebSocketConfig:
     """Configuration for WebSocket connection."""
-    
+
     base_url: str = WS_BASE_URL
     reconnect_delay_min: float = WS_RECONNECT_DELAY_MIN
     reconnect_delay_max: float = WS_RECONNECT_DELAY_MAX
@@ -46,64 +69,55 @@ class WebSocketConfig:
 
 class WebSocketManager:
     """Manages WebSocket connection to Atmeex Cloud API.
-    
+
     Features:
     - Automatic connection and authentication
     - Exponential backoff reconnection strategy
     - Message handling and routing
     - Graceful shutdown
-    
-    Usage:
-        manager = WebSocketManager(token_getter, on_message_callback)
-        await manager.connect()
-        # ... manager runs in background ...
-        await manager.disconnect()
     """
-    
+
     def __init__(
         self,
         session: aiohttp.ClientSession,
-        token_getter: Callable[[], str] | str,
-        on_message: Callable[[dict[str, Any]], None],
-        config: Optional[WebSocketConfig] = None,
-        on_auth_failure: Optional[Callable[[], None]] = None,
-        on_token_refresh: Optional[Callable[[], Any]] = None,
+        token_getter: Callable[[], str],
+        on_message: MessageCallback,
+        *,
+        task_factory: TaskFactory,
+        on_auth_failure: Callable[[], None],
+        on_token_refresh: TokenRecoveryCallback,
+        config: WebSocketConfig | None = None,
     ) -> None:
         """Initialize WebSocket manager.
 
         Args:
             session: aiohttp ClientSession for WebSocket connection
-            token_getter: Callable returning current auth token, or static token string.
-                Use a callable so reconnects pick up refreshed tokens.
+            token_getter: Callable returning the current authentication token.
             on_message: Callback function for received messages
             config: Optional WebSocket configuration
-            on_auth_failure: Optional callback invoked when the server rejects the token
-                with HTTP 401 or 403.  After calling this callback the manager stops
-                all reconnect attempts so the caller can start a reauth flow.
-            on_token_refresh: Optional async/sync callback to request a token refresh
-                (e.g. coordinator.async_request_refresh).  Called on 'unauthorized'
-                messages so the next reconnect picks up a fresh token.
+            task_factory: Entry-owned task creation callback.
+            on_auth_failure: Callback that starts config-entry reauthentication.
+            on_token_refresh: Async callback that refreshes the API token.
         """
         self._session = session
-        if callable(token_getter):
-            self._token_getter: Callable[[], str] = token_getter
-        else:
-            static_token = token_getter
-            self._token_getter = lambda: static_token
+        self._token_getter = token_getter
         self._on_message = on_message
+        self._task_factory = task_factory
         self._on_auth_failure = on_auth_failure
         self._on_token_refresh = on_token_refresh
         self._config = config or WebSocketConfig()
-        
-        self._ws: Optional[ClientWebSocketResponse] = None
+
+        self._ws: ClientWebSocketResponse | None = None
         self._running = False
-        self._reconnect_task: Optional[asyncio.Task[None]] = None
-        self._listen_task: Optional[asyncio.Task[None]] = None
-        
+        self._reconnect_task: asyncio.Task[None] | None = None
+        self._listen_task: asyncio.Task[None] | None = None
+
         self._reconnect_delay = self._config.reconnect_delay_min
         self._last_message_time = 0.0
-        self._consecutive_auth_failures = 0
-        
+        self._transport_failures = 0
+        self._application_unauthorized_count = 0
+        self._reauth_requested = False
+
     async def connect(self) -> bool:
         """Start WebSocket connection and keep reconnect loop active on failures."""
         if self.is_connected:
@@ -116,43 +130,89 @@ class WebSocketManager:
             self._ensure_reconnect_task()
         return connected
 
-    async def _connect_once(self) -> bool:
+    async def _connect_once(self, *, allow_recovery: bool = True) -> bool:
         """Try exactly one WebSocket connection attempt."""
         try:
-            _LOGGER.info("Connecting to Atmeex WebSocket: %s", self._config.base_url)
             token = self._token_getter() or ""
-            headers = {"Authorization": f"Bearer {token}"}
-            self._ws = await self._session.ws_connect(
+            ws = await self._session.ws_connect(
                 self._config.base_url,
-                headers=headers,
+                headers={"Authorization": f"Bearer {token}"},
                 heartbeat=self._config.ping_interval,
-                timeout=self._config.ping_timeout,
+                timeout=_ws_handshake_timeout(self._config.ping_timeout),
             )
         except aiohttp.WSServerHandshakeError as err:
             if err.status in (401, 403):
-                _LOGGER.warning(
-                    "WebSocket authentication failed (HTTP %s) — stopping reconnect",
-                    err.status,
-                )
-                # Permanently stop reconnect; let the caller trigger a reauth flow.
-                self._running = False
-                if self._on_auth_failure is not None:
-                    self._on_auth_failure()
-            else:
-                _LOGGER.warning("WebSocket handshake error: %s", err)
-            self._ws = None
+                if allow_recovery:
+                    try:
+                        await self._on_token_refresh()
+                    except ApiError:
+                        self._request_reauth()
+                        return False
+                    return await self._connect_once(allow_recovery=False)
+                self._request_reauth()
+                return False
+            self._record_transport_failure()
             return False
-        except Exception as err:  # noqa: BLE001
-            _LOGGER.warning("Failed to connect to WebSocket: %s", err)
-            self._ws = None
+        except (aiohttp.ClientError, asyncio.TimeoutError):
+            self._record_transport_failure()
             return False
 
+        self._transport_failures = 0
         self._reconnect_delay = self._config.reconnect_delay_min
-        self._consecutive_auth_failures = 0
-        await self._cancel_task(self._listen_task)
-        self._listen_task = asyncio.create_task(self._listen())
-        _LOGGER.info("WebSocket connected successfully")
+        self._ws = ws
+        listen_coro = self._listen(ws)
+        self._listen_task = None
+        try:
+            self._listen_task = self._task_factory(
+                listen_coro,
+                "atmeex websocket listener",
+            )
+        except BaseException:
+            listen_coro.close()
+            try:
+                if not ws.closed:
+                    await ws.close()
+            finally:
+                if self._ws is ws:
+                    self._ws = None
+            raise
         return True
+
+    def _request_reauth(self) -> None:
+        """Stop reconnects and request reauthentication at most once."""
+        self._running = False
+        if self._reauth_requested:
+            return
+        self._reauth_requested = True
+        self._on_auth_failure()
+
+    def _record_transport_failure(self) -> None:
+        """Record one transport failure and update transport backoff."""
+        self._transport_failures += 1
+        if self._transport_failures == 1:
+            self._reconnect_delay = min(
+                self._config.reconnect_delay_min,
+                self._config.reconnect_delay_max,
+            )
+            return
+        self._reconnect_delay = min(
+            max(
+                self._reconnect_delay * 2,
+                self._config.reconnect_delay_min,
+            ),
+            self._config.reconnect_delay_max,
+        )
+
+    def _next_reconnect_delay(self) -> float:
+        """Return the larger transport or application-auth backoff."""
+        auth_delay = self._config.reconnect_delay_min
+        if self._application_unauthorized_count:
+            auth_delay = min(
+                self._config.reconnect_delay_min
+                * (2**self._application_unauthorized_count),
+                self._config.reconnect_delay_max,
+            )
+        return max(self._reconnect_delay, auth_delay)
 
     def _ensure_reconnect_task(self) -> None:
         """Start reconnect loop if not running already."""
@@ -160,194 +220,165 @@ class WebSocketManager:
             return
         if self._reconnect_task and not self._reconnect_task.done():
             return
-        self._reconnect_task = asyncio.create_task(self._reconnect())
+        reconnect_coro = self._reconnect()
+        self._reconnect_task = None
+        try:
+            self._reconnect_task = self._task_factory(
+                reconnect_coro,
+                "atmeex websocket reconnect",
+            )
+        except BaseException:
+            reconnect_coro.close()
+            raise
 
-    async def _cancel_task(self, task: Optional[asyncio.Task[None]]) -> None:
+    async def _cancel_task(self, task: asyncio.Task[None] | None) -> None:
         """Cancel background task and swallow cancellation errors."""
         if task is None or task.done():
             return
         task.cancel()
         with suppress(asyncio.CancelledError):
             await task
-    
+
     async def disconnect(self) -> None:
         """Disconnect from WebSocket server gracefully."""
         _LOGGER.info("Disconnecting from WebSocket")
         self._running = False
 
+        ws = self._ws
+        if ws is not None and not ws.closed:
+            await ws.close()
         await self._cancel_task(self._listen_task)
         await self._cancel_task(self._reconnect_task)
         self._listen_task = None
         self._reconnect_task = None
-
-        if self._ws and not self._ws.closed:
-            await self._ws.close()
-        self._ws = None
+        if self._ws is ws:
+            self._ws = None
         _LOGGER.info("WebSocket disconnected")
-    
-    async def _listen(self) -> None:
-        """Listen for incoming WebSocket messages."""
-        if not self._ws:
-            return
-        
+
+    async def _listen(self, ws: ClientWebSocketResponse) -> None:
+        """Listen on one captured WebSocket until it closes."""
         try:
-            async for msg in self._ws:
+            async for msg in ws:
                 if not self._running:
                     break
-                
-                self._last_message_time = time.monotonic()
-                
+
                 if msg.type == WSMsgType.TEXT:
                     await self._handle_message(msg.data)
-                    
+
                 elif msg.type == WSMsgType.BINARY:
                     _LOGGER.debug("Received binary message (ignored)")
-                    
+
                 elif msg.type == WSMsgType.PING:
                     _LOGGER.debug("Received ping")
-                    
+
                 elif msg.type == WSMsgType.PONG:
                     _LOGGER.debug("Received pong")
-                    
+
                 elif msg.type == WSMsgType.CLOSE:
                     _LOGGER.warning("WebSocket closed by server")
                     break
-                    
+
                 elif msg.type == WSMsgType.ERROR:
-                    _LOGGER.error("WebSocket error: %s", msg.data)
+                    _LOGGER.error("WebSocket transport reported an error")
                     break
-                    
+
         except asyncio.CancelledError:
-            _LOGGER.debug("WebSocket listen task cancelled")
             raise
-            
-        except Exception as err:
-            _LOGGER.error("Error in WebSocket listen loop: %s", err)
-            
+        except (aiohttp.ClientError, asyncio.TimeoutError):
+            self._record_transport_failure()
         finally:
-            self._ws = None
-            # Connection lost - attempt reconnection if still running.
-            if self._running:
-                _LOGGER.info("WebSocket connection lost, scheduling reconnect")
-                self._ensure_reconnect_task()
-    
+            try:
+                if not ws.closed:
+                    await ws.close()
+            finally:
+                if self._ws is ws:
+                    self._ws = None
+                if self._running:
+                    self._ensure_reconnect_task()
+
     async def _handle_message(self, data: str) -> None:
-        """Handle incoming WebSocket message.
-        
-        Args:
-            data: Raw message data (JSON string)
-        """
+        """Validate and handle one raw WebSocket message."""
         try:
             message = json.loads(data)
-            
-            _LOGGER.debug("WebSocket message received: %s", message)
-
-            # Handle server-level 'unauthorized' rejection.
-            # The TCP handshake succeeds but the server immediately sends
-            # {"type": "unauthorized"} and closes the connection.  Without
-            # this check the manager would reconnect every ~1 s with the
-            # same stale token.  We apply exponential backoff and wait for
-            # the HTTP polling cycle to refresh the token.
-            if message.get("type") == "unauthorized":
-                self._consecutive_auth_failures += 1
-
-                if self._consecutive_auth_failures >= WS_MAX_UNAUTHORIZED_BEFORE_REAUTH:
-                    _LOGGER.warning(
-                        "WebSocket received %d consecutive 'unauthorized' "
-                        "messages — stopping reconnect and requesting reauth",
-                        self._consecutive_auth_failures,
-                    )
-                    self._running = False
-                    if self._on_auth_failure is not None:
-                        self._on_auth_failure()
-                    if self._ws and not self._ws.closed:
-                        await self._ws.close()
-                    return
-
-                delay = min(
-                    self._config.reconnect_delay_min
-                    * (2 ** self._consecutive_auth_failures),
-                    self._config.reconnect_delay_max,
-                )
-                self._reconnect_delay = delay
-                _LOGGER.warning(
-                    "WebSocket received 'unauthorized' message "
-                    "(attempt %d/%d), requesting token refresh, "
-                    "next reconnect in %.1f s",
-                    self._consecutive_auth_failures,
-                    WS_MAX_UNAUTHORIZED_BEFORE_REAUTH,
-                    delay,
-                )
-
-                # Ask the coordinator to refresh data (and the token)
-                # so the next reconnect picks up a valid token.
-                if self._on_token_refresh is not None:
-                    try:
-                        result = self._on_token_refresh()
-                        if asyncio.isfuture(result) or asyncio.iscoroutine(result):
-                            await result
-                    except Exception as err:  # noqa: BLE001
-                        _LOGGER.debug(
-                            "Token refresh request failed: %s", err
-                        )
-
-                if self._ws and not self._ws.closed:
-                    await self._ws.close()
-                return
-
-            # Successful data message — reset auth failure counter.
-            self._consecutive_auth_failures = 0
-
-            # Call the message handler callback
-            if callable(self._on_message):
+        except (json.JSONDecodeError, TypeError):
+            return
+        if not isinstance(message, dict):
+            return
+        if message.get("type") == "unauthorized":
+            self._application_unauthorized_count += 1
+            if (
+                self._application_unauthorized_count
+                >= WS_MAX_UNAUTHORIZED_BEFORE_REAUTH
+            ):
+                self._request_reauth()
+            else:
                 try:
-                    self._on_message(message)
-                except Exception as err:
-                    _LOGGER.error("Error in message handler: %s", err)
-                    
-        except json.JSONDecodeError as err:
-            _LOGGER.error("Failed to parse WebSocket message: %s", err)
-            
-        except Exception as err:
-            _LOGGER.error("Error handling WebSocket message: %s", err)
-    
+                    await self._on_token_refresh()
+                except ApiError:
+                    self._request_reauth()
+            await self._close_active_socket()
+            return
+        if not self._is_valid_state_message(message):
+            return
+        try:
+            accepted = self._on_message(message)
+        except Exception:
+            return
+        if accepted:
+            self._application_unauthorized_count = 0
+            self._last_message_time = time.monotonic()
+
+    async def _close_active_socket(self) -> None:
+        """Close the currently active socket without changing ownership."""
+        ws = self._ws
+        if ws is not None and not ws.closed:
+            await ws.close()
+
+    @staticmethod
+    def _is_valid_state_message(message: dict[str, Any]) -> bool:
+        """Return whether a message contains a usable device state delta."""
+        message_type = message.get("type")
+        field = "condition" if message_type == "condition" else "settings"
+        if message_type not in ("condition", "settings"):
+            return False
+        data = message.get("data")
+        if not isinstance(data, list):
+            return False
+        return any(
+            isinstance(item, dict)
+            and item.get("id") is not None
+            and isinstance(item.get(field), dict)
+            and bool(item[field])
+            for item in data
+        )
+
     async def _reconnect(self) -> None:
         """Attempt to reconnect with exponential backoff."""
-        while self._running and not self.is_connected:
-            _LOGGER.info(
-                "Attempting WebSocket reconnect in %.1f seconds",
-                self._reconnect_delay
-            )
-            
-            await asyncio.sleep(self._reconnect_delay)
-            
-            if not self._running or self.is_connected:
-                break
+        current = asyncio.current_task()
+        try:
+            while self._running and not self.is_connected:
+                await asyncio.sleep(self._next_reconnect_delay())
+                if not self._running:
+                    return
+                connected = await self._connect_once()
+                if connected:
+                    await asyncio.sleep(0)
+                    if self.is_connected:
+                        return
+        finally:
+            if self._reconnect_task is current:
+                self._reconnect_task = None
+            if self._running and not self.is_connected:
+                self._ensure_reconnect_task()
 
-            success = await self._connect_once()
-            if success:
-                _LOGGER.info("WebSocket reconnected successfully")
-                break
-
-            self._reconnect_delay = min(
-                self._reconnect_delay * 2,
-                self._config.reconnect_delay_max,
-            )
-            _LOGGER.warning(
-                "WebSocket reconnect failed, next attempt in %.1f seconds",
-                self._reconnect_delay,
-            )
-
-        self._reconnect_task = None
-    
     @property
     def is_connected(self) -> bool:
         """Check if WebSocket is currently connected."""
         return self._running and self._ws is not None and not self._ws.closed
-    
+
     @property
     def last_message_age(self) -> float:
         """Get time since last message received (seconds)."""
         if self._last_message_time == 0:
-            return float('inf')
+            return float("inf")
         return time.monotonic() - self._last_message_time

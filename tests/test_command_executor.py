@@ -254,13 +254,14 @@ async def test_successful_write_with_failed_confirmation_remains_successful_and_
     executor = AtmeexCommandExecutor(refresh_device)
     operation = AsyncMock()
 
-    await executor.async_execute(
+    confirmation_success = await executor.async_execute(
         1,
         operation,
         pending={"pwr_on": True},
         translation_key="command_failed",
     )
 
+    assert confirmation_success is False
     operation.assert_awaited_once()
     refresh_device.assert_awaited_once_with(1)
     assert executor.value_with_pending(1, "pwr_on", False) is True
@@ -268,6 +269,36 @@ async def test_successful_write_with_failed_confirmation_remains_successful_and_
     executor.allow_recovery_confirmation(1)
     assert executor.confirm(1, "pwr_on", True) is True
     assert executor.value_with_pending(1, "pwr_on", False) is False
+
+
+@pytest.mark.asyncio
+async def test_successful_confirmation_returns_true():
+    executor = AtmeexCommandExecutor(AsyncMock())
+
+    confirmation_success = await executor.async_execute(
+        1,
+        AsyncMock(),
+        pending={"pwr_on": True},
+        translation_key="command_failed",
+    )
+
+    assert confirmation_success is True
+
+
+@pytest.mark.asyncio
+async def test_confirmation_timeout_returns_false():
+    executor = AtmeexCommandExecutor(
+        AsyncMock(side_effect=asyncio.TimeoutError)
+    )
+
+    confirmation_success = await executor.async_execute(
+        1,
+        AsyncMock(),
+        pending={"pwr_on": True},
+        translation_key="command_failed",
+    )
+
+    assert confirmation_success is False
 
 
 @pytest.mark.asyncio

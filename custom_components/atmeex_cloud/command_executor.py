@@ -404,7 +404,7 @@ class AtmeexCommandExecutor:
         pending: Mapping[str, Any],
         translation_key: str,
         translation_placeholders: Mapping[str, str] | None = None,
-    ) -> None:
+    ) -> bool:
         """Execute one logical operation and confirmation under one lock."""
         key = self._device_key(device_id)
         generation = self._next_generation()
@@ -450,7 +450,7 @@ class AtmeexCommandExecutor:
                     except (ApiError, asyncio.TimeoutError):
                         # The remote write succeeded. A failed confirmation is
                         # not a failed command, and its optimistic value stays.
-                        return
+                        return False
                     except asyncio.CancelledError:
                         try:
                             await self._recover_after_write_failure(device_id)
@@ -460,6 +460,7 @@ class AtmeexCommandExecutor:
                     else:
                         if self._generation_is_referenced(generation):
                             self._confirmation_ready_generations.add(generation)
+                        return True
             except asyncio.CancelledError:
                 # Also handles cancellation while waiting for the lock.
                 self._clear_generation(key, generation)

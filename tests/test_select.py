@@ -1,7 +1,9 @@
-import pytest
+import asyncio
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock, patch
-from homeassistant.exceptions import HomeAssistantError
+from unittest.mock import AsyncMock, MagicMock
+
+import pytest
+from homeassistant.exceptions import HomeAssistantError, ServiceValidationError
 
 from custom_components.atmeex_cloud import AtmeexRuntimeData
 from custom_components.atmeex_cloud.select import (
@@ -50,12 +52,17 @@ def test_humidification_select_current_option_from_hum_stg():
     assert hum.current_option == "off"
 
 
-def test_humidification_select_fallback_to_cached_option():
+def test_humidification_select_unknown_state_ignores_stale_cache():
     hum, breezer, cond, api, coord = _make_selects({"hum_stg": "bad"})
-    # нет корректного hum_stg — используется _attr_current_option (по умолчанию "off")
-    assert hum.current_option == "off"
     hum._attr_current_option = "2"
-    assert hum.current_option == "2"
+
+    assert hum.current_option is None
+
+    cond.clear()
+    assert hum.current_option is None
+
+    cond["hum_stg"] = True
+    assert hum.current_option is None
 
 
 @pytest.mark.asyncio
@@ -65,26 +72,39 @@ async def test_humidification_select_async_select_option():
 
     api.set_humid_stage.assert_awaited_once_with(1, 3)
     coord.async_request_refresh.assert_awaited_once()
-    assert hum._attr_current_option == "3"
+    assert not hasattr(hum, "_attr_current_option")
 
 
 @pytest.mark.asyncio
-async def test_humidification_select_invalid_option_noop():
+async def test_humidification_select_invalid_option_raises():
     hum, breezer, cond, api, coord = _make_selects()
-    await hum.async_select_option("invalid")
+
+    with pytest.raises(ServiceValidationError) as raised:
+        await hum.async_select_option("invalid")
+
+    assert raised.value.translation_key == "invalid_command_value"
+    assert (
+        raised.value.translation_placeholders["field"]
+        == "humidification_option"
+    )
     api.set_humid_stage.assert_not_awaited()
     coord.async_request_refresh.assert_not_awaited()
 
 
 
 def test_breezer_select_current_option_from_damp_pos():
-    hum, breezer, cond, api, coord = _make_selects({"damp_pos": 1})
+    hum, breezer, cond, api, coord = _make_selects(
+        {"pwr_on": True, "damp_pos": 1}
+    )
     assert getattr(breezer, "_attr_name", None) is None
     assert breezer.current_option == BREEZER_OPTIONS[1]
 
     cond["damp_pos"] = 10
-    # некорректное значение — берём кэш или первую опцию
-    assert breezer.current_option == BREEZER_OPTIONS[0]
+    breezer._attr_current_option = BREEZER_OPTIONS[0]
+    assert breezer.current_option is None
+
+    cond.clear()
+    assert breezer.current_option is None
 
 
 @pytest.mark.asyncio
@@ -94,13 +114,18 @@ async def test_breezer_select_async_select_option():
 
     api.set_breezer_mode.assert_awaited_once_with(1, 3)
     coord.async_request_refresh.assert_awaited_once()
-    assert breezer._attr_current_option == BREEZER_OPTIONS[3]
+    assert not hasattr(breezer, "_attr_current_option")
 
 
 @pytest.mark.asyncio
-async def test_breezer_select_invalid_option_noop():
+async def test_breezer_select_invalid_option_raises():
     hum, breezer, cond, api, coord = _make_selects()
-    await breezer.async_select_option("неизвестно")
+
+    with pytest.raises(ServiceValidationError) as raised:
+        await breezer.async_select_option("неизвестно")
+
+    assert raised.value.translation_key == "invalid_command_value"
+    assert raised.value.translation_placeholders["field"] == "breezer_option"
     api.set_breezer_mode.assert_not_awaited()
     coord.async_request_refresh.assert_not_awaited()
 
@@ -147,6 +172,12 @@ async def test_async_setup_entry_skips_hum_entities_until_capability_detected():
         AtmeexBreezerSelect,
         AtmeexHumidificationSelect,
     }
+    humidification = next(
+        entity
+        for entity in entities
+        if isinstance(entity, AtmeexHumidificationSelect)
+    )
+    assert humidification._runtime is runtime
 
 
 # ---------------------------------------------------------------------------
@@ -160,7 +191,9 @@ async def test_async_setup_entry_skips_hum_entities_until_capability_detected():
         (True, 1, BREEZER_OPTIONS[1]),   # recirculation
         (True, 2, BREEZER_OPTIONS[2]),   # mixed_mode
         (False, 0, BREEZER_OPTIONS[3]),  # supply_valve
-        (False, 1, BREEZER_OPTIONS[1]),  # recirculation (shows damper's actual position)
+        (False, 1, None),                # contradictory power/mode state
+        (False, 2, None),                # contradictory power/mode state
+        (None, 1, None),                 # power state is not known yet
     ],
 )
 def test_breezer_current_option_truth_table(pwr_on, damp_pos, expected_option):
@@ -205,10 +238,11 @@ async def test_breezer_select_supply_valve_sets_pending():
     await breezer.async_select_option(BREEZER_OPTIONS[3])  # supply_valve
 
     api.set_breezer_mode.assert_awaited_once_with(1, 3)
-    pending_pwr = runtime.get_pending(1, "pwr_on")
-    pending_damp = runtime.get_pending(1, "damp_pos")
-    assert pending_pwr is None or pending_pwr.value is False
-    assert pending_damp is None or pending_damp.value == 0
+    assert runtime.command_executor.value_with_pending(
+        1, "pwr_on", True
+    ) is False
+    assert runtime.command_executor.value_with_pending(1, "damp_pos", 2) == 0
+    assert breezer.current_option == BREEZER_OPTIONS[3]
 
 
 @pytest.mark.asyncio
@@ -217,5 +251,188 @@ async def test_breezer_select_recirculation_sets_pending():
     await breezer.async_select_option(BREEZER_OPTIONS[1])  # recirculation
 
     api.set_breezer_mode.assert_awaited_once_with(1, 1)
-    pending_damp = runtime.get_pending(1, "damp_pos")
-    assert pending_damp is None or pending_damp.value == 1
+    assert runtime.command_executor.value_with_pending(1, "damp_pos", 0) == 1
+    assert breezer.current_option == BREEZER_OPTIONS[1]
+
+
+@pytest.mark.asyncio
+async def test_humidification_select_uses_executor_pending_value():
+    hum, _breezer, _cond, api, coordinator = _make_selects({"hum_stg": 0})
+    refresh = AsyncMock()
+    runtime = AtmeexRuntimeData(
+        api=api,
+        coordinator=coordinator,
+        refresh_device=refresh,
+    )
+    hum._runtime = runtime
+    hum._refresh_device_cb = refresh
+
+    await hum.async_select_option("3")
+
+    assert runtime.command_executor.value_with_pending(1, "hum_stg", 0) == 3
+    assert hum.current_option == "3"
+    refresh.assert_awaited_once_with(1)
+
+
+class _BadOptionString:
+    def __str__(self) -> str:
+        raise RuntimeError("must not escape validation")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("entity_name", ["humidification", "breezer"])
+@pytest.mark.parametrize(
+    "invalid_option",
+    [None, True, 1, object(), _BadOptionString()],
+)
+async def test_selects_reject_malformed_non_string_options(
+    entity_name, invalid_option
+):
+    hum, breezer, _cond, api, coordinator = _make_selects()
+    entity = hum if entity_name == "humidification" else breezer
+
+    with pytest.raises(ServiceValidationError) as raised:
+        await entity.async_select_option(invalid_option)
+
+    assert raised.value.translation_key == "invalid_command_value"
+    api.set_humid_stage.assert_not_awaited()
+    api.set_breezer_mode.assert_not_awaited()
+    coordinator.async_request_refresh.assert_not_awaited()
+
+
+def _attach_select_runtime(hum, breezer, api, coordinator):
+    refresh = AsyncMock()
+    runtime = AtmeexRuntimeData(
+        api=api,
+        coordinator=coordinator,
+        refresh_device=refresh,
+    )
+    for entity in (hum, breezer):
+        entity._runtime = runtime
+        entity._refresh_device_cb = refresh
+    return refresh, runtime
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("entity_name", "option", "api_method"),
+    [
+        ("humidification", "3", "set_humid_stage"),
+        ("breezer", BREEZER_OPTIONS[1], "set_breezer_mode"),
+    ],
+)
+async def test_select_defers_api_call_until_executor_lock_is_acquired(
+    entity_name, option, api_method
+):
+    hum, breezer, _cond, api, coordinator = _make_selects()
+    _refresh, runtime = _attach_select_runtime(
+        hum, breezer, api, coordinator
+    )
+    entity = hum if entity_name == "humidification" else breezer
+    lock = runtime.get_device_lock(1)
+    await lock.acquire()
+    task = asyncio.create_task(entity.async_select_option(option))
+    await asyncio.sleep(0)
+
+    try:
+        getattr(api, api_method).assert_not_called()
+    finally:
+        if not task.done():
+            task.cancel()
+        lock.release()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("entity_name", "option", "api_method", "action", "pending_fields"),
+    [
+        (
+            "humidification",
+            "3",
+            "set_humid_stage",
+            "set humidification stage",
+            ("hum_stg",),
+        ),
+        (
+            "breezer",
+            BREEZER_OPTIONS[3],
+            "set_breezer_mode",
+            "set breezer mode",
+            ("pwr_on", "damp_pos"),
+        ),
+    ],
+)
+async def test_select_api_error_is_translated_and_clears_pending(
+    entity_name, option, api_method, action, pending_fields
+):
+    hum, breezer, _cond, api, coordinator = _make_selects({"pwr_on": True})
+    refresh, runtime = _attach_select_runtime(
+        hum, breezer, api, coordinator
+    )
+    entity = hum if entity_name == "humidification" else breezer
+    error = ApiError(api_method, "failed", status=503)
+    getattr(api, api_method).side_effect = error
+
+    with pytest.raises(HomeAssistantError) as raised:
+        await entity.async_select_option(option)
+
+    assert raised.value.translation_key == "command_failed"
+    assert raised.value.translation_placeholders == {"action": action}
+    assert raised.value.__cause__ is error
+    refresh.assert_awaited_once_with(1)
+    for field in pending_fields:
+        assert runtime.get_pending(1, field) is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("entity_name", "option", "api_method", "expected_option", "pending_fields"),
+    [
+        (
+            "humidification",
+            "3",
+            "set_humid_stage",
+            "3",
+            ("hum_stg",),
+        ),
+        (
+            "breezer",
+            BREEZER_OPTIONS[3],
+            "set_breezer_mode",
+            BREEZER_OPTIONS[3],
+            ("pwr_on", "damp_pos"),
+        ),
+    ],
+)
+async def test_select_cancellation_recovers_and_clears_pending(
+    entity_name, option, api_method, expected_option, pending_fields
+):
+    hum, breezer, _cond, api, coordinator = _make_selects(
+        {"hum_stg": 0, "pwr_on": True, "damp_pos": 0}
+    )
+    refresh, runtime = _attach_select_runtime(
+        hum, breezer, api, coordinator
+    )
+    entity = hum if entity_name == "humidification" else breezer
+    started = asyncio.Event()
+    never_release = asyncio.Event()
+
+    async def blocked_write(*_args):
+        started.set()
+        await never_release.wait()
+
+    getattr(api, api_method).side_effect = blocked_write
+    task = asyncio.create_task(entity.async_select_option(option))
+    await started.wait()
+
+    try:
+        assert entity.current_option == expected_option
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    refresh.assert_awaited_once_with(1)
+    for field in pending_fields:
+        assert runtime.get_pending(1, field) is None

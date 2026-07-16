@@ -1,4 +1,5 @@
 import asyncio
+import logging
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -15,6 +16,11 @@ from custom_components.atmeex_cloud.api import (
     AtmeexProtocolError,
 )
 from tests.conftest import DummyCoordinator
+
+
+def _ha_create_task(coro, *, name=None):
+    """Create a named task like HomeAssistant.async_create_task."""
+    return asyncio.create_task(coro, name=name)
 
 
 class FakeApi:
@@ -52,17 +58,11 @@ class FakeApi:
         # первый полный опрос — список устройств (включённое)
         self.get_devices = AsyncMock(return_value=[self._dev_initial])
 
-        # считаем вызовы get_device
-        self._get_device_call_count = 0
-
         def _get_device_side_effect(device_id):
-            """Первая дочитка — включённый девайс, далее — выключенный."""
-            self._get_device_call_count += 1
-            if self._get_device_call_count == 1:
-                return self._dev_initial
+            """Targeted refresh returns the newer device snapshot."""
             return self._dev_refreshed
 
-        # точечное дочтение: сначала включённый, затем выключенный
+        # The inventory list provides initial state; targeted reads provide updates.
         self.get_device = AsyncMock(side_effect=_get_device_side_effect)
 
 
@@ -79,6 +79,7 @@ async def test_refresh_device_updates_coordinator_data(monkeypatch):
     # hass-заглушка без реального Home Assistant
     hass = SimpleNamespace(
         data={},
+        async_create_task=_ha_create_task,
         config_entries=SimpleNamespace(
             async_forward_entry_setups=AsyncMock(),
             async_unload_platforms=AsyncMock(return_value=True),
@@ -111,6 +112,21 @@ async def test_refresh_device_updates_coordinator_data(monkeypatch):
 
     state_after = coordinator.data["states"]["1"]
     assert state_after["pwr_on"] is False
+
+    runtime.api.get_device.reset_mock()
+
+    async def operation() -> None:
+        return
+
+    await runtime.command_executor.async_execute(
+        1,
+        operation,
+        pending={"pwr_on": False},
+        translation_key="command_failed",
+    )
+
+    runtime.api.get_device.assert_awaited_once_with(1)
+    assert runtime.coordinator.data["states"]["1"]["pwr_on"] is False
 
 
 @pytest.mark.asyncio
@@ -147,12 +163,8 @@ async def test_refresh_device_preserves_newer_websocket_field(monkeypatch):
             self.refresh_token = None
             self.login = AsyncMock()
             self.get_devices = AsyncMock(return_value=[initial])
-            self._get_count = 0
 
         async def get_device(self, _device_id):
-            self._get_count += 1
-            if self._get_count == 1:
-                return initial
             get_started.set()
             await release_get.wait()
             return stale_refresh
@@ -163,6 +175,7 @@ async def test_refresh_device_preserves_newer_websocket_field(monkeypatch):
 
     hass = SimpleNamespace(
         data={},
+        async_create_task=_ha_create_task,
         config_entries=SimpleNamespace(
             async_forward_entry_setups=AsyncMock(),
             async_unload_platforms=AsyncMock(return_value=True),
@@ -232,6 +245,7 @@ async def test_refresh_device_typed_error_propagates_and_schedules_recovery(
     )
     runtime = await _setup_default_refresh_runtime(monkeypatch, hass)
     runtime.coordinator.async_request_refresh = AsyncMock()
+    runtime.coordinator.async_update_listeners = MagicMock()
     failure = AtmeexConnectionError(
         "get_device",
         "cloud unavailable",
@@ -243,7 +257,13 @@ async def test_refresh_device_typed_error_propagates_and_schedules_recovery(
         await runtime.refresh_device(1)
 
     assert caught.value is failure
-    await asyncio.gather(*created_tasks)
+    recovery_tasks = [
+        task
+        for task in created_tasks
+        if task.get_name() == "atmeex targeted-refresh recovery"
+    ]
+    assert len(recovery_tasks) == 1
+    await asyncio.gather(*recovery_tasks)
     runtime.coordinator.async_request_refresh.assert_awaited_once_with()
     assert any(
         call.args
@@ -254,18 +274,303 @@ async def test_refresh_device_typed_error_propagates_and_schedules_recovery(
 
 
 @pytest.mark.asyncio
+async def test_failed_authoritative_recovery_keeps_pending_unconfirmed(
+    monkeypatch,
+):
+    """An absorbed coordinator failure must not authorize confirmation."""
+    created_tasks: list[asyncio.Task] = []
+
+    def _create_task(coro, *, name=None):
+        task = asyncio.create_task(coro, name=name)
+        created_tasks.append(task)
+        return task
+
+    hass = SimpleNamespace(
+        data={},
+        bus=SimpleNamespace(async_fire=MagicMock()),
+        async_create_task=_create_task,
+        config_entries=SimpleNamespace(
+            async_forward_entry_setups=AsyncMock(),
+            async_unload_platforms=AsyncMock(return_value=True),
+        ),
+    )
+    runtime = await _setup_default_refresh_runtime(monkeypatch, hass)
+    coordinator = runtime.coordinator
+    executor = runtime.command_executor
+    allow_recovery = MagicMock(
+        wraps=executor.allow_recovery_confirmation,
+    )
+    executor.allow_recovery_confirmation = allow_recovery
+    coordinator.async_update_listeners = MagicMock()
+
+    async def absorbed_failed_refresh() -> None:
+        coordinator.last_update_success = False
+
+    coordinator.async_request_refresh = AsyncMock(
+        side_effect=absorbed_failed_refresh,
+    )
+    runtime.api.get_device.side_effect = AtmeexConnectionError(
+        "get_device",
+        "cloud unavailable",
+        status=503,
+    )
+
+    confirmation = await executor.async_execute(
+        1,
+        AsyncMock(),
+        pending={"pwr_on": False},
+        translation_key="command_failed",
+    )
+    assert confirmation is False
+    pending_before = executor.get_pending(1, "pwr_on")
+    assert pending_before is not None
+
+    recovery_tasks = [
+        task
+        for task in created_tasks
+        if task.get_name() == "atmeex targeted-refresh recovery"
+    ]
+    assert len(recovery_tasks) == 1
+    await asyncio.gather(*recovery_tasks)
+
+    assert coordinator.last_update_success is False
+    coordinator.async_request_refresh.assert_awaited_once_with()
+    allow_recovery.assert_not_called()
+    coordinator.async_update_listeners.assert_not_called()
+    pending_after = executor.get_pending(1, "pwr_on")
+    assert pending_after is not None
+    assert pending_after.generation == pending_before.generation
+    assert pending_after.value is False
+
+
+@pytest.mark.asyncio
+async def test_debounced_recovery_keeps_pending_without_new_inventory(
+    monkeypatch,
+):
+    """A stale prior success must not authorize recovery confirmation."""
+    created_tasks: list[asyncio.Task] = []
+
+    def _create_task(coro, *, name=None):
+        task = asyncio.create_task(coro, name=name)
+        created_tasks.append(task)
+        return task
+
+    hass = SimpleNamespace(
+        data={},
+        bus=SimpleNamespace(async_fire=MagicMock()),
+        async_create_task=_create_task,
+        config_entries=SimpleNamespace(
+            async_forward_entry_setups=AsyncMock(),
+            async_unload_platforms=AsyncMock(return_value=True),
+        ),
+    )
+    runtime = await _setup_default_refresh_runtime(monkeypatch, hass)
+    coordinator = runtime.coordinator
+    executor = runtime.command_executor
+    prior_inventory_success = coordinator.last_inventory_success_mono
+    assert coordinator.last_update_success is True
+    assert prior_inventory_success is not None
+    allow_recovery = MagicMock(
+        wraps=executor.allow_recovery_confirmation,
+    )
+    executor.allow_recovery_confirmation = allow_recovery
+    coordinator.async_update_listeners = MagicMock()
+    coordinator.async_request_refresh = AsyncMock()
+    runtime.api.get_device.side_effect = AtmeexConnectionError(
+        "get_device",
+        "cloud unavailable",
+        status=503,
+    )
+
+    confirmation = await executor.async_execute(
+        1,
+        AsyncMock(),
+        pending={"pwr_on": False},
+        translation_key="command_failed",
+    )
+    assert confirmation is False
+    pending_before = executor.get_pending(1, "pwr_on")
+    assert pending_before is not None
+
+    recovery_tasks = [
+        task
+        for task in created_tasks
+        if task.get_name() == "atmeex targeted-refresh recovery"
+    ]
+    assert len(recovery_tasks) == 1
+    await asyncio.gather(*recovery_tasks)
+
+    assert coordinator.last_update_success is True
+    assert coordinator.last_inventory_success_mono == prior_inventory_success
+    coordinator.async_request_refresh.assert_awaited_once_with()
+    allow_recovery.assert_not_called()
+    coordinator.async_update_listeners.assert_not_called()
+    pending_after = executor.get_pending(1, "pwr_on")
+    assert pending_after is not None
+    assert pending_after.generation == pending_before.generation
+    assert pending_after.value is False
+
+
+@pytest.mark.asyncio
+async def test_degraded_inventory_recovery_keeps_pending_unconfirmed(
+    monkeypatch,
+):
+    """A newer but degraded inventory must not authorize confirmation."""
+    created_tasks: list[asyncio.Task] = []
+
+    def _create_task(coro, *, name=None):
+        task = asyncio.create_task(coro, name=name)
+        created_tasks.append(task)
+        return task
+
+    hass = SimpleNamespace(
+        data={},
+        bus=SimpleNamespace(async_fire=MagicMock()),
+        async_create_task=_create_task,
+        config_entries=SimpleNamespace(
+            async_forward_entry_setups=AsyncMock(),
+            async_unload_platforms=AsyncMock(return_value=True),
+        ),
+    )
+    runtime = await _setup_default_refresh_runtime(monkeypatch, hass)
+    coordinator = runtime.coordinator
+    executor = runtime.command_executor
+    prior_inventory_success = coordinator.last_inventory_success_mono
+    allow_recovery = MagicMock(
+        wraps=executor.allow_recovery_confirmation,
+    )
+    executor.allow_recovery_confirmation = allow_recovery
+    coordinator.async_update_listeners = MagicMock()
+    runtime.api.get_devices.return_value = [
+        AtmeexDevice.from_raw(
+            {
+                "id": 1,
+                "name": "Dev1",
+                "model": "test-model",
+                "online": True,
+            }
+        )
+    ]
+    runtime.api.get_device.side_effect = AtmeexConnectionError(
+        "get_device",
+        "cloud unavailable",
+        status=503,
+    )
+
+    confirmation = await executor.async_execute(
+        1,
+        AsyncMock(),
+        pending={"pwr_on": False},
+        translation_key="command_failed",
+    )
+    assert confirmation is False
+
+    recovery_tasks = [
+        task
+        for task in created_tasks
+        if task.get_name() == "atmeex targeted-refresh recovery"
+    ]
+    assert len(recovery_tasks) == 1
+    await asyncio.gather(*recovery_tasks)
+
+    assert coordinator.last_update_success is True
+    assert coordinator.last_inventory_success_mono > prior_inventory_success
+    assert isinstance(coordinator.last_api_error, AtmeexConnectionError)
+    allow_recovery.assert_not_called()
+    coordinator.async_update_listeners.assert_not_called()
+    assert executor.get_pending(1, "pwr_on") is not None
+
+
+@pytest.mark.asyncio
+async def test_unexpected_refresh_failure_is_private_pending_and_recovered(
+    monkeypatch,
+    caplog,
+):
+    created_tasks: list[asyncio.Task] = []
+
+    def _create_task(coro, *, name=None):
+        task = asyncio.create_task(coro, name=name)
+        created_tasks.append(task)
+        return task
+
+    hass = SimpleNamespace(
+        data={},
+        bus=SimpleNamespace(async_fire=MagicMock()),
+        async_create_task=_create_task,
+        config_entries=SimpleNamespace(
+            async_forward_entry_setups=AsyncMock(),
+            async_unload_platforms=AsyncMock(return_value=True),
+        ),
+    )
+    runtime = await _setup_default_refresh_runtime(monkeypatch, hass)
+    runtime.coordinator.async_request_refresh = AsyncMock()
+    runtime.coordinator.async_update_listeners = MagicMock()
+    secret = "private-token-should-never-leak"
+    runtime.api.get_device.side_effect = RuntimeError(secret)
+    caplog.set_level(logging.WARNING)
+
+    confirmation = await runtime.command_executor.async_execute(
+        1,
+        AsyncMock(),
+        pending={"pwr_on": False},
+        translation_key="command_failed",
+    )
+
+    assert confirmation is False
+    pending = runtime.command_executor.get_pending(1, "pwr_on")
+    assert pending is not None
+    assert pending.value is False
+
+    owner_tasks = [
+        task
+        for task in created_tasks
+        if task.get_name() == "atmeex refresh 1"
+    ]
+    assert len(owner_tasks) == 1
+    sanitized_failure = owner_tasks[0].exception()
+    assert isinstance(sanitized_failure, AtmeexProtocolError)
+    assert sanitized_failure.__context__ is None
+    assert str(sanitized_failure) == "get_device: unexpected client failure"
+
+    recovery_tasks = [
+        task
+        for task in created_tasks
+        if task.get_name() == "atmeex targeted-refresh recovery"
+    ]
+    assert len(recovery_tasks) == 1
+    await asyncio.gather(*recovery_tasks)
+    runtime.coordinator.async_request_refresh.assert_awaited_once_with()
+
+    api_error_calls = [
+        call
+        for call in hass.bus.async_fire.call_args_list
+        if call.args
+        and call.args[0] == atmeex_init.EVENT_API_ERROR
+        and call.args[1]["source"] == "refresh_device"
+    ]
+    assert len(api_error_calls) == 1
+    payload = api_error_calls[0].args[1]
+    assert payload["operation"] == "get_device"
+    assert payload["message"] == "get_device: unexpected client failure"
+    assert secret not in caplog.text
+    assert secret not in repr(hass.bus.async_fire.call_args_list)
+
+
+@pytest.mark.asyncio
 async def test_refresh_device_closes_recovery_when_task_creation_fails(
     monkeypatch,
 ):
     captured_coroutines = []
 
-    def _reject_task(coro, *, name=None):
-        captured_coroutines.append(coro)
-        raise RuntimeError("scheduler unavailable")
+    def _reject_recovery_task(coro, *, name=None):
+        if name == "atmeex targeted-refresh recovery":
+            captured_coroutines.append(coro)
+            raise RuntimeError("scheduler unavailable")
+        return asyncio.create_task(coro, name=name)
 
     hass = SimpleNamespace(
         data={},
-        async_create_task=_reject_task,
+        async_create_task=_reject_recovery_task,
         config_entries=SimpleNamespace(
             async_forward_entry_setups=AsyncMock(),
             async_unload_platforms=AsyncMock(return_value=True),
@@ -324,6 +629,6 @@ async def test_refresh_device_malformed_snapshot_preserves_exact_store(
     with pytest.raises(AtmeexProtocolError):
         await runtime.refresh_device(1)
 
-    await asyncio.gather(*created_tasks)
+    await asyncio.gather(*created_tasks, return_exceptions=True)
     assert runtime.state_store.data is prior
     assert runtime.coordinator.data is prior

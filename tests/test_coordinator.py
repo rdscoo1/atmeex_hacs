@@ -2,6 +2,7 @@
 import asyncio
 import logging
 import time
+from datetime import timedelta
 
 import pytest
 from types import SimpleNamespace
@@ -22,7 +23,11 @@ from custom_components.atmeex_cloud.coordinator import AtmeexCoordinator
 from custom_components.atmeex_cloud.state_store import AtmeexStateStore
 
 
-def _make_coordinator(devices=None, get_device_side_effect=None):
+def _make_coordinator(
+    devices=None,
+    get_device_side_effect=None,
+    state_store=None,
+):
     """Create a coordinator with a fake API for testing update logic."""
     dev_raw = {"id": 1, "name": "Dev1", "model": "m", "online": True,
                "condition": {"pwr_on": 1, "fan_speed": 2}, "settings": {}}
@@ -36,18 +41,20 @@ def _make_coordinator(devices=None, get_device_side_effect=None):
     api.get_device = AsyncMock(
         side_effect=get_device_side_effect or (lambda did: devices_by_id.get(did, default_dev))
     )
-    api._retry_count = 0
+    api.retry_count = 0
 
     hass = SimpleNamespace(
         bus=SimpleNamespace(async_fire=MagicMock()),
     )
     coord = AtmeexCoordinator(
-        hass, logging.getLogger("test"), name="test",
-        update_interval=None,
-    )
-    coord.setup_update(
+        hass,
+        logging.getLogger("test"),
         api=api,
-        state_store=AtmeexStateStore(),
+        state_store=state_store or AtmeexStateStore(),
+        config_entry_id="entry1",
+        config_entry=None,
+        name="test",
+        update_interval=timedelta(seconds=30),
         fire_logbook_event=MagicMock(),
     )
     return coord, api
@@ -67,12 +74,7 @@ async def test_poll_baseline_preserves_later_websocket_field_with_event_barrier(
     store.apply_inventory([stale], store.capture_all())
     started = asyncio.Event()
     release = asyncio.Event()
-    coord, api = _make_coordinator(devices=[stale])
-    coord.setup_update(
-        api=api,
-        state_store=store,
-        fire_logbook_event=MagicMock(),
-    )
+    coord, api = _make_coordinator(devices=[stale], state_store=store)
 
     async def blocked_inventory():
         started.set()
@@ -113,12 +115,7 @@ async def test_poll_race_accepts_unrelated_field_while_preserving_websocket_fiel
     store.apply_inventory([current], store.capture_all())
     started = asyncio.Event()
     release = asyncio.Event()
-    coord, api = _make_coordinator(devices=[polled])
-    coord.setup_update(
-        api=api,
-        state_store=store,
-        fire_logbook_event=MagicMock(),
-    )
+    coord, api = _make_coordinator(devices=[polled], state_store=store)
 
     async def blocked_inventory():
         started.set()
@@ -161,14 +158,15 @@ async def test_malformed_nested_inventory_maps_to_update_failed_and_preserves_sn
     store.apply_websocket_delta("1", state_delta={"fan_speed": 7})
     before = store.data
     before_revisions = dict(store.capture_device("1").revisions)
-    coord, api = _make_coordinator(devices=[malformed])
-    coord.setup_update(
-        api=api,
+    coord, api = _make_coordinator(
+        devices=[malformed],
         state_store=store,
-        fire_logbook_event=MagicMock(),
     )
 
-    with pytest.raises(UpdateFailed, match="Atmeex API update failed") as exc_info:
+    with pytest.raises(
+        UpdateFailed,
+        match="normalize_device_state failed",
+    ) as exc_info:
         await coord._async_update_data()
 
     assert isinstance(exc_info.value.__cause__, AtmeexProtocolError)
@@ -232,7 +230,7 @@ async def test_failed_poll_does_not_advance_authoritative_absence():
 @pytest.mark.asyncio
 async def test_metrics_are_not_part_of_comparable_coordinator_data():
     coord, api = _make_coordinator()
-    api._retry_count = 3
+    api.retry_count = 3
 
     first = await coord._async_update_data()
     second = await coord._async_update_data()
@@ -269,37 +267,14 @@ async def test_update_data_builds_states():
 
 
 @pytest.mark.asyncio
-async def test_update_data_preserves_offline_devices():
-    """Devices from previous poll that disappear from API should be preserved."""
-    dev1_raw = {"id": 1, "name": "Dev1", "model": "m", "online": True,
-                "condition": {"pwr_on": 1, "fan_speed": 2}, "settings": {}}
-    dev2_raw = {"id": 2, "name": "Dev2", "model": "m", "online": True,
-                "condition": {"pwr_on": 0, "fan_speed": 1}, "settings": {}}
-    dev1 = AtmeexDevice.from_raw(dev1_raw)
-    dev2 = AtmeexDevice.from_raw(dev2_raw)
-
-    coord, api = _make_coordinator(devices=[dev1, dev2])
-
-    # First poll — both devices
-    data1 = await coord._async_update_data()
-    coord.data = data1
-    coord.last_update_success = True
-    assert "1" in data1["device_map"]
-    assert "2" in data1["device_map"]
-
-    # Second poll — dev2 disappeared
-    api.get_devices = AsyncMock(return_value=[dev1])
-    api.get_device = AsyncMock(return_value=dev1)
-    data2 = await coord._async_update_data()
-    # dev2 should still be in device_map from merge
-    assert "2" in data2["device_map"]
-
-
-@pytest.mark.asyncio
-async def test_fetch_devices_uses_one_authoritative_inventory_call():
+async def test_empty_update_uses_one_authoritative_inventory_call():
     coord, api = _make_coordinator(devices=[])
 
-    assert await coord._fetch_devices_safely() == []
+    assert await coord._async_update_data() == {
+        "devices": [],
+        "device_map": {},
+        "states": {},
+    }
     api.get_devices.assert_awaited_once_with()
     api.get_device.assert_not_awaited()
 
@@ -313,7 +288,7 @@ async def test_update_data_maps_transient_typed_errors_to_update_failed(error_ty
     coord, api = _make_coordinator()
     api.get_devices = AsyncMock(side_effect=error_type("get_devices", "failed"))
 
-    with pytest.raises(UpdateFailed, match="Atmeex API update failed"):
+    with pytest.raises(UpdateFailed, match="get_devices failed"):
         await coord._async_update_data()
 
 
@@ -328,12 +303,12 @@ async def test_update_data_maps_typed_auth_error_to_config_entry_auth_failed():
         )
     )
 
-    with pytest.raises(ConfigEntryAuthFailed, match="Atmeex authentication failed"):
+    with pytest.raises(ConfigEntryAuthFailed, match="get_devices failed"):
         await coord._async_update_data()
 
 
 @pytest.mark.asyncio
-async def test_fetch_devices_primary_unexpected_exception_propagates():
+async def test_primary_unexpected_exception_propagates():
     """A non-network exception from the primary get_devices call must propagate.
 
     The over-broad `except Exception` swallows programming errors (e.g., a
@@ -349,7 +324,7 @@ async def test_fetch_devices_primary_unexpected_exception_propagates():
     api.get_devices = AsyncMock(side_effect=_UnexpectedBug("programming bug"))
 
     with pytest.raises(_UnexpectedBug):
-        await coord._fetch_devices_safely()
+        await coord._async_update_data()
 
 
 def test_fire_api_error_event_throttles_repeated_events(monkeypatch):

@@ -20,30 +20,60 @@ class DummyCoordinator:
     avoids the full HA machinery.
     """
 
-    def __init__(self, hass=None, logger=None, name=None, update_method=None, update_interval=None, **kwargs):
+    def __init__(
+        self,
+        hass=None,
+        logger=None,
+        *,
+        api=None,
+        state_store=None,
+        config_entry_id=None,
+        config_entry=None,
+        fire_logbook_event=None,
+        name=None,
+        update_interval=None,
+        **kwargs,
+    ):
         self.hass = hass
         self.logger = logger
         self.name = name
-        self.update_method = update_method
         self.update_interval = update_interval
+        self.api = api
+        self.state_store = state_store
+        self.config_entry_id = config_entry_id
+        self.config_entry = config_entry
         self.data = kwargs.get("data")
         self.last_update_success = False
         self.last_update_success_time = None
         # Attributes that AtmeexCoordinator adds
         self.last_api_error = kwargs.get("last_api_error")
         self.last_success_ts = kwargs.get("last_success_ts")
+        self.last_inventory_success_mono = None
+        self.avg_latency_ms = None
+        self.request_retries = 0
         # Extra counter used by some WS tests
         self.update_calls = 0
-
-    def setup_update(self, *, api, state_store, fire_logbook_event):
-        self._api = api
-        self.state_store = state_store
         self._fire_logbook_event = fire_logbook_event
         self._api_error_last_ts = float("-inf")
         self._api_error_suppressed = 0
+        self._last_detail_error = None
+        self._last_detail_failure_count = 0
+        for static_name in (
+            "_safe_detail_error",
+            "_needs_detail",
+            "_merge_detail_source",
+            "_exception_leaves",
+        ):
+            setattr(
+                self,
+                static_name,
+                getattr(AtmeexCoordinator, static_name),
+            )
         for method_name in (
-            "_fetch_devices_safely",
             "_fire_api_error_event",
+            "_previous_device",
+            "_hydrate_one",
+            "_hydrate_devices",
             "_async_update_data",
         ):
             setattr(
@@ -51,12 +81,11 @@ class DummyCoordinator:
                 method_name,
                 MethodType(getattr(AtmeexCoordinator, method_name), self),
             )
+        self._safe_error_event = AtmeexCoordinator._safe_error_event
 
     async def async_config_entry_first_refresh(self):
         if hasattr(self, "_async_update_data"):
             self.data = await self._async_update_data()
-        else:
-            self.data = await self.update_method()
         self.last_update_success = True
 
     def async_set_updated_data(self, data):
@@ -64,8 +93,24 @@ class DummyCoordinator:
         self.data = data
 
     async def async_request_refresh(self):
+        inventory_success_before = self.last_inventory_success_mono
+        self.last_update_success = False
         if hasattr(self, "_async_update_data"):
             self.data = await self._async_update_data()
+        self.last_update_success = True
+        if (
+            self.last_inventory_success_mono is None
+            or (
+                inventory_success_before is not None
+                and self.last_inventory_success_mono
+                <= inventory_success_before
+            )
+        ):
+            self.last_inventory_success_mono = (
+                0.0
+                if inventory_success_before is None
+                else inventory_success_before + 1.0
+            )
 
 
 def make_fake_api_class(

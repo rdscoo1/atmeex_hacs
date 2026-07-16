@@ -3,10 +3,9 @@ from __future__ import annotations
 from homeassistant.components.select import SelectEntity
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
-from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
-from .api import ApiError, AtmeexDevice
+from .api import AtmeexDevice
 from .entity_base import AtmeexEntityMixin, setup_dynamic_device_entities, supports_humidifier
 
 from .const import BREEZER_MODES, HUMIDIFICATION_OPTIONS
@@ -31,6 +30,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_e
                     api=runtime.api,
                     device=dev,
                     refresh_device_cb=runtime.refresh_device,
+                    runtime=runtime,
                 )
             )
         entities.append(
@@ -73,29 +73,45 @@ class AtmeexHumidificationSelect(_BaseSelect):
         api,
         device: AtmeexDevice,
         refresh_device_cb=None,
+        runtime=None,
     ) -> None:
-        super().__init__(coordinator, api, device, refresh_device_cb)
+        super().__init__(
+            coordinator,
+            api,
+            device,
+            refresh_device_cb,
+            runtime,
+        )
         self._attr_unique_id = f"{device.id}_hum_mode"
 
     @property
     def current_option(self) -> str | None:
-        # сервер может отдавать либо hum_stg (0..3), либо только показания влажности hum_room — пробуем оба
-        stg = self._device_state.get("hum_stg")
-        if isinstance(stg, int) and 0 <= stg <= 3:
-            return HUM_OPTIONS[stg] if stg > 0 else "off"
-        # fallback к кэшированному значению (важно для тестов и первого запуска)
-        return getattr(self, "_attr_current_option", "off")
+        stage = self._state_with_pending(
+            "hum_stg", self._device_state.get("hum_stg")
+        )
+        if (
+            isinstance(stage, int)
+            and not isinstance(stage, bool)
+            and 0 <= stage < len(HUM_OPTIONS)
+        ):
+            return HUM_OPTIONS[stage]
+        return None
 
     async def async_select_option(self, option: str) -> None:
-        if option not in HUM_OPTIONS:
-            return
+        if not isinstance(option, str) or option not in HUM_OPTIONS:
+            raise self._invalid_value("humidification_option", option)
         stage = 0 if option == "off" else int(option)
-        try:
+
+        async def operation() -> None:
             await self.api.set_humid_stage(self._device_id, stage)
-        except ApiError as err:
-            raise HomeAssistantError(f"Failed to set humidification stage: {err}") from err
-        self._attr_current_option = option
-        await self._refresh()
+
+        await self._execute_command(
+            operation,
+            pending={"hum_stg": stage},
+            translation_placeholders={
+                "action": "set humidification stage"
+            },
+        )
 
 
 class AtmeexBreezerSelect(_BaseSelect):
@@ -115,27 +131,36 @@ class AtmeexBreezerSelect(_BaseSelect):
 
     @property
     def current_option(self) -> str | None:
-        pos = self._device_state.get("damp_pos")
-        pwr = self._device_state.get("pwr_on")
-        if pos == 0 and not pwr:
-            return BREEZER_OPTIONS[3]  # supply_valve
-        if isinstance(pos, int) and 0 <= pos < 3:
-            return BREEZER_OPTIONS[pos]
-        return getattr(self, "_attr_current_option", BREEZER_OPTIONS[0])
+        position = self._state_with_pending(
+            "damp_pos", self._device_state.get("damp_pos")
+        )
+        power = self._state_with_pending(
+            "pwr_on", self._device_state.get("pwr_on")
+        )
+        if not isinstance(position, int) or isinstance(position, bool):
+            return None
+        if position == 0:
+            if power is False:
+                return BREEZER_OPTIONS[3]
+            if power is True:
+                return BREEZER_OPTIONS[0]
+            return None
+        if power is True and 0 < position < 3:
+            return BREEZER_OPTIONS[position]
+        return None
 
     async def async_select_option(self, option: str) -> None:
-        if option not in BREEZER_OPTIONS:
-            return
-        pos = BREEZER_OPTIONS.index(option)
-        target_pwr = pos != 3
-        target_damp = 0 if pos == 3 else pos
+        if not isinstance(option, str) or option not in BREEZER_OPTIONS:
+            raise self._invalid_value("breezer_option", option)
+        mode = BREEZER_OPTIONS.index(option)
+        power = mode != 3
+        damper = 0 if mode == 3 else mode
 
-        if self._runtime is not None:
-            self._runtime.set_pending(self._device_id, "damp_pos", target_damp)
+        async def operation() -> None:
+            await self.api.set_breezer_mode(self._device_id, mode)
+
         await self._execute_command(
-            self.api.set_breezer_mode(self._device_id, pos),
-            pending_attr="pwr_on",
-            pending_value=target_pwr,
-            error_message="Failed to set work mode",
+            operation,
+            pending={"pwr_on": power, "damp_pos": damper},
+            translation_placeholders={"action": "set breezer mode"},
         )
-        self._attr_current_option = option

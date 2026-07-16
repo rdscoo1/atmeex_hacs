@@ -192,5 +192,16 @@
         }
       }
     }
+  },
+  "exceptions": {
+    "command_failed": {
+      "message": "Unable to {action} because the Atmeex Cloud command failed."
+    },
+    "invalid_command_value": {
+      "message": "{value} is not a valid value for {field}."
+    },
+    "unsupported_device_feature": {
+      "message": "This Atmeex device does not support {feature}."
+    }
   }
 }

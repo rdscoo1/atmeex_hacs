@@ -147,7 +147,7 @@ def _device_url(device_id: int | str, suffix: str = "") -> URL:
         encoded=True,
     )
 
-@dataclass(slots=True)
+@dataclass(frozen=True, slots=True)
 class AtmeexDevice:
     """Validated device metadata with a legacy-compatible outward ID."""
 
@@ -156,6 +156,8 @@ class AtmeexDevice:
     model: str
     online: bool
     raw: dict[str, Any]
+    condition_present: bool
+    settings_present: bool
 
     @classmethod
     def from_raw(cls, raw: dict[str, Any]) -> "AtmeexDevice":
@@ -169,6 +171,12 @@ class AtmeexDevice:
                 device_id = device_key
             condition_raw = raw.get("condition")
             settings_raw = raw.get("settings")
+            condition_present = (
+                "condition" in raw and condition_raw is not None
+            )
+            settings_present = (
+                "settings" in raw and settings_raw is not None
+            )
             condition = {} if condition_raw is None else condition_raw
             settings = {} if settings_raw is None else settings_raw
             if not isinstance(condition, dict) or not isinstance(settings, dict):
@@ -192,6 +200,8 @@ class AtmeexDevice:
             model=str(raw.get("model") or "unknown"),
             online=online,
             raw=normalized_raw,
+            condition_present=condition_present,
+            settings_present=settings_present,
         )
 
     @property
@@ -765,13 +775,22 @@ class AtmeexApi:
             return []
 
         devices: list[AtmeexDevice] = []
+        seen_device_ids: set[str] = set()
         for item in items:
             if not isinstance(item, dict):
                 continue
             try:
-                devices.append(AtmeexDevice.from_raw(item))
+                device = AtmeexDevice.from_raw(item)
             except AtmeexProtocolError:
                 continue
+            device_id = normalize_device_id(device.id)
+            if device_id in seen_device_ids:
+                raise AtmeexProtocolError(
+                    "get_devices",
+                    "duplicate canonical device id",
+                )
+            seen_device_ids.add(device_id)
+            devices.append(device)
         if not devices:
             raise AtmeexProtocolError(
                 "get_devices",

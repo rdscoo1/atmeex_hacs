@@ -1,14 +1,17 @@
 from __future__ import annotations
 
-import asyncio
-from collections.abc import Awaitable, Mapping
+from collections.abc import Mapping
 from typing import Any, Callable, Iterable
 
-from homeassistant.exceptions import HomeAssistantError, ServiceValidationError
+from homeassistant.exceptions import ServiceValidationError
 from homeassistant.helpers.device_registry import DeviceInfo
 
-from .api import ApiError, AtmeexDevice
-from .command_executor import AtmeexCommandExecutor, CommandCoroutineFactory
+from .api import AtmeexDevice
+from .command_executor import (
+    AtmeexCommandExecutor,
+    CommandCoroutineFactory,
+    RecoveryRefresh,
+)
 from .const import DOMAIN
 
 
@@ -18,7 +21,7 @@ class AtmeexEntityMixin:
     coordinator: Any  # CoordinatorEntity уже дает .coordinator
     _device_id: int | str
     _device_meta: AtmeexDevice
-    _refresh_device_cb: Callable[[int | str], Awaitable[None]] | None = None
+    _refresh_device_cb: RecoveryRefresh | None = None
 
     @property
     def _device_id_str(self) -> str:
@@ -47,11 +50,8 @@ class AtmeexEntityMixin:
         self,
         attribute: str,
         confirmed_value: Any,
-        *,
-        tolerance: float | None = None,
     ) -> Any:
         """Return the executor's optimistic value while it awaits confirmation."""
-        del tolerance
         runtime = getattr(self, "_runtime", None)
         executor = getattr(runtime, "command_executor", None)
         if executor is None:
@@ -64,127 +64,40 @@ class AtmeexEntityMixin:
 
     async def _execute_command(
         self,
-        operation: CommandCoroutineFactory | Awaitable[None],
+        operation: CommandCoroutineFactory,
         *,
-        pending: Mapping[str, Any] | None = None,
+        pending: Mapping[str, Any],
         translation_key: str = "command_failed",
         translation_placeholders: Mapping[str, str] | None = None,
-        pending_attr: str | None = None,
-        pending_value: Any = None,
-        error_message: str = "Command failed",
-    ) -> None:
-        """Execute a lazy command, with a temporary eager-awaitable adapter."""
+    ) -> bool:
+        """Execute one lazy command through the entry-owned executor."""
         runtime = getattr(self, "_runtime", None)
-        if callable(operation):
-            if pending is None:
-                raise TypeError("factory commands require a pending mapping")
-            executor = getattr(runtime, "command_executor", None)
-            if executor is None:
-                executor = getattr(self, "_fallback_command_executor", None)
-                if executor is None:
-                    executor = AtmeexCommandExecutor(
-                        lambda _device_id: self._refresh()
-                    )
-                    self._fallback_command_executor = executor
-            await executor.async_execute(
-                self._device_id,
-                operation,
-                pending=pending,
-                translation_key=translation_key,
-                translation_placeholders=translation_placeholders,
-            )
-            return
-
-        legacy_generation = None
-        if pending_attr is not None and runtime is not None:
-            legacy_generation = runtime.set_pending(
-                self._device_id,
-                pending_attr,
-                pending_value,
-            )
-
         executor = getattr(runtime, "command_executor", None)
-        lock = (
-            runtime.get_device_lock(self._device_id)
-            if executor is not None
-            else None
-        )
-
-        def cancel_legacy_generation() -> None:
-            if runtime is not None:
-                runtime.cancel_legacy_generation(
-                    self._device_id,
-                    legacy_generation,
+        if executor is None:
+            executor = getattr(self, "_fallback_command_executor", None)
+            if executor is None:
+                executor = AtmeexCommandExecutor(
+                    lambda _device_id: self._refresh()
                 )
-
-        async def recover_legacy_best_effort() -> None:
-            """Reconcile a possible partial write without masking its cause."""
-            try:
-                await self._refresh()
-            except (ApiError, asyncio.TimeoutError):
-                return
-            except Exception:
-                return
-
-        operation_started = False
-
-        async def run_legacy() -> None:
-            nonlocal operation_started
-            operation_started = True
-            try:
-                await operation
-            except asyncio.CancelledError:
-                try:
-                    await recover_legacy_best_effort()
-                finally:
-                    cancel_legacy_generation()
-                raise
-            except ApiError as err:
-                try:
-                    await recover_legacy_best_effort()
-                finally:
-                    cancel_legacy_generation()
-                raise HomeAssistantError(error_message) from err
-            except Exception:
-                try:
-                    await recover_legacy_best_effort()
-                finally:
-                    cancel_legacy_generation()
-                raise
-            try:
-                await self._refresh()
-            except (ApiError, asyncio.TimeoutError):
-                # The write succeeded. Keep its optimistic generation until a
-                # later authoritative refresh confirms or expires it.
-                return
-            except asyncio.CancelledError:
-                try:
-                    await recover_legacy_best_effort()
-                finally:
-                    cancel_legacy_generation()
-                raise
-
-        try:
-            if lock is None:
-                await run_legacy()
-            else:
-                async with lock:
-                    await run_legacy()
-        except asyncio.CancelledError:
-            if not operation_started:
-                if asyncio.iscoroutine(operation):
-                    operation.close()
-                elif isinstance(operation, asyncio.Future):
-                    operation.cancel()
-                cancel_legacy_generation()
-            raise
+                self._fallback_command_executor = executor
+        return await executor.async_execute(
+            self._device_id,
+            operation,
+            pending=pending,
+            translation_key=translation_key,
+            translation_placeholders=translation_placeholders,
+        )
 
     @staticmethod
     def _invalid_value(field: str, value: Any) -> ServiceValidationError:
+        try:
+            rendered_value = str(value)
+        except Exception:
+            rendered_value = f"<{type(value).__name__} outside supported range>"
         return ServiceValidationError(
             translation_domain=DOMAIN,
             translation_key="invalid_command_value",
-            translation_placeholders={"field": field, "value": str(value)},
+            translation_placeholders={"field": field, "value": rendered_value},
         )
 
     @staticmethod

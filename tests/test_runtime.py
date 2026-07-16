@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import asyncio
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -157,3 +157,131 @@ def test_runtime_without_refresh_keeps_executor_optional():
     assert runtime.clear_pending_if_confirmed(1, "fan_speed", 3) is True
     with pytest.raises(RuntimeError, match="Command executor is unavailable"):
         runtime.get_device_lock(1)
+
+
+@pytest.mark.asyncio
+async def test_runtime_tracks_and_discards_completed_tasks():
+    runtime = AtmeexRuntimeData(
+        api=None,
+        coordinator=None,
+        state_store=None,
+        command_executor=None,
+        refresh_device=None,
+    )
+    candidate = asyncio.create_task(asyncio.sleep(0))
+    try:
+        task = runtime.track_task(candidate)
+        assert task in runtime.tasks
+        await task
+        await asyncio.sleep(0)
+        assert runtime.tasks == set()
+    finally:
+        if not candidate.done():
+            candidate.cancel()
+        await asyncio.gather(candidate, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_runtime_logs_failed_task_type_without_exception_text(caplog):
+    runtime = AtmeexRuntimeData(
+        api=None,
+        coordinator=None,
+        state_store=None,
+        command_executor=None,
+        refresh_device=None,
+    )
+
+    async def fail() -> None:
+        raise RuntimeError("secret cloud response")
+
+    candidate = asyncio.create_task(fail())
+    try:
+        task = runtime.track_task(candidate)
+        with pytest.raises(RuntimeError, match="secret cloud response"):
+            await task
+        await asyncio.sleep(0)
+
+        assert "RuntimeError" in caplog.text
+        assert "secret cloud response" not in caplog.text
+        assert runtime.tasks == set()
+    finally:
+        if not candidate.done():
+            candidate.cancel()
+        await asyncio.gather(candidate, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_runtime_discards_cancelled_task_without_warning(caplog):
+    runtime = AtmeexRuntimeData(
+        api=None,
+        coordinator=None,
+        state_store=None,
+        command_executor=None,
+        refresh_device=None,
+    )
+    candidate = asyncio.create_task(asyncio.sleep(60))
+    try:
+        task = runtime.track_task(candidate)
+        task.cancel()
+
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        await asyncio.sleep(0)
+
+        assert runtime.tasks == set()
+        assert "Atmeex background task failed" not in caplog.text
+    finally:
+        if not candidate.done():
+            candidate.cancel()
+        await asyncio.gather(candidate, return_exceptions=True)
+
+
+def test_runtime_ownership_defaults_are_isolated():
+    first = AtmeexRuntimeData(
+        api=None,
+        coordinator=None,
+        refresh_device=None,
+    )
+    second = AtmeexRuntimeData(
+        api=None,
+        coordinator=None,
+        refresh_device=None,
+    )
+
+    first.refresh_tasks["1"] = MagicMock()
+    first.websocket_overflow_count = 2
+
+    assert first.stopping is False
+    assert first.inventory_watchdog_task is None
+    assert first.websocket_resync_task is None
+    assert second.tasks == set()
+    assert second.refresh_tasks == {}
+    assert second.websocket_overflow_count == 0
+
+
+def test_runtime_preserves_legacy_websocket_task_positional_arguments():
+    api = MagicMock()
+    coordinator = MagicMock()
+    refresh_device = AsyncMock()
+    state_store = MagicMock()
+    command_executor = MagicMock()
+    websocket_manager = MagicMock()
+    websocket_start_task = MagicMock()
+    websocket_message_task = MagicMock()
+
+    runtime = AtmeexRuntimeData(
+        api,
+        coordinator,
+        refresh_device,
+        state_store,
+        command_executor,
+        websocket_manager,
+        websocket_start_task,
+        websocket_message_task,
+    )
+
+    assert runtime.websocket_start_task is websocket_start_task
+    assert runtime.websocket_message_task is websocket_message_task
+    assert runtime.stopping is False
+    assert runtime.tasks == set()
+    assert runtime.refresh_tasks == {}

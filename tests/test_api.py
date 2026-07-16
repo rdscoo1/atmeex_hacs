@@ -1,5 +1,6 @@
 import asyncio
 import logging
+from dataclasses import FrozenInstanceError
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -387,6 +388,26 @@ def test_device_normalization_overwrites_raw_id_and_rejects_bad_online_literal()
 
     with pytest.raises(AtmeexProtocolError, match="parse_device"):
         AtmeexDevice.from_raw({"id": 42, "online": "connected"})
+
+
+def test_device_retains_immutable_nested_section_provenance():
+    omitted = AtmeexDevice.from_raw({"id": 1})
+    null_sections = AtmeexDevice.from_raw(
+        {"id": 2, "condition": None, "settings": None}
+    )
+    explicit = AtmeexDevice.from_raw(
+        {"id": 3, "condition": {}, "settings": {}}
+    )
+
+    assert omitted.raw["condition"] == omitted.raw["settings"] == {}
+    assert omitted.condition_present is False
+    assert omitted.settings_present is False
+    assert null_sections.condition_present is False
+    assert null_sections.settings_present is False
+    assert explicit.condition_present is True
+    assert explicit.settings_present is True
+    with pytest.raises(FrozenInstanceError):
+        explicit.condition_present = False
 
 
 @pytest.mark.parametrize("field", ["condition", "settings"])
@@ -1052,6 +1073,32 @@ async def test_nonempty_all_invalid_inventory_is_protocol_failure():
 
     with pytest.raises(AtmeexProtocolError, match="no valid device items"):
         await api.get_devices()
+
+
+@pytest.mark.asyncio
+async def test_get_devices_rejects_duplicate_canonical_ids():
+    session = FakeSession()
+    session.queue_response(
+        FakeResponse(
+            200,
+            json_data=[
+                {"id": 7, "condition": {}, "settings": {}},
+                {"id": "0007", "condition": {}, "settings": {}},
+            ],
+        )
+    )
+    api = AtmeexApi(session)
+    api._token = "access"
+
+    with pytest.raises(
+        AtmeexProtocolError,
+        match="duplicate canonical device id",
+    ) as caught:
+        await api.get_devices()
+
+    assert str(caught.value) == (
+        "get_devices: duplicate canonical device id"
+    )
 
 
 @pytest.mark.asyncio

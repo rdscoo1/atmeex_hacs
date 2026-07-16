@@ -1,11 +1,14 @@
+import asyncio
+import math
+
 import pytest
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, call
 
 from homeassistant.components.climate import ClimateEntityFeature, HVACMode
 from homeassistant.components.climate.const import PRESET_BOOST, PRESET_NONE, PRESET_SLEEP
 from homeassistant.const import ATTR_TEMPERATURE
-from homeassistant.exceptions import HomeAssistantError
+from homeassistant.exceptions import HomeAssistantError, ServiceValidationError
 from typing import Any
 
 from custom_components.atmeex_cloud import AtmeexRuntimeData
@@ -210,7 +213,7 @@ def test_climate_swing_mode_invalid():
     [
         (HVACMode.OFF, True, "set_power"),
         (HVACMode.FAN_ONLY, True, "set_heater_off"),
-        (HVACMode.FAN_ONLY, False, "set_power_and_heat"),
+        (HVACMode.FAN_ONLY, False, "set_heater_off"),
     ],
 )
 async def test_async_set_hvac_mode_calls_expected_api(
@@ -227,12 +230,8 @@ async def test_async_set_hvac_mode_calls_expected_api(
         api.set_power_and_heat.assert_not_awaited()
     elif expected_call == "set_heater_off":
         api.set_heater_off.assert_awaited_once_with(1)
-        api.set_power.assert_not_awaited()
+        api.set_power.assert_awaited_once_with(1, True)
         api.set_power_and_heat.assert_not_awaited()
-    else:
-        api.set_power_and_heat.assert_awaited_once_with(1, True, None)
-        api.set_power.assert_not_awaited()
-        api.set_heater_off.assert_not_awaited()
     ent._refresh.assert_awaited_once()
 
 
@@ -249,6 +248,7 @@ async def test_async_set_temperature_turns_on_if_needed():
 
     api.set_power.assert_awaited_once_with(1, True)
     api.set_target_temperature.assert_awaited_once_with(1, 23.0)
+    api.set_power_and_heat.assert_not_awaited()
     ent._refresh.assert_awaited_once()
 
 
@@ -266,6 +266,7 @@ async def test_set_temperature_on_off_device_tracks_pwr_on_pending():
 
     api.set_power.assert_awaited_once_with(1, True)
     api.set_target_temperature.assert_awaited_once_with(1, 22.0)
+    api.set_power_and_heat.assert_not_awaited()
     # pwr_on=True must be pending so hvac_mode shows device as on (not OFF)
     # u_temp_room=225 (valid) + damp_pos=2 → HEAT
     assert ent.hvac_mode == HVACMode.HEAT
@@ -298,14 +299,17 @@ def test_device_info_reflects_name_updates():
 
 
 @pytest.mark.asyncio
-async def test_async_set_temperature_ignores_missing_value():
+async def test_async_set_temperature_rejects_missing_value():
     ent, cond, api = _make_entity()
     ent._refresh = AsyncMock()
 
-    await ent.async_set_temperature()
+    with pytest.raises(ServiceValidationError) as raised:
+        await ent.async_set_temperature()
 
-    # ничего не должно происходить
-    assert api.set_target_temperature.await_count == 0
+    assert raised.value.translation_key == "invalid_command_value"
+    assert raised.value.translation_placeholders["field"] == "temperature"
+    api.set_power_and_heat.assert_not_awaited()
+    api.set_target_temperature.assert_not_awaited()
     ent._refresh.assert_not_awaited()
 
 
@@ -322,16 +326,18 @@ async def test_async_set_humidity_quantizes_and_calls_api():
 
 
 @pytest.mark.asyncio
-async def test_async_set_humidity_no_humidifier_noop():
+async def test_async_set_humidity_no_humidifier_is_unsupported():
     ent, cond, api = _make_entity()
     ent._refresh = AsyncMock()
     # убираем признак увлажнителя
     cond.pop("hum_stg", None)
     ent.coordinator.data["states"]["1"] = cond
 
-    await ent.async_set_humidity(50)
+    with pytest.raises(ServiceValidationError) as raised:
+        await ent.async_set_humidity(50)
 
-    assert api.set_humid_stage.await_count == 0
+    assert raised.value.translation_key == "unsupported_device_feature"
+    api.set_humid_stage.assert_not_awaited()
     ent._refresh.assert_not_awaited()
 
 
@@ -347,9 +353,10 @@ async def test_async_set_fan_mode_valid_and_invalid():
     api.set_fan_speed.reset_mock()
     ent._refresh.reset_mock()
 
-    # нечисловой режим — предупреждение и no-op
-    await ent.async_set_fan_mode("invalid")
-    assert api.set_fan_speed.await_count == 0
+    with pytest.raises(ServiceValidationError) as raised:
+        await ent.async_set_fan_mode("invalid")
+    assert raised.value.translation_key == "invalid_command_value"
+    api.set_fan_speed.assert_not_awaited()
     ent._refresh.assert_not_awaited()
 
 
@@ -366,8 +373,10 @@ async def test_async_set_swing_mode_valid_and_invalid():
     api.set_breezer_mode.reset_mock()
     ent._refresh.reset_mock()
 
-    await ent.async_set_swing_mode("неизвестный режим")
-    assert api.set_breezer_mode.await_count == 0
+    with pytest.raises(ServiceValidationError) as raised:
+        await ent.async_set_swing_mode("неизвестный режим")
+    assert raised.value.translation_key == "invalid_command_value"
+    api.set_breezer_mode.assert_not_awaited()
     ent._refresh.assert_not_awaited()
 
 
@@ -498,6 +507,7 @@ async def test_preset_mode_reads_from_device_state():
 
     # BOOST is client-side
     ent._is_boost = True
+    ent._local_preset = PRESET_BOOST
     assert ent.preset_mode == PRESET_BOOST
     # BOOST takes priority even if u_auto is set
     cond["u_auto"] = True
@@ -550,22 +560,35 @@ async def test_service_set_humidifier_stage_calls_api():
 
 
 @pytest.mark.asyncio
-async def test_service_set_humidifier_stage_no_humidifier_is_noop():
-    """When the device has no humidifier, the API is never called."""
+async def test_service_set_humidifier_stage_no_humidifier_is_unsupported():
+    """When the device has no humidifier, reject the unsupported service."""
     # Remove hum_stg from state so _has_humidifier() returns False
     ent, _cond, api = _make_entity({})
     del ent.coordinator.data["states"]["1"]["hum_stg"]
-    await ent.async_set_humidifier_stage(1)
-    api.set_humid_stage.assert_not_called()
+    with pytest.raises(ServiceValidationError) as raised:
+        await ent.async_set_humidifier_stage(1)
+    assert raised.value.translation_key == "unsupported_device_feature"
+    api.set_humid_stage.assert_not_awaited()
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("stage,expected", [(-1, 0), (0, 0), (3, 3), (4, 3)])
-async def test_service_set_humidifier_stage_clamps_value(stage, expected):
-    """Stage is clamped to 0–3 before being sent to the API."""
+@pytest.mark.parametrize("stage", [0, 3])
+async def test_service_set_humidifier_stage_accepts_boundary_values(stage):
     ent, _cond, api = _make_entity({"hum_stg": 1})
     await ent.async_set_humidifier_stage(stage)
-    api.set_humid_stage.assert_awaited_once_with(1, expected)
+    api.set_humid_stage.assert_awaited_once_with(1, stage)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stage", [-1, 4])
+async def test_service_set_humidifier_stage_rejects_out_of_range(stage):
+    ent, _cond, api = _make_entity({"hum_stg": 1})
+
+    with pytest.raises(ServiceValidationError) as raised:
+        await ent.async_set_humidifier_stage(stage)
+
+    assert raised.value.translation_key == "invalid_command_value"
+    api.set_humid_stage.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -618,7 +641,9 @@ async def test_set_hvac_mode_heat_from_off_uses_default_20():
     """HEAT from off with no prior heat temp uses 20.0°C default."""
     ent, cond, api, runtime = _make_entity_with_runtime({"pwr_on": False, "u_temp_room": -1000})
     await ent.async_set_hvac_mode(HVACMode.HEAT)
-    api.set_power_and_heat.assert_awaited_once_with(1, True, 20.0)
+    api.set_power.assert_awaited_once_with(1, True)
+    api.set_target_temperature.assert_awaited_once_with(1, 20.0)
+    api.set_power_and_heat.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -627,7 +652,9 @@ async def test_set_hvac_mode_heat_from_off_uses_last_heat_temp():
     ent, cond, api, runtime = _make_entity_with_runtime({"pwr_on": False, "u_temp_room": -1000})
     ent._last_heat_temp = 24.0
     await ent.async_set_hvac_mode(HVACMode.HEAT)
-    api.set_power_and_heat.assert_awaited_once_with(1, True, 24.0)
+    api.set_power.assert_awaited_once_with(1, True)
+    api.set_target_temperature.assert_awaited_once_with(1, 24.0)
+    api.set_power_and_heat.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -635,40 +662,45 @@ async def test_set_hvac_mode_heat_from_off_uses_current_u_temp_room():
     """HEAT from off with a valid u_temp_room in state uses that temp."""
     ent, cond, api, runtime = _make_entity_with_runtime({"pwr_on": False, "u_temp_room": 230})
     await ent.async_set_hvac_mode(HVACMode.HEAT)
-    api.set_power_and_heat.assert_awaited_once_with(1, True, 23.0)
-
-
-@pytest.mark.asyncio
-async def test_set_hvac_mode_fan_only_from_on_calls_heater_off():
-    """FAN_ONLY when device is already on calls set_heater_off, not set_power."""
-    ent, cond, api, runtime = _make_entity_with_runtime({"pwr_on": True, "u_temp_room": 225})
-    await ent.async_set_hvac_mode(HVACMode.FAN_ONLY)
-    api.set_heater_off.assert_awaited_once_with(1)
-    api.set_power.assert_not_awaited()
+    api.set_power.assert_awaited_once_with(1, True)
+    api.set_target_temperature.assert_awaited_once_with(1, 23.0)
     api.set_power_and_heat.assert_not_awaited()
 
 
 @pytest.mark.asyncio
-async def test_set_hvac_mode_fan_only_from_off_calls_power_and_heat_none():
-    """FAN_ONLY when device is off uses set_power_and_heat(True, None)."""
+async def test_set_hvac_mode_fan_only_from_on_calls_heater_off():
+    """FAN_ONLY idempotently powers on before disabling the heater."""
+    ent, cond, api, runtime = _make_entity_with_runtime({"pwr_on": True, "u_temp_room": 225})
+    await ent.async_set_hvac_mode(HVACMode.FAN_ONLY)
+    api.set_heater_off.assert_awaited_once_with(1)
+    api.set_power.assert_awaited_once_with(1, True)
+    api.set_power_and_heat.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_set_hvac_mode_fan_only_from_off_uses_safe_sequential_writes():
+    """FAN_ONLY powers on before sending the heater-off sentinel."""
     ent, cond, api, runtime = _make_entity_with_runtime({"pwr_on": False})
     await ent.async_set_hvac_mode(HVACMode.FAN_ONLY)
-    api.set_power_and_heat.assert_awaited_once_with(1, True, None)
+    api.set_power.assert_awaited_once_with(1, True)
+    api.set_heater_off.assert_awaited_once_with(1)
+    api.set_power_and_heat.assert_not_awaited()
 
 
 @pytest.mark.asyncio
 async def test_set_hvac_mode_heat_from_on_calls_set_target_temperature():
-    """HEAT when device is already on (fan-only -> heat) sends only the target.
+    """HEAT when reported on idempotently powers on, then sends only the target.
 
     A multi-field PUT that repeats the unchanged u_pwr_on makes the device
-    drop u_temp_room, so the heater never engages. When already on, the
-    single-field set_target_temperature path must be used instead.
+    drop u_temp_room, so the safe retry uses two single-field writes. Repeating
+    power first also recovers if an earlier OFF confirmation was stale.
     """
     ent, cond, api, runtime = _make_entity_with_runtime(
         {"pwr_on": True, "u_temp_room": -1000}
     )
     ent._last_heat_temp = 22.0
     await ent.async_set_hvac_mode(HVACMode.HEAT)
+    api.set_power.assert_awaited_once_with(1, True)
     api.set_target_temperature.assert_awaited_once_with(1, 22.0)
     api.set_power_and_heat.assert_not_awaited()
     # u_temp_room pending must still be recorded so hvac_mode shows HEAT
@@ -692,7 +724,986 @@ def test_resolve_heat_target_defaults_to_20():
     assert ent._resolve_heat_target() == pytest.approx(20.0)
 
 
-def test_target_temperature_updates_last_heat_temp():
+def test_remember_confirmed_heat_target_updates_last_heat_temp():
     ent, _, _ = _make_entity({"u_temp_room": 235})
-    _ = ent.target_temperature  # access the property
+    _ = ent.target_temperature
+    assert ent._last_heat_temp is None
+
+    ent._remember_confirmed_heat_target()
     assert ent._last_heat_temp == pytest.approx(23.5)
+
+
+@pytest.mark.asyncio
+async def test_temperature_from_off_is_one_logical_command_with_one_refresh():
+    ent, _cond, api, runtime = _make_entity_with_runtime({"pwr_on": False})
+
+    await ent.async_set_temperature(**{ATTR_TEMPERATURE: 23.0})
+
+    api.set_power.assert_awaited_once_with(1, True)
+    api.set_target_temperature.assert_awaited_once_with(1, 23.0)
+    api.set_power_and_heat.assert_not_awaited()
+    runtime.refresh_device.assert_awaited_once_with(1)
+    assert ent.hvac_mode == HVACMode.HEAT
+
+
+@pytest.mark.asyncio
+async def test_fan_only_from_off_tracks_power_and_heater_fields():
+    ent, _cond, _api, runtime = _make_entity_with_runtime({"pwr_on": False})
+
+    await ent.async_set_hvac_mode(HVACMode.FAN_ONLY)
+
+    assert runtime.command_executor.value_with_pending(1, "pwr_on", False) is True
+    assert runtime.command_executor.value_with_pending(
+        1, "u_temp_room", 225
+    ) == -1000
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("call", "field"),
+    [
+        (lambda ent: ent.async_set_temperature(temperature="bad"), "temperature"),
+        (lambda ent: ent.async_set_fan_mode("8"), "fan_mode"),
+        (lambda ent: ent.async_set_swing_mode("bad"), "swing_mode"),
+        (lambda ent: ent.async_set_humidifier_stage(4), "humidifier_stage"),
+    ],
+)
+async def test_climate_invalid_inputs_raise_translated_validation_error(call, field):
+    ent, _cond, api, _runtime = _make_entity_with_runtime()
+
+    with pytest.raises(ServiceValidationError) as raised:
+        await call(ent)
+
+    assert raised.value.translation_key == "invalid_command_value"
+    assert raised.value.translation_placeholders["field"] == field
+    api.set_power.assert_not_awaited()
+    api.set_fan_speed.assert_not_awaited()
+    api.set_breezer_mode.assert_not_awaited()
+    api.set_humid_stage.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_missing_humidifier_raises_unsupported_feature():
+    ent, cond, api, _runtime = _make_entity_with_runtime()
+    cond.pop("hum_stg")
+
+    with pytest.raises(ServiceValidationError) as raised:
+        await ent.async_set_humidity(50)
+
+    assert raised.value.translation_key == "unsupported_device_feature"
+    api.set_humid_stage.assert_not_awaited()
+
+
+def test_target_temperature_property_is_pure_and_hook_records_target():
+    ent, _cond, _api, _runtime = _make_entity_with_runtime(
+        {"pwr_on": True, "u_temp_room": 225}
+    )
+
+    assert ent.target_temperature == 22.5
+    assert ent._last_heat_temp is None
+
+    ent._remember_confirmed_heat_target()
+    assert ent._last_heat_temp == 22.5
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("call", "field"),
+    [
+        (lambda ent: ent.async_set_temperature(temperature=True), "temperature"),
+        (lambda ent: ent.async_set_temperature(temperature=math.nan), "temperature"),
+        (lambda ent: ent.async_set_temperature(temperature=math.inf), "temperature"),
+        (lambda ent: ent.async_set_temperature(temperature=10**10000), "temperature"),
+        (lambda ent: ent.async_set_temperature(temperature=object()), "temperature"),
+        (lambda ent: ent.async_set_humidity(True), "humidity"),
+        (lambda ent: ent.async_set_humidity(math.nan), "humidity"),
+        (lambda ent: ent.async_set_humidity(math.inf), "humidity"),
+        (lambda ent: ent.async_set_humidity(10**10000), "humidity"),
+        (lambda ent: ent.async_set_humidity(object()), "humidity"),
+        (lambda ent: ent.async_set_fan_mode(True), "fan_mode"),
+        (lambda ent: ent.async_set_swing_mode(object()), "swing_mode"),
+        (lambda ent: ent.async_set_humidifier_stage(True), "humidifier_stage"),
+        (lambda ent: ent.async_set_humidifier_stage(10**10000), "humidifier_stage"),
+        (lambda ent: ent.async_set_hvac_mode("bad"), "hvac_mode"),
+    ],
+)
+async def test_climate_malformed_values_only_raise_translated_validation(
+    call, field
+):
+    ent, _cond, api, runtime = _make_entity_with_runtime()
+
+    with pytest.raises(ServiceValidationError) as raised:
+        await call(ent)
+
+    assert raised.value.translation_domain == "atmeex_cloud"
+    assert raised.value.translation_key == "invalid_command_value"
+    assert raised.value.translation_placeholders["field"] == field
+    for api_method in (
+        api.set_power,
+        api.set_power_and_heat,
+        api.set_target_temperature,
+        api.set_humid_stage,
+        api.set_fan_speed,
+        api.set_breezer_mode,
+        api.set_heater_off,
+    ):
+        api_method.assert_not_awaited()
+    runtime.refresh_device.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_temperature_pending_map_includes_power_when_already_on():
+    ent, _cond, api, runtime = _make_entity_with_runtime({"pwr_on": True})
+
+    await ent.async_set_temperature(**{ATTR_TEMPERATURE: 23.0})
+
+    api.set_power.assert_awaited_once_with(1, True)
+    api.set_target_temperature.assert_awaited_once_with(1, 23.0)
+    assert runtime.get_pending(1, "pwr_on").value is True
+    assert runtime.get_pending(1, "u_temp_room").value == 230
+
+
+@pytest.mark.asyncio
+async def test_queued_temperature_succeeds_after_owner_power_write_failure():
+    ent, _cond, api, runtime = _make_entity_with_runtime({"pwr_on": False})
+    first_write_started = asyncio.Event()
+    release_first_write = asyncio.Event()
+    legacy_power_calls = 0
+
+    async def set_power(device_id, power):
+        nonlocal legacy_power_calls
+        legacy_power_calls += 1
+        if legacy_power_calls == 1:
+            first_write_started.set()
+            await release_first_write.wait()
+            raise ApiError("set_power", "first write failed", status=503)
+
+    api.set_power.side_effect = set_power
+
+    first = asyncio.create_task(
+        ent.async_set_temperature(**{ATTR_TEMPERATURE: 20.0})
+    )
+    await first_write_started.wait()
+    first_generation = runtime.get_pending(1, "pwr_on").generation
+    second = asyncio.create_task(
+        ent.async_set_temperature(**{ATTR_TEMPERATURE: 23.0})
+    )
+    for _ in range(10):
+        await asyncio.sleep(0)
+        if runtime.get_pending(1, "pwr_on").generation != first_generation:
+            break
+
+    assert runtime.get_pending(1, "pwr_on").generation != first_generation
+    release_first_write.set()
+    with pytest.raises(HomeAssistantError):
+        await first
+    await second
+
+    assert api.set_power.await_args_list == [call(1, True), call(1, True)]
+    api.set_target_temperature.assert_awaited_once_with(1, 23.0)
+    api.set_power_and_heat.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("next_action", "expected_method", "expected_value"),
+    [
+        (
+            lambda ent: ent.async_set_temperature(temperature=23.0),
+            "set_target_temperature",
+            23.0,
+        ),
+        (
+            lambda ent: ent.async_set_hvac_mode(HVACMode.HEAT),
+            "set_target_temperature",
+            22.5,
+        ),
+        (
+            lambda ent: ent.async_set_hvac_mode(HVACMode.FAN_ONLY),
+            "set_heater_off",
+            None,
+        ),
+    ],
+)
+async def test_climate_power_on_action_survives_stale_confirmation_after_off(
+    next_action, expected_method, expected_value
+):
+    ent, _cond, api, runtime = _make_entity_with_runtime(
+        {"pwr_on": True, "u_temp_room": 225}
+    )
+    first_confirmation_started = asyncio.Event()
+    release_first_confirmation = asyncio.Event()
+    refresh_count = 0
+
+    async def refresh_device(device_id):
+        nonlocal refresh_count
+        refresh_count += 1
+        if refresh_count == 1:
+            first_confirmation_started.set()
+            await release_first_confirmation.wait()
+            raise ApiError("get_device", "confirmation failed", status=503)
+
+    runtime.refresh_device.side_effect = refresh_device
+
+    turn_off = asyncio.create_task(ent.async_set_hvac_mode(HVACMode.OFF))
+    await first_confirmation_started.wait()
+    queued = asyncio.create_task(next_action(ent))
+    await asyncio.sleep(0)
+
+    assert runtime.get_pending(1, "pwr_on").value is True
+    release_first_confirmation.set()
+    await asyncio.gather(turn_off, queued)
+
+    assert api.set_power.await_args_list == [call(1, False), call(1, True)]
+    api.set_power_and_heat.assert_not_awaited()
+    if expected_method == "set_target_temperature":
+        api.set_target_temperature.assert_awaited_once_with(1, expected_value)
+        api.set_heater_off.assert_not_awaited()
+    else:
+        api.set_heater_off.assert_awaited_once_with(1)
+        api.set_target_temperature.assert_not_awaited()
+    assert refresh_count == 2
+
+
+@pytest.mark.asyncio
+async def test_temperature_avoids_compound_write_after_stale_power_on_confirmation():
+    ent, _cond, api, runtime = _make_entity_with_runtime({"pwr_on": False})
+    first_confirmation_started = asyncio.Event()
+    release_first_confirmation = asyncio.Event()
+    refresh_count = 0
+
+    async def refresh_device(device_id):
+        nonlocal refresh_count
+        refresh_count += 1
+        if refresh_count == 1:
+            first_confirmation_started.set()
+            await release_first_confirmation.wait()
+            raise ApiError("get_device", "confirmation failed", status=503)
+
+    runtime.refresh_device.side_effect = refresh_device
+
+    first = asyncio.create_task(
+        ent.async_set_temperature(**{ATTR_TEMPERATURE: 20.0})
+    )
+    await first_confirmation_started.wait()
+    queued = asyncio.create_task(
+        ent.async_set_temperature(**{ATTR_TEMPERATURE: 23.0})
+    )
+    await asyncio.sleep(0)
+
+    assert runtime.get_pending(1, "pwr_on").value is True
+    release_first_confirmation.set()
+    await asyncio.gather(first, queued)
+
+    assert api.set_power.await_args_list == [call(1, True), call(1, True)]
+    assert api.set_target_temperature.await_args_list == [
+        call(1, 20.0),
+        call(1, 23.0),
+    ]
+    api.set_power_and_heat.assert_not_awaited()
+    assert refresh_count == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("action", "failing_method", "pending_field"),
+    [
+        (
+            lambda ent: ent.async_set_temperature(temperature=23.0),
+            "set_target_temperature",
+            "u_temp_room",
+        ),
+        (
+            lambda ent: ent.async_set_hvac_mode(HVACMode.FAN_ONLY),
+            "set_heater_off",
+            "u_temp_room",
+        ),
+    ],
+)
+async def test_climate_partial_second_write_failure_recovers_and_clears_pending(
+    action, failing_method, pending_field
+):
+    ent, _cond, api, runtime = _make_entity_with_runtime({"pwr_on": True})
+    api_error = ApiError(failing_method, "second write failed", status=503)
+    getattr(api, failing_method).side_effect = api_error
+
+    with pytest.raises(HomeAssistantError) as raised:
+        await action(ent)
+
+    api.set_power.assert_awaited_once_with(1, True)
+    getattr(api, failing_method).assert_awaited_once()
+    runtime.refresh_device.assert_awaited_once_with(1)
+    assert raised.value.translation_key == "command_failed"
+    assert raised.value.__cause__ is api_error
+    assert runtime.get_pending(1, "pwr_on") is None
+    assert runtime.get_pending(1, pending_field) is None
+
+
+@pytest.mark.asyncio
+async def test_climate_partial_second_write_cancellation_recovers_and_clears_pending():
+    ent, _cond, api, runtime = _make_entity_with_runtime({"pwr_on": True})
+    target_write_started = asyncio.Event()
+    never_release = asyncio.Event()
+
+    async def blocked_target_write(device_id, target):
+        target_write_started.set()
+        await never_release.wait()
+
+    api.set_target_temperature.side_effect = blocked_target_write
+    task = asyncio.create_task(
+        ent.async_set_temperature(**{ATTR_TEMPERATURE: 23.0})
+    )
+    await target_write_started.wait()
+
+    assert runtime.get_pending(1, "pwr_on").value is True
+    assert runtime.get_pending(1, "u_temp_room").value == 230
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    api.set_power.assert_awaited_once_with(1, True)
+    api.set_target_temperature.assert_awaited_once_with(1, 23.0)
+    runtime.refresh_device.assert_awaited_once_with(1)
+    assert runtime.get_pending(1, "pwr_on") is None
+    assert runtime.get_pending(1, "u_temp_room") is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("api_method", "action", "expected_action"),
+    [
+        (
+            "set_power",
+            lambda ent: ent.async_set_hvac_mode(HVACMode.OFF),
+            "turn off climate control",
+        ),
+        (
+            "set_fan_speed",
+            lambda ent: ent.async_set_fan_mode("5"),
+            "set climate fan mode",
+        ),
+        (
+            "set_breezer_mode",
+            lambda ent: ent.async_set_swing_mode(BREEZER_SWING_MODES[1]),
+            "set breezer mode",
+        ),
+    ],
+)
+async def test_climate_api_failures_preserve_translated_error_metadata(
+    api_method, action, expected_action
+):
+    ent, _cond, api, runtime = _make_entity_with_runtime()
+    api_error = ApiError(api_method, "write failed", status=503)
+    getattr(api, api_method).side_effect = api_error
+
+    with pytest.raises(HomeAssistantError) as raised:
+        await action(ent)
+
+    assert raised.value.translation_domain == "atmeex_cloud"
+    assert raised.value.translation_key == "command_failed"
+    assert raised.value.translation_placeholders == {"action": expected_action}
+    assert raised.value.__cause__ is api_error
+    runtime.refresh_device.assert_awaited_once_with(1)
+
+
+@pytest.mark.asyncio
+async def test_sleep_preset_uses_one_refresh_for_mode_and_speed():
+    ent, _cond, api, runtime = _make_entity_with_runtime(
+        {"fan_speed": 4, "u_night": False, "u_auto": False}
+    )
+    ent.async_write_ha_state = MagicMock()
+
+    await ent.async_set_preset_mode(PRESET_SLEEP)
+
+    api.set_sleep_mode.assert_awaited_once_with(1, True)
+    api.set_fan_speed.assert_awaited_once_with(1, 2)
+    runtime.refresh_device.assert_awaited_once_with(1)
+    assert runtime.command_executor.value_with_pending(
+        1, "u_night", False
+    ) is True
+    assert ent._saved_fan_mode == "4"
+
+
+@pytest.mark.asyncio
+async def test_preset_mode_reads_pending_flags_during_delayed_confirmation():
+    ent, _cond, _api, runtime = _make_entity_with_runtime(
+        {"fan_speed": 4, "u_night": False, "u_auto": False}
+    )
+    refresh_started = asyncio.Event()
+    release_refresh = asyncio.Event()
+
+    async def blocked_refresh(_device_id):
+        refresh_started.set()
+        await release_refresh.wait()
+
+    runtime.refresh_device.side_effect = blocked_refresh
+    task = asyncio.create_task(ent.async_set_preset_mode(PRESET_SLEEP))
+    await refresh_started.wait()
+
+    assert ent.preset_mode == PRESET_SLEEP
+
+    release_refresh.set()
+    await task
+
+
+@pytest.mark.asyncio
+async def test_rapid_sleep_to_auto_transition_uses_pending_previous_mode():
+    ent, _cond, api, runtime = _make_entity_with_runtime(
+        {"fan_speed": 4, "u_night": False, "u_auto": False}
+    )
+    first_refresh_started = asyncio.Event()
+    release_first_refresh = asyncio.Event()
+    refresh_calls = 0
+
+    async def controlled_refresh(_device_id):
+        nonlocal refresh_calls
+        refresh_calls += 1
+        if refresh_calls == 1:
+            first_refresh_started.set()
+            await release_first_refresh.wait()
+
+    runtime.refresh_device.side_effect = controlled_refresh
+    sleep_task = asyncio.create_task(ent.async_set_preset_mode(PRESET_SLEEP))
+    await first_refresh_started.wait()
+    auto_task = asyncio.create_task(ent.async_set_preset_mode(PRESET_AUTO))
+    await asyncio.sleep(0)
+
+    assert ent.preset_mode == PRESET_AUTO
+
+    release_first_refresh.set()
+    await asyncio.gather(sleep_task, auto_task)
+    api.set_sleep_mode.assert_has_awaits([call(1, True), call(1, False)])
+    api.set_auto_mode.assert_has_awaits([call(1, False), call(1, True)])
+    api.set_fan_speed.assert_has_awaits([call(1, 2), call(1, 4)])
+    assert refresh_calls == 2
+    assert ent._saved_fan_mode is None
+
+
+@pytest.mark.asyncio
+async def test_preset_partial_failure_refreshes_once_before_error():
+    ent, _cond, api, runtime = _make_entity_with_runtime(
+        {"fan_speed": 4, "u_night": False}
+    )
+    ent.async_write_ha_state = MagicMock()
+    api.set_fan_speed.side_effect = ApiError(
+        "test_preset", "second write failed", status=503
+    )
+
+    with pytest.raises(HomeAssistantError):
+        await ent.async_set_preset_mode(PRESET_SLEEP)
+
+    api.set_sleep_mode.assert_awaited_once_with(1, True)
+    runtime.refresh_device.assert_awaited_once_with(1)
+    assert ent._saved_fan_mode is None
+
+
+@pytest.mark.asyncio
+async def test_invalid_preset_raises_service_validation_error():
+    ent, _cond, api, runtime = _make_entity_with_runtime()
+
+    with pytest.raises(ServiceValidationError) as raised:
+        await ent.async_set_preset_mode("invalid")
+
+    assert raised.value.translation_key == "invalid_command_value"
+    api.set_auto_mode.assert_not_awaited()
+    api.set_sleep_mode.assert_not_awaited()
+    api.set_fan_speed.assert_not_awaited()
+    runtime.refresh_device.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_queued_auto_waits_for_sleep_restore_state_commit():
+    ent, _cond, api, runtime = _make_entity_with_runtime(
+        {"fan_speed": 4, "u_night": False, "u_auto": False}
+    )
+    sleep_speed_started = asyncio.Event()
+    release_sleep_speed = asyncio.Event()
+
+    async def controlled_fan_speed(device_id, speed):
+        if speed == 2:
+            sleep_speed_started.set()
+            await release_sleep_speed.wait()
+
+    api.set_fan_speed.side_effect = controlled_fan_speed
+    sleep_task = asyncio.create_task(ent.async_set_preset_mode(PRESET_SLEEP))
+    await sleep_speed_started.wait()
+    auto_task = asyncio.create_task(ent.async_set_preset_mode(PRESET_AUTO))
+    await asyncio.sleep(0)
+
+    assert ent.preset_mode == PRESET_AUTO
+    assert ent._saved_fan_mode is None
+    release_sleep_speed.set()
+    await asyncio.gather(sleep_task, auto_task)
+
+    api.set_sleep_mode.assert_has_awaits([call(1, True), call(1, False)])
+    api.set_fan_speed.assert_has_awaits([call(1, 2), call(1, 4)])
+    api.set_auto_mode.assert_has_awaits([call(1, False), call(1, True)])
+    assert runtime.refresh_device.await_count == 2
+    assert ent._saved_fan_mode is None
+    assert ent._is_boost is False
+    assert ent._local_preset is None
+
+
+@pytest.mark.asyncio
+async def test_preset_second_write_cancellation_keeps_local_state_uncommitted():
+    ent, _cond, api, runtime = _make_entity_with_runtime(
+        {"fan_speed": 4, "u_night": False, "u_auto": False}
+    )
+    speed_write_started = asyncio.Event()
+    never_release = asyncio.Event()
+
+    async def blocked_fan_speed(device_id, speed):
+        speed_write_started.set()
+        await never_release.wait()
+
+    api.set_fan_speed.side_effect = blocked_fan_speed
+    task = asyncio.create_task(ent.async_set_preset_mode(PRESET_SLEEP))
+    await speed_write_started.wait()
+    task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    api.set_sleep_mode.assert_awaited_once_with(1, True)
+    runtime.refresh_device.assert_awaited_once_with(1)
+    assert ent._saved_fan_mode is None
+    assert ent._is_boost is False
+    assert ent._local_preset is None
+    assert runtime.get_pending(1, "u_night") is None
+    assert runtime.get_pending(1, "u_auto") is None
+    assert runtime.get_pending(1, "local_preset") is None
+
+
+class _BadPresetString:
+    def __str__(self) -> str:
+        raise RuntimeError("must not escape validation")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "invalid_preset",
+    [None, True, 1, object(), _BadPresetString()],
+)
+async def test_malformed_preset_only_raises_translated_validation(invalid_preset):
+    ent, _cond, api, runtime = _make_entity_with_runtime()
+
+    with pytest.raises(ServiceValidationError) as raised:
+        await ent.async_set_preset_mode(invalid_preset)
+
+    assert raised.value.translation_key == "invalid_command_value"
+    assert raised.value.translation_placeholders["field"] == "preset_mode"
+    api.set_auto_mode.assert_not_awaited()
+    api.set_sleep_mode.assert_not_awaited()
+    api.set_fan_speed.assert_not_awaited()
+    runtime.refresh_device.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_failed_boost_exit_preserves_complete_local_restore_state():
+    ent, _cond, api, runtime = _make_entity_with_runtime(
+        {"fan_speed": 7, "u_night": False, "u_auto": False}
+    )
+    ent._saved_fan_mode = "3"
+    ent._is_boost = True
+    ent._local_preset = PRESET_BOOST
+    api.set_fan_speed.side_effect = ApiError(
+        "set_fan_speed", "restore failed", status=503
+    )
+
+    with pytest.raises(HomeAssistantError):
+        await ent.async_set_preset_mode(PRESET_AUTO)
+
+    api.set_sleep_mode.assert_awaited_once_with(1, False)
+    api.set_auto_mode.assert_awaited_once_with(1, True)
+    runtime.refresh_device.assert_awaited_once_with(1)
+    assert ent._saved_fan_mode == "3"
+    assert ent._is_boost is True
+    assert ent._local_preset == PRESET_BOOST
+
+
+@pytest.mark.asyncio
+async def test_pending_auto_overrides_committed_boost_during_restore_write():
+    ent, _cond, api, _runtime = _make_entity_with_runtime(
+        {"fan_speed": 7, "u_night": False, "u_auto": False}
+    )
+    ent._saved_fan_mode = "3"
+    ent._is_boost = True
+    ent._local_preset = PRESET_BOOST
+    restore_started = asyncio.Event()
+    release_restore = asyncio.Event()
+
+    async def blocked_restore(device_id, speed):
+        restore_started.set()
+        await release_restore.wait()
+
+    api.set_fan_speed.side_effect = blocked_restore
+    task = asyncio.create_task(ent.async_set_preset_mode(PRESET_AUTO))
+    await restore_started.wait()
+
+    assert ent.preset_mode == PRESET_AUTO
+
+    release_restore.set()
+    await task
+    assert ent._saved_fan_mode is None
+    assert ent._is_boost is False
+    assert ent._local_preset is None
+
+
+@pytest.mark.asyncio
+async def test_queued_sleep_disables_auto_after_predecessor_disable_fails():
+    ent, _cond, api, _runtime = _make_entity_with_runtime(
+        {"fan_speed": 4, "u_night": False, "u_auto": True}
+    )
+    first_disable_started = asyncio.Event()
+    release_first_disable = asyncio.Event()
+    disable_calls = 0
+
+    async def controlled_auto_mode(device_id: int | str, enabled: bool) -> None:
+        nonlocal disable_calls
+        if enabled:
+            return
+        disable_calls += 1
+        if disable_calls == 1:
+            first_disable_started.set()
+            await release_first_disable.wait()
+            raise ApiError("set_auto_mode", "disable failed", status=503)
+
+    api.set_auto_mode.side_effect = controlled_auto_mode
+    none_task = asyncio.create_task(ent.async_set_preset_mode(PRESET_NONE))
+    await first_disable_started.wait()
+    sleep_task = asyncio.create_task(ent.async_set_preset_mode(PRESET_SLEEP))
+    await asyncio.sleep(0)
+
+    release_first_disable.set()
+    none_result, sleep_result = await asyncio.gather(
+        none_task,
+        sleep_task,
+        return_exceptions=True,
+    )
+
+    assert isinstance(none_result, HomeAssistantError)
+    assert sleep_result is None
+    api.set_auto_mode.assert_has_awaits([call(1, False), call(1, False)])
+    api.set_sleep_mode.assert_awaited_with(1, True)
+
+
+@pytest.mark.asyncio
+async def test_queued_none_retries_failed_boost_restore_and_enforces_flags():
+    ent, _cond, api, _runtime = _make_entity_with_runtime(
+        {"fan_speed": 7, "u_night": False, "u_auto": False}
+    )
+    ent._saved_fan_mode = "3"
+    ent._is_boost = True
+    ent._local_preset = PRESET_BOOST
+    first_restore_started = asyncio.Event()
+    release_first_restore = asyncio.Event()
+    restore_calls = 0
+
+    async def controlled_fan_speed(device_id: int | str, speed: int) -> None:
+        nonlocal restore_calls
+        if speed != 3:
+            return
+        restore_calls += 1
+        if restore_calls == 1:
+            first_restore_started.set()
+            await release_first_restore.wait()
+            raise ApiError("set_fan_speed", "restore failed", status=503)
+
+    api.set_fan_speed.side_effect = controlled_fan_speed
+    auto_task = asyncio.create_task(ent.async_set_preset_mode(PRESET_AUTO))
+    await first_restore_started.wait()
+    none_task = asyncio.create_task(ent.async_set_preset_mode(PRESET_NONE))
+    await asyncio.sleep(0)
+
+    release_first_restore.set()
+    auto_result, none_result = await asyncio.gather(
+        auto_task,
+        none_task,
+        return_exceptions=True,
+    )
+
+    assert isinstance(auto_result, HomeAssistantError)
+    assert none_result is None
+    api.set_auto_mode.assert_awaited_with(1, False)
+    api.set_sleep_mode.assert_awaited_with(1, False)
+    api.set_fan_speed.assert_has_awaits([call(1, 3), call(1, 3)])
+    assert ent._saved_fan_mode is None
+    assert ent._is_boost is False
+    assert ent._local_preset is None
+
+
+@pytest.mark.asyncio
+async def test_sleep_reentry_keeps_restore_speed_after_exit_confirmation_failure():
+    ent, _cond, api, runtime = _make_entity_with_runtime(
+        {"fan_speed": 2, "u_night": True, "u_auto": False}
+    )
+    ent._saved_fan_mode = "4"
+    runtime.refresh_device.side_effect = [
+        ApiError("refresh", "confirmation failed", status=503),
+        None,
+    ]
+
+    await ent.async_set_preset_mode(PRESET_NONE)
+    assert ent._saved_fan_mode is None
+
+    await ent.async_set_preset_mode(PRESET_SLEEP)
+
+    api.set_fan_speed.assert_has_awaits([call(1, 4), call(1, 2)])
+    assert ent._saved_fan_mode == "4"
+
+
+@pytest.mark.asyncio
+async def test_sleep_reentry_keeps_restore_speed_after_pending_ttl_expires(
+    monkeypatch,
+):
+    now = 100.0
+    monkeypatch.setattr(
+        command_executor_module.time,
+        "monotonic",
+        lambda: now,
+    )
+    ent, cond, api, runtime = _make_entity_with_runtime(
+        {"fan_speed": 2, "u_night": True, "u_auto": False}
+    )
+    ent._saved_fan_mode = "4"
+    runtime.refresh_device.side_effect = [
+        ApiError("refresh", "confirmation failed", status=503),
+        None,
+    ]
+
+    await ent.async_set_preset_mode(PRESET_NONE)
+    assert ent._saved_fan_mode is None
+
+    now = 120.0
+    cond["u_night"] = False
+    assert runtime.get_pending(1, "fan_speed") is None
+    await ent.async_set_preset_mode(PRESET_SLEEP)
+
+    api.set_fan_speed.assert_has_awaits([call(1, 4), call(1, 2)])
+    assert ent._saved_fan_mode == "4"
+
+
+@pytest.mark.asyncio
+async def test_restore_intent_survives_ttl_expiry_during_failed_confirmation(
+    monkeypatch,
+):
+    now = 100.0
+    monkeypatch.setattr(
+        command_executor_module.time,
+        "monotonic",
+        lambda: now,
+    )
+    ent, cond, api, runtime = _make_entity_with_runtime(
+        {"fan_speed": 2, "u_night": True, "u_auto": False}
+    )
+    ent._saved_fan_mode = "4"
+    confirmation_started = asyncio.Event()
+    release_confirmation = asyncio.Event()
+    refresh_calls = 0
+
+    async def controlled_refresh(_device_id: int | str) -> None:
+        nonlocal refresh_calls
+        refresh_calls += 1
+        if refresh_calls == 1:
+            confirmation_started.set()
+            await release_confirmation.wait()
+            raise ApiError("refresh", "confirmation failed", status=503)
+
+    runtime.refresh_device.side_effect = controlled_refresh
+    exit_task = asyncio.create_task(ent.async_set_preset_mode(PRESET_NONE))
+    await confirmation_started.wait()
+
+    now = 120.0
+    assert runtime.get_pending(1, "fan_speed") is None
+    release_confirmation.set()
+    await exit_task
+
+    cond["u_night"] = False
+    await ent.async_set_preset_mode(PRESET_SLEEP)
+
+    api.set_fan_speed.assert_has_awaits([call(1, 4), call(1, 2)])
+    assert ent._saved_fan_mode == "4"
+
+
+@pytest.mark.asyncio
+async def test_restore_intent_survives_cancellation_during_confirmation_recovery():
+    ent, cond, api, runtime = _make_entity_with_runtime(
+        {"fan_speed": 2, "u_night": True, "u_auto": False}
+    )
+    ent._saved_fan_mode = "4"
+    confirmation_started = asyncio.Event()
+    recovery_started = asyncio.Event()
+    never_release = asyncio.Event()
+    refresh_calls = 0
+
+    async def controlled_refresh(_device_id: int | str) -> None:
+        nonlocal refresh_calls
+        refresh_calls += 1
+        if refresh_calls == 1:
+            confirmation_started.set()
+            await never_release.wait()
+        elif refresh_calls == 2:
+            recovery_started.set()
+            await never_release.wait()
+
+    runtime.refresh_device.side_effect = controlled_refresh
+    exit_task = asyncio.create_task(ent.async_set_preset_mode(PRESET_NONE))
+    await confirmation_started.wait()
+    exit_task.cancel()
+    await recovery_started.wait()
+    exit_task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await exit_task
+
+    cond["u_night"] = False
+    await ent.async_set_preset_mode(PRESET_SLEEP)
+
+    api.set_fan_speed.assert_has_awaits([call(1, 4), call(1, 2)])
+    assert ent._saved_fan_mode == "4"
+
+
+@pytest.mark.asyncio
+async def test_manual_fan_intent_supersedes_old_restore_after_failed_confirmation(
+    monkeypatch,
+):
+    now = 100.0
+    monkeypatch.setattr(
+        command_executor_module.time,
+        "monotonic",
+        lambda: now,
+    )
+    ent, _cond, api, runtime = _make_entity_with_runtime(
+        {"fan_speed": 3, "u_night": False, "u_auto": False}
+    )
+    ent._unconfirmed_restore_fan_mode = "4"
+    runtime.refresh_device.side_effect = [
+        ApiError("refresh", "manual confirmation failed", status=503),
+        None,
+        None,
+    ]
+
+    await ent.async_set_fan_mode("5")
+    now = 120.0
+    assert runtime.get_pending(1, "fan_speed") is None
+    await ent.async_set_preset_mode(PRESET_SLEEP)
+    await ent.async_set_preset_mode(PRESET_NONE)
+
+    api.set_fan_speed.assert_has_awaits(
+        [call(1, 5), call(1, 2), call(1, 5)]
+    )
+    assert ent._saved_fan_mode is None
+
+
+@pytest.mark.asyncio
+async def test_manual_fan_confirmation_clears_durable_intent():
+    ent, cond, _api, runtime = _make_entity_with_runtime(
+        {"fan_speed": 3, "u_night": False, "u_auto": False}
+    )
+    ent._unconfirmed_restore_fan_mode = "4"
+
+    async def confirmed_refresh(_device_id: int | str) -> None:
+        cond["fan_speed"] = 5
+
+    runtime.refresh_device.side_effect = confirmed_refresh
+
+    await ent.async_set_fan_mode("5")
+
+    assert ent._unconfirmed_restore_fan_mode is None
+
+
+@pytest.mark.asyncio
+async def test_manual_fan_intent_survives_cancelled_confirmation():
+    ent, _cond, _api, runtime = _make_entity_with_runtime(
+        {"fan_speed": 3, "u_night": False, "u_auto": False}
+    )
+    ent._unconfirmed_restore_fan_mode = "4"
+    confirmation_started = asyncio.Event()
+    never_release = asyncio.Event()
+    refresh_calls = 0
+
+    async def controlled_refresh(_device_id: int | str) -> None:
+        nonlocal refresh_calls
+        refresh_calls += 1
+        if refresh_calls == 1:
+            confirmation_started.set()
+            await never_release.wait()
+
+    runtime.refresh_device.side_effect = controlled_refresh
+    task = asyncio.create_task(ent.async_set_fan_mode("5"))
+    await confirmation_started.wait()
+    task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert ent._unconfirmed_restore_fan_mode == "5"
+
+
+@pytest.mark.asyncio
+async def test_manual_fan_after_failed_queued_sleep_supersedes_restore_baseline():
+    ent, _cond, api, _runtime = _make_entity_with_runtime(
+        {"fan_speed": 3, "u_night": False, "u_auto": False}
+    )
+    ent._unconfirmed_restore_fan_mode = "4"
+    first_sleep_flag_started = asyncio.Event()
+    release_first_sleep_flag = asyncio.Event()
+    auto_flag_calls = 0
+
+    async def controlled_auto_mode(device_id: int | str, enabled: bool) -> None:
+        nonlocal auto_flag_calls
+        auto_flag_calls += 1
+        if auto_flag_calls == 1:
+            assert enabled is False
+            first_sleep_flag_started.set()
+            await release_first_sleep_flag.wait()
+            raise ApiError("set_auto_mode", "sleep setup failed", status=503)
+
+    api.set_auto_mode.side_effect = controlled_auto_mode
+    failed_sleep = asyncio.create_task(
+        ent.async_set_preset_mode(PRESET_SLEEP)
+    )
+    await first_sleep_flag_started.wait()
+    manual_fan = asyncio.create_task(ent.async_set_fan_mode("5"))
+    await asyncio.sleep(0)
+    assert ent.preset_mode == PRESET_SLEEP
+
+    release_first_sleep_flag.set()
+    sleep_result, fan_result = await asyncio.gather(
+        failed_sleep,
+        manual_fan,
+        return_exceptions=True,
+    )
+
+    assert isinstance(sleep_result, HomeAssistantError)
+    assert fan_result is None
+    await ent.async_set_preset_mode(PRESET_SLEEP)
+    await ent.async_set_preset_mode(PRESET_NONE)
+
+    api.set_fan_speed.assert_has_awaits(
+        [call(1, 5), call(1, 2), call(1, 5)]
+    )
+    assert ent._saved_fan_mode is None
+
+
+@pytest.mark.asyncio
+async def test_sleep_fan_target_is_pending_during_blocked_confirmation():
+    ent, _cond, _api, runtime = _make_entity_with_runtime(
+        {"fan_speed": 4, "u_night": False, "u_auto": False}
+    )
+    confirmation_started = asyncio.Event()
+    release_confirmation = asyncio.Event()
+
+    async def blocked_refresh(_device_id: int | str) -> None:
+        confirmation_started.set()
+        await release_confirmation.wait()
+
+    runtime.refresh_device.side_effect = blocked_refresh
+    task = asyncio.create_task(ent.async_set_preset_mode(PRESET_SLEEP))
+    await confirmation_started.wait()
+
+    fan_mode_during_confirmation = ent.fan_mode
+
+    release_confirmation.set()
+    await task
+    assert fan_mode_during_confirmation == "2"
