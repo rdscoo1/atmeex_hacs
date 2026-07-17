@@ -201,12 +201,14 @@ Use these imports and definitions in `custom_components/atmeex_cloud/coordinator
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 import time
 from collections.abc import Callable, Mapping
 from datetime import timedelta
 from typing import Any, TypedDict
 
+from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import ConfigEntryAuthFailed
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
@@ -239,10 +241,18 @@ class AtmeexCoordinator(DataUpdateCoordinator[AtmeexCoordinatorData]):
         api: AtmeexApi,
         state_store: AtmeexStateStore,
         config_entry_id: str,
+        config_entry: ConfigEntry | None = None,
         name: str,
         update_interval: timedelta,
         fire_logbook_event: Callable[[str, dict[str, Any]], None] | None = None,
     ) -> None:
+        coordinator_kwargs: dict[str, Any] = {}
+        if (
+            config_entry is not None
+            and "config_entry"
+            in inspect.signature(DataUpdateCoordinator.__init__).parameters
+        ):
+            coordinator_kwargs["config_entry"] = config_entry
         super().__init__(
             hass,
             logger,
@@ -250,6 +260,7 @@ class AtmeexCoordinator(DataUpdateCoordinator[AtmeexCoordinatorData]):
             update_interval=update_interval,
             update_method=self._async_update_data,
             always_update=False,
+            **coordinator_kwargs,
         )
         self.api = api
         self.state_store = state_store
@@ -331,6 +342,14 @@ class AtmeexCoordinator(DataUpdateCoordinator[AtmeexCoordinatorData]):
 
 Delete `_fetch_devices_safely`, `_ws_device_update_ts`, `_refresh_device_update_ts`, and timing keys in `AtmeexCoordinatorData`. The state store now performs every merge, and only `devices`, `device_map`, and `states` participate in equality.
 
+Passing `config_entry=` to `DataUpdateCoordinator` through feature detection
+removes Home Assistant's "coordinator created without config_entry"
+deprecation warning on current releases — required for the contract-quality
+plan's zero-deprecation gate on the current-HA CI leg — while
+`inspect.signature` keeps Home Assistant 2024.8 compatibility without version
+comparisons. Test doubles that construct the coordinator without
+`config_entry` remain valid because the parameter defaults to `None`.
+
 In `async_setup_entry`, migrate the composition root in the same task so the
 constructor change never leaves the repository broken:
 
@@ -342,6 +361,7 @@ constructor change never leaves the repository broken:
         api=api,
         state_store=state_store,
         config_entry_id=entry.entry_id,
+        config_entry=entry,
         name="Atmeex Cloud",
         update_interval=timedelta(seconds=update_interval_seconds),
         fire_logbook_event=_fire_logbook_event,
@@ -1890,6 +1910,7 @@ Confirm the exact construction introduced in Task 1 remains in
         api=api,
         state_store=state_store,
         config_entry_id=entry.entry_id,
+        config_entry=entry,
         name="Atmeex Cloud",
         update_interval=timedelta(seconds=update_interval_seconds),
         fire_logbook_event=_fire_logbook_event,

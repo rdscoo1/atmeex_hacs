@@ -718,6 +718,14 @@ RETRY_MAX_DELAY_SEC = 8.0
 TOKEN_REFRESH_BUFFER_SEC = 60
 ```
 
+> **Decision note (User-Agent):** this replaces the deliberately chosen
+> `okhttp/3.14.9` mimicry — the current `const.py` comment warns the cloud may
+> single out non-native clients. Before merging this task, verify a real
+> account still signs in and lists devices under the new User-Agent. If the
+> cloud rejects or throttles it, keep `USER_AGENT = "okhttp/3.14.9"`, update
+> the two User-Agent assertions in Step 8 to expect that value, and drop the
+> okhttp pattern from Task 6 Step 5's forbidden-pattern check.
+
 - [ ] **Step 5: Implement the complete response and retry primitives**
 
 Add `from collections.abc import Awaitable, Callable`, `from datetime import datetime, timezone`, and `from email.utils import parsedate_to_datetime` to `api.py`. Extend the `.const` import to include `API_REQUEST_TIMEOUT_SEC`, `API_AUTH_TIMEOUT_SEC`, `RETRY_MAX_ATTEMPTS`, `RETRY_BASE_DELAY_SEC`, `RETRY_MAX_DELAY_SEC`, and `TOKEN_REFRESH_BUFFER_SEC`, then add these module-level helpers:
@@ -1840,7 +1848,15 @@ Move `stored_refresh_token` above API construction and use this exact callback a
     )
     await api.async_init()
     if stored_refresh_token:
-        api._refresh_token = stored_refresh_token
+        api.restore_refresh_token(stored_refresh_token)
+```
+
+Add this public method to `AtmeexApi` beside the `refresh_token` property so the composition root never assigns the private attribute:
+
+```python
+    def restore_refresh_token(self, refresh_token: str) -> None:
+        """Seed the refresh token persisted on the config entry before any request."""
+        self._refresh_token = refresh_token
 ```
 
 Delete the post-login persistence block at current lines 114-120. Replace `_update_listener` and listener registration with:
@@ -1912,7 +1928,7 @@ Expected: exit status 0 and no output.
 
 - [ ] **Step 5: Verify forbidden fallback and privacy patterns are absent**
 
-Run: `rg -n 'fallback=True|okhttp/3\.14\.9|await resp\.text\(|str\(data\)|text\[:' custom_components/atmeex_cloud/api.py custom_components/atmeex_cloud/coordinator.py`
+Run: `rg -n 'fallback=True|okhttp/3\.14\.9|await resp\.text\(|str\(data\)|text\[:|api\._refresh_token' custom_components/atmeex_cloud/api.py custom_components/atmeex_cloud/coordinator.py custom_components/atmeex_cloud/__init__.py`
 
 Expected: no matches and exit status 1.
 

@@ -293,6 +293,26 @@ async def test_malformed_or_unknown_messages_do_not_reset_auth(payload):
     manager._application_unauthorized_count = 2
     await manager._handle_message(payload)
     assert manager._application_unauthorized_count == 2
+
+
+@pytest.mark.asyncio
+async def test_ws_connect_timeout_type_matches_aiohttp_capability():
+    captured = {}
+
+    class _CapturingSession:
+        async def ws_connect(self, *args, **kwargs):
+            captured.update(kwargs)
+            return _FakeWebSocket()
+
+    manager = _manager(_CapturingSession())
+    assert await manager.connect() is True
+    try:
+        from aiohttp import ClientWSTimeout
+    except ImportError:
+        assert isinstance(captured["timeout"], float)
+    else:
+        assert isinstance(captured["timeout"], ClientWSTimeout)
+    await manager.disconnect()
 ~~~
 
 Add these complete helpers above the tests:
@@ -358,7 +378,7 @@ application-auth backoff are deliberately calculated from separate counters.
 Run:
 
 ~~~bash
-.venv/bin/python -m pytest -q tests/test_websocket_manager.py -k "handshake_auth_recovers or application_auth_counter or malformed_or_unknown"
+.venv/bin/python -m pytest -q tests/test_websocket_manager.py -k "handshake_auth_recovers or application_auth_counter or malformed_or_unknown or ws_connect_timeout"
 ~~~
 
 Expected: FAIL because handshake rejection immediately starts reauth, successful handshakes reset the application counter, and malformed messages are forwarded.
@@ -411,7 +431,7 @@ Replace handshake handling with:
                 self._config.base_url,
                 headers={"Authorization": f"Bearer {token}"},
                 heartbeat=self._config.ping_interval,
-                timeout=self._config.ping_timeout,
+                timeout=_ws_handshake_timeout(self._config.ping_timeout),
             )
         except aiohttp.WSServerHandshakeError as err:
             if err.status in (401, 403):
@@ -463,6 +483,22 @@ Replace handshake handling with:
                 self._config.reconnect_delay_max,
             )
         return max(self._reconnect_delay, auth_delay)
+~~~
+
+Add this module-level helper above `WebSocketManager` (with `Any` from
+`typing`) so the handshake timeout follows aiohttp's current contract through
+feature detection — aiohttp with typed WebSocket timeouts deprecates the bare
+float, while the aiohttp shipped with Home Assistant 2024.8 requires it:
+
+~~~python
+try:
+    from aiohttp import ClientWSTimeout
+
+    def _ws_handshake_timeout(seconds: float) -> Any:
+        return ClientWSTimeout(ws_close=seconds)
+except ImportError:
+    def _ws_handshake_timeout(seconds: float) -> float:
+        return seconds
 ~~~
 
 Replace message handling with:
@@ -1589,4 +1625,5 @@ Expected: all selected tests pass; entity IDs, service names and schemas, option
 - The 500-message buffer detects overflow before eviction, increments its counter, schedules one authoritative resync, coalesces later field values, and publishes once per drain.
 - Platform-forward or startup failure closes coroutines, cleans runtime, and clears entry.runtime_data.
 - Platform unload False leaves communications operational; successful unload stops callbacks, closes sockets, cancels and awaits all tracked work, and prevents post-unload publication.
+- The WebSocket handshake timeout is passed as `ClientWSTimeout` when aiohttp provides it and as a float otherwise; no deprecated bare-float timeout reaches a typed-timeout aiohttp.
 - Existing public entity, service, option, translation, and automation contracts remain unchanged.

@@ -753,10 +753,12 @@ git commit -m "fix: whitelist diagnostics and redact logs"
 
 **Files:**
 - Modify: `custom_components/atmeex_cloud/sensor.py`
+- Modify: `custom_components/atmeex_cloud/climate.py`
 - Modify: `custom_components/atmeex_cloud/logbook.py`
 - Modify: `custom_components/atmeex_cloud/__init__.py`
 - Modify: `custom_components/atmeex_cloud/coordinator.py`
 - Modify: `tests/test_sensor.py`
+- Modify: `tests/test_climate.py`
 - Modify: `tests/test_logbook.py`
 - Modify: `tests/test_websocket_integration.py`
 - Modify: `tests/test_coordinator.py`
@@ -789,11 +791,26 @@ successful inventory refresh, and asserts exactly one public event with
 "Device recovered", domain=DOMAIN)`. The next healthy poll emits neither
 another recovery event nor another logbook entry.
 
+Append to `tests/test_climate.py`, reusing its existing entity factory:
+
+```python
+def test_climate_attributes_exclude_volatile_timing_fields():
+    ent, _cond, _api, _runtime = _make_entity_with_runtime(
+        {"temp_room": 215, "u_temp_room": 225}
+    )
+
+    attrs = ent.extra_state_attributes
+    assert attrs["room_temp_c"] == 21.5
+    assert attrs["target_temp_c"] == 22.5
+    for volatile in ("avg_latency_ms", "last_success_ts", "last_success_utc"):
+        assert volatile not in attrs
+```
+
 - [ ] **Step 2: Run RED**
 
-Run: `.venv/bin/python -m pytest tests/test_sensor.py tests/test_logbook.py -q`
+Run: `.venv/bin/python -m pytest tests/test_sensor.py tests/test_logbook.py tests/test_climate.py -q`
 
-Expected: FAIL because diagnostics are enabled by default and routine WebSocket updates are rendered in logbook.
+Expected: FAIL because diagnostics are enabled by default, routine WebSocket updates are rendered in logbook, and climate still exposes volatile timing attributes.
 
 - [ ] **Step 3: Implement low-churn rendering**
 
@@ -802,6 +819,17 @@ Set `_attr_entity_registry_enabled_default = False` on
 registry entries. Keep all existing diagnostic attributes, but rely on Plan
 5's comparable coordinator snapshots so timing-only property changes never
 notify listeners.
+
+In `climate.py`, delete the volatile diagnostics block from
+`extra_state_attributes` — `avg_latency_ms`, `last_success_ts`, and
+`last_success_utc` change on every poll and would force a recorder write for
+every climate entity even when nothing about the device changed. Plan 2's
+snapshot already stopped carrying these keys, so today they would vanish as an
+unstated side effect of the shape change; remove them deliberately so the
+recorder contract is explicit and tested. Keep `room_temp_c`, `target_temp_c`,
+and `has_humidifier`, which change only with real device state. The same
+timing data remains available on the diagnostics sensor and in downloadable
+diagnostics.
 
 A logbook event describer must always return a mapping; Home Assistant indexes
 the return value immediately. Routine device-update events are also part of the
@@ -819,12 +847,12 @@ conditional describer return `None` and without changing automation inputs.
 
 - [ ] **Step 4: Run GREEN and commit**
 
-Run: `.venv/bin/python -m pytest tests/test_sensor.py tests/test_logbook.py tests/test_websocket_integration.py -q`
+Run: `.venv/bin/python -m pytest tests/test_sensor.py tests/test_logbook.py tests/test_websocket_integration.py tests/test_climate.py -q`
 
-Expected: PASS with no routine technical logbook entry and unchanged event constants/payload compatibility.
+Expected: PASS with no routine technical logbook entry, no volatile climate attributes, and unchanged event constants/payload compatibility.
 
 ```bash
-git add custom_components/atmeex_cloud/sensor.py custom_components/atmeex_cloud/logbook.py custom_components/atmeex_cloud/__init__.py custom_components/atmeex_cloud/coordinator.py tests/test_sensor.py tests/test_logbook.py tests/test_websocket_integration.py tests/test_coordinator.py
+git add custom_components/atmeex_cloud/sensor.py custom_components/atmeex_cloud/climate.py custom_components/atmeex_cloud/logbook.py custom_components/atmeex_cloud/__init__.py custom_components/atmeex_cloud/coordinator.py tests/test_sensor.py tests/test_climate.py tests/test_logbook.py tests/test_websocket_integration.py tests/test_coordinator.py
 git commit -m "perf: reduce recorder and logbook churn"
 ```
 

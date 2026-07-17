@@ -1531,6 +1531,18 @@ async def test_missing_humidifier_raises_unsupported_feature():
 
     assert raised.value.translation_key == "unsupported_device_feature"
     api.set_humid_stage.assert_not_awaited()
+
+
+def test_target_temperature_property_is_pure_and_hook_records_target():
+    ent, _cond, _api, _runtime = _make_entity_with_runtime(
+        {"pwr_on": True, "u_temp_room": 225}
+    )
+
+    assert ent.target_temperature == 22.5
+    assert ent._last_heat_temp is None  # reading a property must not mutate
+
+    ent._remember_confirmed_heat_target()
+    assert ent._last_heat_temp == 22.5
 ~~~
 
 - [ ] **Step 2: Run the new climate tests and verify RED**
@@ -1716,6 +1728,34 @@ Replace the remaining direct command methods with:
             translation_placeholders={"action": "set humidifier stage"},
         )
 ~~~
+
+Also remove the hidden write from the `target_temperature` property — reading
+a property must not mutate entity state, and `_resolve_heat_target()` must not
+depend on when Home Assistant last happened to read it. Make the property pure
+and move the bookkeeping into a coordinator-update hook:
+
+~~~python
+    @property
+    def target_temperature(self) -> float | None:
+        target = deci_to_c(self._device_state.get("u_temp_room"))
+        if target is not None and self._attr_min_temp <= target <= self._attr_max_temp:
+            return target
+        return None
+
+    @callback
+    def _handle_coordinator_update(self) -> None:
+        self._remember_confirmed_heat_target()
+        super()._handle_coordinator_update()
+
+    def _remember_confirmed_heat_target(self) -> None:
+        """Track the last confirmed valid heat target for _resolve_heat_target."""
+        target = deci_to_c(self._device_state.get("u_temp_room"))
+        if target is not None and self._attr_min_temp <= target <= self._attr_max_temp:
+            self._last_heat_temp = target
+~~~
+
+Import `callback` from `homeassistant.core`. `_resolve_heat_target()` keeps its
+existing priority (current `u_temp_room` → `_last_heat_temp` → 20.0 default).
 
 - [ ] **Step 5: Run the climate command tests**
 
@@ -2041,6 +2081,13 @@ async def test_selects_reject_invalid_options():
     api.set_humid_stage.assert_not_awaited()
     api.set_breezer_mode.assert_not_awaited()
     coordinator.async_request_refresh.assert_not_awaited()
+
+
+def test_select_current_option_has_no_stale_cache_fallback():
+    hum, breezer, _cond, _api, _coordinator = _make_selects({})
+
+    assert hum.current_option is None
+    assert breezer.current_option is None
 ~~~
 
 - [ ] **Step 2: Add a RED switch executor test**
@@ -2104,7 +2151,6 @@ Pass runtime=runtime when constructing AtmeexHumidificationSelect in async_setup
                 "action": "set humidification stage"
             },
         )
-        self._attr_current_option = option
 ~~~
 
 ~~~python
@@ -2123,8 +2169,17 @@ Pass runtime=runtime when constructing AtmeexHumidificationSelect in async_setup
             pending={"pwr_on": power, "damp_pos": damper},
             translation_placeholders={"action": "set breezer mode"},
         )
-        self._attr_current_option = option
 ~~~
+
+Also delete the stale client-side option cache from both selects: remove every
+`self._attr_current_option` assignment and both
+`getattr(self, "_attr_current_option", ...)` fallback reads in
+`current_option`. Derive the displayed option from
+`self._state_with_pending(...)` on `hum_stg` (humidification) and on
+`damp_pos`/`pwr_on` (breezer), and return `None` when the state does not yet
+identify an option — an unknown select is honest, while a cached one lies
+after a restart. The executor's pending values already cover the optimistic
+window between command and confirmation.
 
 - [ ] **Step 5: Route all switch methods through one shared helper**
 
