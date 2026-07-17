@@ -114,6 +114,10 @@ class AtmeexDiagnosticsSensor(CoordinatorEntity, SensorEntity):
 
     _attr_has_entity_name = True
     _attr_entity_category = EntityCategory.DIAGNOSTIC
+    # Disabled by default: its attributes (ws age, latency) are volatile and
+    # only useful for troubleshooting. Applies to newly created registry
+    # entries; users can enable it when needed.
+    _attr_entity_registry_enabled_default = False
     _attr_icon = "mdi:cloud-check"
     _attr_name = "Atmeex diagnostics"
     _attr_native_unit_of_measurement = "devices"

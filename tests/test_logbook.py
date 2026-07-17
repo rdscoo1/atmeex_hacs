@@ -13,11 +13,12 @@ def test_logbook_registers_event_describers() -> None:
 
     async_describe_events(SimpleNamespace(), _register)
 
-    assert len(registered) == 2
+    # Only the API-error event is described in the logbook; routine device
+    # updates still fire on the bus but are no longer logbook/recorder noise.
+    assert len(registered) == 1
     assert registered[0][0] == DOMAIN
     assert registered[0][1] == EVENT_API_ERROR
-    assert registered[1][0] == DOMAIN
-    assert registered[1][1] == EVENT_DEVICE_UPDATED
+    assert all(event_type != EVENT_DEVICE_UPDATED for _, event_type, _ in registered)
 
 
 def test_logbook_describers_format_messages() -> None:
@@ -45,14 +46,5 @@ def test_logbook_describers_format_messages() -> None:
         == "[coordinator_update] Timeout while calling API (status=504) (+2 suppressed)"
     )
 
-    device_result = describers[EVENT_DEVICE_UPDATED](
-        SimpleNamespace(
-            data={
-                "device_ids": ["1", "2"],
-                "source": "websocket",
-                "suppressed_updates": 3,
-            }
-        )
-    )
-    assert device_result["name"] == "Atmeex device"
-    assert device_result["message"] == "2 devices state updated (+3 suppressed) via websocket"
+    # EVENT_DEVICE_UPDATED is no longer registered with the logbook platform.
+    assert EVENT_DEVICE_UPDATED not in describers

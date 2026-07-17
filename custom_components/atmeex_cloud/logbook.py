@@ -61,4 +61,7 @@ def async_describe_events(
         }
 
     async_describe_event(DOMAIN, EVENT_API_ERROR, async_describe_api_error)
-    async_describe_event(DOMAIN, EVENT_DEVICE_UPDATED, async_describe_device_updated)
+    # EVENT_DEVICE_UPDATED still fires on the bus (automations depend on it and
+    # its payload keys), but it is intentionally NOT registered with the logbook
+    # platform: routine per-poll/per-WS device updates would otherwise flood the
+    # logbook/recorder with technical noise.

@@ -646,7 +646,14 @@ class AtmeexClimateEntity(AtmeexEntityMixin, CoordinatorEntity, ClimateEntity):
 
     @property
     def extra_state_attributes(self) -> dict[str, Any] | None:
-        """Вернуть дополнительные атрибуты (температуры в °C и наличие увлажнителя)."""
+        """Extra attributes that change only with real device state.
+
+        Deliberately excludes coordinator timing (avg_latency_ms,
+        last_success_ts, last_success_utc): those change on every poll and would
+        force a recorder write for this entity even when nothing about the
+        device changed. That timing remains on the diagnostics sensor and in
+        downloadable diagnostics.
+        """
         attrs: dict[str, Any] = {}
         state = self._device_state
         room = deci_to_c(state.get("temp_room"))
@@ -656,19 +663,4 @@ class AtmeexClimateEntity(AtmeexEntityMixin, CoordinatorEntity, ClimateEntity):
         if target is not None:
             attrs["target_temp_c"] = round(target, 1)
         attrs["has_humidifier"] = self._has_humidifier()
-
-        # expose last_success_ts from coordinator data
-        data = getattr(self.coordinator, "data", {}) or {}
-        ts = getattr(self.coordinator, "last_success_ts", None)
-        avg = data.get("avg_latency_ms")
-        if isinstance(avg, (int, float)):
-            attrs["avg_latency_ms"] = avg
-            attrs["last_success_ts"] = ts
-            try:
-                attrs["last_success_utc"] = datetime.fromtimestamp(
-                    ts, tz=timezone.utc
-                ).isoformat()
-            except Exception:  # pragma: no cover - defensive only
-                pass
-
         return attrs

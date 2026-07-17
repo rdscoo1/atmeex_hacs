@@ -205,3 +205,15 @@ async def test_diagnostics_sensor_serializes_api_error(hass):
     assert attrs["last_api_error"] == "test_sensor: boom (status=500)"
     assert attrs["last_api_error_status"] == 500
     json_dumps(attrs)
+
+
+def test_diagnostics_sensor_disabled_by_default():
+    """Volatile diagnostics sensor should not clutter new setups by default."""
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+
+    from custom_components.atmeex_cloud.sensor import AtmeexDiagnosticsSensor
+
+    runtime = SimpleNamespace(coordinator=MagicMock())
+    sensor = AtmeexDiagnosticsSensor(runtime, "entry1")
+    assert sensor.entity_registry_enabled_default is False
