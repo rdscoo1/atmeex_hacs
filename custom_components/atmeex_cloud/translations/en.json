@@ -43,17 +43,28 @@
         "title": "Re-authenticate Atmeex Cloud",
         "description": "Your session for {phone} has expired. Submit to receive a new SMS code.",
         "data": {}
+      },
+      "reconfigure": {
+        "title": "Update Atmeex credentials",
+        "description": "Re-enter the credentials for this Atmeex account.",
+        "data": {
+          "email": "Email",
+          "password": "Password"
+        }
       }
     },
     "error": {
       "cannot_connect": "Failed to connect to Atmeex Cloud. Please check your internet connection.",
       "invalid_auth": "Invalid credentials or SMS code.",
-      "unknown": "An unexpected error occurred."
+      "unknown": "An unexpected error occurred.",
+      "account_mismatch": "The account you entered does not match the one being reconfigured."
     },
     "abort": {
       "already_configured": "This account is already configured.",
       "reauth_successful": "Re-authentication successful.",
-      "phone_state_lost": "Phone verification state was lost. Please start again."
+      "phone_state_lost": "Phone verification state was lost. Please start again.",
+      "reconfigure_successful": "Reconfiguration successful.",
+      "reconfigure_failed": "Could not find the configuration entry to reconfigure."
     }
   },
   "options": {

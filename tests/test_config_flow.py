@@ -1,6 +1,6 @@
 # tests/test_config_flow.py
 import pytest
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from homeassistant.const import CONF_EMAIL, CONF_PASSWORD
 from types import SimpleNamespace
@@ -622,3 +622,83 @@ async def test_reauth_confirm_success_without_entry_aborts():
 
     assert result["type"] == data_entry_flow.FlowResultType.ABORT
     assert result["reason"] == "reauth_successful"
+
+
+# --- Reconfigure flow (Plan 6) ---
+
+def _make_reconfigure_flow(entry_data=None, unique_id="old@example.com"):
+    flow = AtmeexConfigFlow()
+    entry = SimpleNamespace(
+        entry_id="entry1",
+        unique_id=unique_id,
+        data=entry_data
+        or {
+            CONF_AUTH_METHOD: AUTH_METHOD_EMAIL,
+            CONF_EMAIL: "old@example.com",
+            CONF_PASSWORD: "oldpwd",
+        },
+    )
+    flow.hass = SimpleNamespace(
+        config_entries=SimpleNamespace(async_get_entry=lambda _entry_id: entry),
+    )
+    flow.context = {"entry_id": "entry1", "source": "reconfigure"}
+    return flow, entry
+
+
+@pytest.mark.asyncio
+async def test_email_reconfigure_rejects_account_switch_before_network():
+    flow, _entry = _make_reconfigure_flow()
+
+    with patch(
+        "custom_components.atmeex_cloud.config_flow.async_get_clientsession"
+    ) as get_session:
+        result = await flow.async_step_reconfigure(
+            {CONF_EMAIL: "different@example.com", CONF_PASSWORD: "x"}
+        )
+
+    assert result["type"] == data_entry_flow.FlowResultType.FORM
+    assert result["errors"]["base"] == "account_mismatch"
+    get_session.assert_not_called()  # identity checked before any network I/O
+
+
+@pytest.mark.asyncio
+async def test_email_reconfigure_success_updates_same_entry():
+    flow, entry = _make_reconfigure_flow()
+    flow.async_update_reload_and_abort = MagicMock(
+        return_value={"type": "abort", "reason": "reconfigure_successful"}
+    )
+
+    with patch(
+        "custom_components.atmeex_cloud.config_flow.async_get_clientsession"
+    ) as get_session, patch(
+        "custom_components.atmeex_cloud.config_flow.AtmeexApi"
+    ) as api_cls:
+        get_session.return_value = object()
+        api = api_cls.return_value
+        api.async_init = AsyncMock()
+        api.login = AsyncMock()
+        api.get_devices = AsyncMock(return_value=[])
+
+        result = await flow.async_step_reconfigure(
+            {CONF_EMAIL: "old@example.com", CONF_PASSWORD: "newpwd"}
+        )
+
+    assert result["reason"] == "reconfigure_successful"
+    flow.async_update_reload_and_abort.assert_called_once()
+    _args, kwargs = flow.async_update_reload_and_abort.call_args
+    assert kwargs["reason"] == "reconfigure_successful"
+    assert kwargs["data_updates"][CONF_PASSWORD] == "newpwd"
+
+
+@pytest.mark.asyncio
+async def test_reconfigure_aborts_when_entry_missing():
+    flow = AtmeexConfigFlow()
+    flow.hass = SimpleNamespace(
+        config_entries=SimpleNamespace(async_get_entry=lambda _entry_id: None),
+    )
+    flow.context = {"entry_id": "missing"}
+
+    result = await flow.async_step_reconfigure(None)
+
+    assert result["type"] == data_entry_flow.FlowResultType.ABORT
+    assert result["reason"] == "reconfigure_failed"

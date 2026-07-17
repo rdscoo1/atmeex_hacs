@@ -90,8 +90,25 @@ class AtmeexConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     def __init__(self) -> None:
         """Initialize the config flow."""
         self._reauth_entry: ConfigEntry | None = None
+        # Set when the shared phone-code step is driven by a reconfigure flow,
+        # so it aborts with `reconfigure_successful` rather than
+        # `reauth_successful`.
+        self._reconfigure_entry: ConfigEntry | None = None
         # Carries the phone number across phone → phone_code steps.
         self._pending_phone: str | None = None
+
+    def _reconfigure_entry_compat(self) -> ConfigEntry | None:
+        """Return the entry being reconfigured across HA versions."""
+        getter = getattr(self, "_get_reconfigure_entry", None)
+        if callable(getter):
+            try:
+                return getter()
+            except Exception:  # noqa: BLE001 - fall back to context lookup
+                pass
+        entry_id = self.context.get("entry_id")
+        if entry_id:
+            return self.hass.config_entries.async_get_entry(entry_id)
+        return None
 
     def _abort_if_unique_id_mismatch(self) -> None:
         """Abort if unique_id doesn't match the entry being reauthenticated.
@@ -244,6 +261,20 @@ class AtmeexConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 # accounts — there are no replayable creds to fall back on.
                 if api.refresh_token:
                     entry_data["refresh_token"] = api.refresh_token
+
+                # A reconfigure flow reuses this shared SMS-code step but must
+                # finish with its own reason and never fall through to
+                # entry creation.
+                if self._reconfigure_entry:
+                    await self.async_set_unique_id(
+                        _phone_unique_id(self._pending_phone)
+                    )
+                    self._abort_if_unique_id_mismatch()
+                    return self.async_update_reload_and_abort(
+                        self._reconfigure_entry,
+                        data_updates=entry_data,
+                        reason="reconfigure_successful",
+                    )
 
                 if self._reauth_entry:
                     await self.async_set_unique_id(
@@ -410,6 +441,121 @@ class AtmeexConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 
         return self.async_show_form(
             step_id="reauth_phone_confirm",
+            data_schema=DATA_SCHEMA_REAUTH_PHONE_CONFIRM,
+            errors=errors,
+            description_placeholders={"phone": phone},
+        )
+
+
+    # ---------- reconfigure (user-initiated credential update) ----------
+
+    async def async_step_reconfigure(
+        self, user_input: dict[str, Any] | None = None
+    ) -> FlowResult:
+        """Update credentials for the existing account without re-adding it."""
+        self._reconfigure_entry = self._reconfigure_entry_compat()
+        if self._reconfigure_entry is None:
+            return self.async_abort(reason="reconfigure_failed")
+
+        auth_method = self._reconfigure_entry.data.get(
+            CONF_AUTH_METHOD, AUTH_METHOD_EMAIL
+        )
+        if auth_method == AUTH_METHOD_PHONE:
+            return await self._async_step_reconfigure_phone(user_input)
+        return await self._async_step_reconfigure_email(user_input)
+
+    async def _async_step_reconfigure_email(
+        self, user_input: dict[str, Any] | None = None
+    ) -> FlowResult:
+        """Email reconfigure: validate identity, then credentials."""
+        entry = self._reconfigure_entry
+        assert entry is not None
+        errors: dict[str, str] = {}
+
+        if user_input is not None:
+            email = _clean_email(user_input[CONF_EMAIL])
+            # Identity check BEFORE any network I/O: reconfigure updates the
+            # same account, it must not switch to a different one.
+            if entry.unique_id and _email_unique_id(email) != entry.unique_id:
+                errors["base"] = "account_mismatch"
+            else:
+                password = user_input[CONF_PASSWORD]
+                session = async_get_clientsession(self.hass)
+                api = AtmeexApi(session)
+                if hasattr(api, "async_init"):
+                    await api.async_init()
+                try:
+                    await api.login(email, password)
+                    await api.get_devices()
+                except ApiError as err:
+                    status = getattr(err, "status", None)
+                    errors["base"] = (
+                        "invalid_auth" if status in (401, 403) else "cannot_connect"
+                    )
+                except Exception as err:  # noqa: BLE001
+                    _LOGGER.exception(
+                        "Unexpected error during Atmeex email reconfigure: %s",
+                        type(err).__name__,
+                    )
+                    errors["base"] = "unknown"
+                else:
+                    return self.async_update_reload_and_abort(
+                        entry,
+                        data_updates={
+                            CONF_AUTH_METHOD: AUTH_METHOD_EMAIL,
+                            CONF_EMAIL: email,
+                            CONF_PASSWORD: password,
+                        },
+                        reason="reconfigure_successful",
+                    )
+
+        schema = vol.Schema(
+            {
+                vol.Required(
+                    CONF_EMAIL, default=entry.data.get(CONF_EMAIL, "")
+                ): str,
+                vol.Required(CONF_PASSWORD): str,
+            }
+        )
+        return self.async_show_form(
+            step_id="reconfigure",
+            data_schema=schema,
+            errors=errors,
+        )
+
+    async def _async_step_reconfigure_phone(
+        self, user_input: dict[str, Any] | None = None
+    ) -> FlowResult:
+        """Phone reconfigure: explicit confirm, then reuse the SMS-code path."""
+        entry = self._reconfigure_entry
+        assert entry is not None
+        errors: dict[str, str] = {}
+        phone = entry.data.get(CONF_PHONE, "")
+
+        if user_input is not None:
+            session = async_get_clientsession(self.hass)
+            api = AtmeexApi(session)
+            if hasattr(api, "async_init"):
+                await api.async_init()
+            try:
+                await api.request_sms_code(phone)
+            except ApiError as err:
+                status = getattr(err, "status", None)
+                errors["base"] = (
+                    "invalid_auth" if status in (401, 403) else "cannot_connect"
+                )
+            except Exception as err:  # noqa: BLE001
+                _LOGGER.exception(
+                    "Unexpected error sending reconfigure SMS: %s",
+                    type(err).__name__,
+                )
+                errors["base"] = "unknown"
+            else:
+                self._pending_phone = phone
+                return await self.async_step_phone_code()
+
+        return self.async_show_form(
+            step_id="reconfigure",
             data_schema=DATA_SCHEMA_REAUTH_PHONE_CONFIRM,
             errors=errors,
             description_placeholders={"phone": phone},
