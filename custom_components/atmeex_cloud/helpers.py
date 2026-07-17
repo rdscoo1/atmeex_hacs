@@ -339,22 +339,8 @@ def _normalize_device_state(item: dict[str, Any]) -> dict[str, Any]:
     else:
         pwr = False
 
-    _LOGGER.debug(
-        "Normalize pwr_on: condition=%s, settings=%s, result=%s",
-        pwr_cond,
-        pwr_settings,
-        pwr,
-    )
-
     fan_raw = cond.get("fan_speed")
     u_fan_raw = st.get("u_fan_speed")
-
-    _LOGGER.debug(
-        "Normalize fan_speed: condition.fan_speed=%s, settings.u_fan_speed=%s, pwr=%s",
-        fan_raw,
-        u_fan_raw,
-        pwr,
-    )
 
     if (fan_raw is None or (fan_raw == 0 and pwr)) and u_fan_raw is not None and pwr:
         fan = api_to_fan_speed(u_fan_raw)

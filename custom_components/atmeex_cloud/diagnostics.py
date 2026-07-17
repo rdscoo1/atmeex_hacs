@@ -1,88 +1,128 @@
+"""Whitelist-only diagnostics for the Atmeex Cloud integration.
+
+Diagnostics are assembled from fresh dictionaries containing only known-safe
+fields. We never copy ``entry.data``/``entry.title``, coordinator raw device
+payloads, registry IDs, device names, areas, coordinates, or raw error
+messages — only categories, counts, booleans, and rounded metrics.
+"""
 from __future__ import annotations
 
 from math import isfinite
 from typing import Any
 
-from homeassistant.components.diagnostics import async_redact_data
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.const import CONF_EMAIL, CONF_PASSWORD
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.device_registry import DeviceEntry
-from .const import DOMAIN, CONF_ENABLE_WEBSOCKET, DEFAULT_ENABLE_WEBSOCKET
-from .coordinator import AtmeexCoordinator, AtmeexCoordinatorData
-from . import AtmeexRuntimeData
-from .helpers import serialize_api_error, serialize_api_error_status
 
-# Поля, которые всегда редактируем (удаляем/маскируем) из diagnostics
-TO_REDACT: set[str] = {
-    CONF_EMAIL,
-    CONF_PASSWORD,
-    "access_token",
-    "token",
-    "authorization",
-    "Authorization",
-    "refresh_token",
-}
+from .const import (
+    CONF_AUTH_METHOD,
+    CONF_ENABLE_CO2,
+    CONF_ENABLE_WEBSOCKET,
+    CONF_UPDATE_INTERVAL,
+    DEFAULT_ENABLE_CO2,
+    DEFAULT_ENABLE_WEBSOCKET,
+    DEFAULT_UPDATE_INTERVAL,
+    DOMAIN,
+)
 
 
-def get_diagnostics_snapshot(
-    coordinator: AtmeexCoordinator,
-) -> dict[str, Any]:
-    """Компактный snapshot для диагностики (entities / diagnostics UI).
+def _manifest_version(hass: HomeAssistant) -> str | None:
+    """Best-effort integration version without importing manifest at module top."""
+    try:
+        integration = hass.data["integrations"][DOMAIN]  # type: ignore[index]
+        return getattr(integration, "version", None)
+    except Exception:  # noqa: BLE001 - version is optional context only
+        return None
 
-    Возвращает:
-    - количество устройств;
-    - timestamp последнего успешного обновления (raw + ISO-строка);
-    - последнее сообщение об ошибке API (если есть).
-    """
-    data: AtmeexCoordinatorData = getattr(coordinator, "data", None) or {
-        "devices": [],
-        "states": {},
-    }
-    devices = data.get("devices") or []
 
-    # Метаданные лежат как атрибуты координатора (см. DummyCoordinator в тестах)
-    last_ts = getattr(coordinator, "last_success_ts", None)
+def _int_or_none(value: Any) -> int | None:
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
+def _rounded(value: Any) -> float | None:
+    if isinstance(value, (int, float)) and not isinstance(value, bool) and isfinite(float(value)):
+        return round(float(value), 1)
+    return None
+
+
+def _coordinator_snapshot(coordinator: Any) -> dict[str, Any]:
+    data = getattr(coordinator, "data", None) or {}
+    device_map = data.get("device_map", {}) or {}
+    devices = data.get("devices", []) or []
+    states = data.get("states", {}) or {}
+    if isinstance(device_map, dict) and device_map:
+        device_count = len(device_map)
+    else:
+        device_count = len(devices) if isinstance(devices, list) else 0
     last_error = getattr(coordinator, "last_api_error", None)
-
-    # Читаемый ISO-формат времени последнего успеха
-    last_success_utc: str | None = None
-    if isinstance(last_ts, (int, float)):
-        from datetime import datetime, timezone
-
-        try:
-            last_success_utc = datetime.fromtimestamp(
-                last_ts, tz=timezone.utc
-            ).isoformat()
-        except Exception:  # pragma: no cover — сильно защитный код
-            last_success_utc = None
-
     return {
-        "device_count": len(devices),
-        "last_success_ts": last_ts,
-        "last_success_utc": last_success_utc,
-        "last_api_error": serialize_api_error(last_error),
-        "last_api_error_status": serialize_api_error_status(last_error),
+        "last_update_success": bool(getattr(coordinator, "last_update_success", False)),
+        "device_count": device_count,
+        "state_count": len(states) if isinstance(states, dict) else 0,
+        "avg_latency_ms": _rounded(getattr(coordinator, "avg_latency_ms", None)),
+        "request_retries": _int_or_none(getattr(coordinator, "request_retries", None)),
+        "last_api_error_operation": getattr(last_error, "operation", None),
+        "last_api_error_status": _int_or_none(getattr(last_error, "status", None)),
     }
 
 
-def _get_websocket_snapshot(runtime: AtmeexRuntimeData, options: dict[str, Any]) -> dict[str, Any]:
-    """Return websocket diagnostics snapshot."""
-    ws_manager = getattr(runtime, "websocket_manager", None)
-    configured = bool(options.get(CONF_ENABLE_WEBSOCKET, DEFAULT_ENABLE_WEBSOCKET))
-    ws_age = getattr(ws_manager, "last_message_age", None) if ws_manager is not None else None
-
-    age_seconds: float | None = None
-    if isinstance(ws_age, (int, float)) and isfinite(float(ws_age)):
-        age_seconds = round(float(ws_age), 1)
-
+def _options_snapshot(options: dict[str, Any]) -> dict[str, Any]:
     return {
-        "configured": configured,
+        "update_interval": _int_or_none(
+            options.get(CONF_UPDATE_INTERVAL, DEFAULT_UPDATE_INTERVAL)
+        ),
+        "enable_websocket": bool(
+            options.get(CONF_ENABLE_WEBSOCKET, DEFAULT_ENABLE_WEBSOCKET)
+        ),
+        "enable_co2": bool(options.get(CONF_ENABLE_CO2, DEFAULT_ENABLE_CO2)),
+    }
+
+
+def _websocket_snapshot(runtime: Any, options: dict[str, Any]) -> dict[str, Any]:
+    ws_manager = getattr(runtime, "websocket_manager", None)
+    ws_age = getattr(ws_manager, "last_message_age", None) if ws_manager is not None else None
+    return {
+        "configured": bool(options.get(CONF_ENABLE_WEBSOCKET, DEFAULT_ENABLE_WEBSOCKET)),
         "manager_initialized": ws_manager is not None,
         "is_connected": bool(getattr(ws_manager, "is_connected", False))
         if ws_manager is not None
         else False,
-        "last_message_age_sec": age_seconds,
+        "last_message_age_sec": _rounded(ws_age),
+        "overflow_count": _int_or_none(
+            getattr(runtime, "websocket_overflow_count", None)
+        ),
+    }
+
+
+def get_diagnostics_snapshot(coordinator: Any) -> dict[str, Any]:
+    """Legacy coordinator snapshot for the diagnostics sensor's attributes.
+
+    Kept for backward compatibility with the diagnostic entity. Error strings
+    are already sanitized at their source (typed operation-based messages), so
+    exposing them here carries no raw payload or credential.
+    """
+    from datetime import datetime, timezone
+
+    data = getattr(coordinator, "data", None) or {}
+    devices = data.get("devices") or []
+    last_ts = getattr(coordinator, "last_success_ts", None)
+    last_error = getattr(coordinator, "last_api_error", None)
+
+    last_success_utc: str | None = None
+    if isinstance(last_ts, (int, float)):
+        try:
+            last_success_utc = datetime.fromtimestamp(
+                last_ts, tz=timezone.utc
+            ).isoformat()
+        except Exception:  # pragma: no cover - defensive only
+            last_success_utc = None
+
+    return {
+        "device_count": len(devices) if isinstance(devices, list) else 0,
+        "last_success_ts": last_ts,
+        "last_success_utc": last_success_utc,
+        "last_api_error": str(last_error) if last_error is not None else None,
+        "last_api_error_status": _int_or_none(getattr(last_error, "status", None)),
     }
 
 
@@ -90,43 +130,23 @@ async def async_get_config_entry_diagnostics(
     hass: HomeAssistant,
     entry: ConfigEntry,
 ) -> dict[str, Any]:
-    """Return diagnostics for a config entry.
+    """Whitelist-only config-entry diagnostics."""
+    runtime = entry.runtime_data
+    options = dict(getattr(entry, "options", {}) or {})
+    coordinator = getattr(runtime, "coordinator", None)
+    api = getattr(runtime, "api", None)
 
-    Вызывается Home Assistant при нажатии "Download diagnostics"
-    для всей интеграции (config entry).
-    """
-    runtime: AtmeexRuntimeData = entry.runtime_data
-    coordinator = runtime.coordinator
-    api = runtime.api
-
-    coordinator_data: dict[str, Any] = getattr(coordinator, "data", {}) or {}
-
-    # компактный snapshot по координатору (device_count, last_success_ts, last_api_error)
-    coordinator_diag = get_diagnostics_snapshot(coordinator)
-
-    options = dict(entry.options)
-    diag: dict[str, Any] = {
-        "entry": {
-            "title": entry.title,
-            "data": dict(entry.data),
-            "options": options,
+    return {
+        "integration": {
+            "domain": DOMAIN,
+            "version": _manifest_version(hass),
+            "auth_method": entry.data.get(CONF_AUTH_METHOD, "email"),
         },
-        "coordinator": {
-            "last_update_success": getattr(coordinator, "last_update_success", None),
-            "last_update_success_time": getattr(
-                coordinator, "last_update_success_time", None
-            ),
-            "data": coordinator_data,
-        },
-        "coordinator_diagnostics": coordinator_diag,
-        "api": {
-            # Только факт наличия токена, без самого токена
-            "has_token": bool(getattr(api, "_token", None)) if api is not None else None,
-        },
-        "websocket": _get_websocket_snapshot(runtime, options),
+        "options": _options_snapshot(options),
+        "coordinator": _coordinator_snapshot(coordinator),
+        "api": {"has_token": bool(getattr(api, "token", "")) if api is not None else None},
+        "websocket": _websocket_snapshot(runtime, options),
     }
-
-    return async_redact_data(diag, TO_REDACT)
 
 
 async def async_get_device_diagnostics(
@@ -134,55 +154,40 @@ async def async_get_device_diagnostics(
     entry: ConfigEntry,
     device: DeviceEntry,
 ) -> dict[str, Any]:
-    """Return diagnostics for a single device."""
+    """Whitelist-only per-device diagnostics.
 
-    runtime: AtmeexRuntimeData = entry.runtime_data
-    coordinator = runtime.coordinator
-    options = dict(entry.options)
-    coordinator_data: dict[str, Any] = getattr(coordinator, "data", {}) or {}
-    devices = coordinator_data.get("devices", []) or []
-    states = coordinator_data.get("states", {}) or {}
+    Reports only capability/shape booleans and counters for the device — never
+    its name, area, raw payload, or state values.
+    """
+    runtime = entry.runtime_data
+    options = dict(getattr(entry, "options", {}) or {})
+    coordinator = getattr(runtime, "coordinator", None)
+    data = getattr(coordinator, "data", None) or {}
+    states = data.get("states", {}) or {}
 
-    atmeex_device_id: str | None = None
+    atmeex_id: str | None = None
     for domain, identifier in device.identifiers:
         if domain == DOMAIN:
-            atmeex_device_id = str(identifier)
+            atmeex_id = str(identifier)
             break
 
-    device_info = None
-    device_state = None
-
-    if atmeex_device_id is not None:
-        device_info = next(
-            (d for d in devices if str(d.get("id")) == atmeex_device_id),
-            None,
-        )
-        device_state = states.get(atmeex_device_id)
-
-    coordinator_diag = get_diagnostics_snapshot(coordinator)
-
-    diag: dict[str, Any] = {
-        "entry": {
-            "title": entry.title,
-            "data": dict(entry.data),
-        },
-        "device_entry": {
-            "id": device.id,
-            "name": device.name,
-            "identifiers": list(device.identifiers),
-            "manufacturer": device.manufacturer,
-            "model": device.model,
-            "sw_version": device.sw_version,
-            "hw_version": device.hw_version,
-            "area_id": device.area_id,
-        },
+    state = states.get(atmeex_id, {}) if atmeex_id is not None else {}
+    device_map = data.get("device_map", {}) or {}
+    devices = data.get("devices", []) or []
+    known = atmeex_id is not None and (
+        atmeex_id in device_map
+        or atmeex_id in states
+        or any(str(d.get("id")) == atmeex_id for d in devices if isinstance(d, dict))
+    )
+    return {
+        "integration": {"domain": DOMAIN},
         "device": {
-            "internal_id": atmeex_device_id,
-            "info": device_info,
-            "state": device_state,
+            "known_to_coordinator": known,
+            "has_state": bool(state),
+            "online": bool(state.get("online")) if isinstance(state, dict) else False,
+            "has_humidifier": isinstance(state, dict)
+            and ("hum_stg" in state or "no_water" in state),
         },
-        "coordinator_diagnostics": coordinator_diag,
-        "websocket": _get_websocket_snapshot(runtime, options),
+        "coordinator": _coordinator_snapshot(coordinator),
+        "websocket": _websocket_snapshot(runtime, options),
     }
-
-    return async_redact_data(diag, TO_REDACT)

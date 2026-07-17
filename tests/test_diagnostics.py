@@ -58,19 +58,26 @@ async def test_config_entry_diagnostics(hass):
 
     diag = await async_get_config_entry_diagnostics(hass, entry)
 
-    assert diag["entry"]["title"] == entry.title
-    # убеждаемся, что структура данных координатора протащилась
-    assert diag["coordinator"]["data"]["devices"][0]["id"] == 1
+    # Whitelist-only: no entry.data / entry.title / raw coordinator payload.
+    assert "entry" not in diag
+    assert "data" not in diag.get("coordinator", {})
+    assert diag["integration"]["domain"] == DOMAIN
+    assert diag["coordinator"]["device_count"] == 1
     assert diag["websocket"]["configured"] is True
     assert diag["websocket"]["manager_initialized"] is True
     assert diag["websocket"]["is_connected"] is True
     assert diag["websocket"]["last_message_age_sec"] == 3.2
-    # и что секреты (email/password) отредактированы
-    assert diag["entry"]["data"][CONF_EMAIL] != "user@example.com"
-    assert diag["entry"]["data"][CONF_PASSWORD] != "secret"
+
+    # Nothing private survives anywhere in the payload.
     dumped = json_dumps(diag)
-    assert "SECRET_ACCESS_TOKEN_SENTINEL" not in dumped
-    assert "SECRET_REFRESH_TOKEN_SENTINEL" not in dumped
+    for sentinel in (
+        "user@example.com",
+        "secret",
+        "SECRET_ACCESS_TOKEN_SENTINEL",
+        "SECRET_REFRESH_TOKEN_SENTINEL",
+        "Dev",  # device name must not appear
+    ):
+        assert sentinel not in dumped
 
 
 @pytest.mark.asyncio
@@ -112,12 +119,10 @@ async def test_config_entry_diagnostics_serializes_api_error(hass):
 
     diag = await async_get_config_entry_diagnostics(hass, entry)
 
-    assert (
-        diag["coordinator_diagnostics"]["last_api_error"]
-        == "test_diagnostics: boom (status=500)"
-    )
-    assert diag["coordinator_diagnostics"]["last_api_error_status"] == 500
-    json_dumps(diag)
+    # Only the sanitized operation label + status, never the raw error message.
+    assert diag["coordinator"]["last_api_error_operation"] == "test_diagnostics"
+    assert diag["coordinator"]["last_api_error_status"] == 500
+    assert "boom" not in json_dumps(diag)
 
 
 @pytest.mark.asyncio
@@ -166,11 +171,13 @@ async def test_device_diagnostics(hass):
 
     diag = await async_get_device_diagnostics(hass, entry, device)
 
-    assert diag["device"]["internal_id"] == "1"
-    assert diag["device"]["state"]["pwr_on"] is True
+    # Whitelist-only per-device: capability/shape booleans, no name/state/raw.
+    assert diag["device"]["known_to_coordinator"] is True
+    assert diag["device"]["has_state"] is True
+    assert diag["device"]["online"] is False
+    assert diag["device"]["has_humidifier"] is False
     assert diag["websocket"]["configured"] is True
     assert diag["websocket"]["manager_initialized"] is False
-    assert diag["websocket"]["is_connected"] is False
-    assert diag["websocket"]["last_message_age_sec"] is None
-    # и secret-ы также редактируются
-    assert diag["entry"]["data"][CONF_EMAIL] != "user@example.com"
+    assert "entry" not in diag
+    for sentinel in ("user@example.com", "secret", "Dev"):
+        assert sentinel not in json_dumps(diag)
