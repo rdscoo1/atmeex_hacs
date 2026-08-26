@@ -519,15 +519,6 @@ async def test_preset_mode_reads_from_device_state():
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
-async def test_service_set_breezer_mode_calls_api():
-    """set_breezer_mode delegates to async_set_swing_mode → api.set_breezer_mode."""
-    ent, _cond, api = _make_entity()
-    mode = BREEZER_MODES[1]  # "recirculation"
-    await ent.async_set_breezer_mode(mode)
-    api.set_breezer_mode.assert_awaited_once_with(1, 1)
-
-
-@pytest.mark.asyncio
 async def test_service_set_breezer_mode_all_valid_modes():
     """Every entry in BREEZER_MODES maps to the correct API index."""
     for idx, mode in enumerate(BREEZER_MODES):
@@ -552,14 +543,6 @@ async def test_service_set_breezer_mode_raises_on_api_error():
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
-async def test_service_set_humidifier_stage_calls_api():
-    """set_humidifier_stage calls api.set_humid_stage with the requested stage."""
-    ent, _cond, api = _make_entity({"hum_stg": 0})
-    await ent.async_set_humidifier_stage(2)
-    api.set_humid_stage.assert_awaited_once_with(1, 2)
-
-
-@pytest.mark.asyncio
 async def test_service_set_humidifier_stage_no_humidifier_is_unsupported():
     """When the device has no humidifier, reject the unsupported service."""
     # Remove hum_stg from state so _has_humidifier() returns False
@@ -572,7 +555,7 @@ async def test_service_set_humidifier_stage_no_humidifier_is_unsupported():
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("stage", [0, 3])
+@pytest.mark.parametrize("stage", [0, 2, 3])
 async def test_service_set_humidifier_stage_accepts_boundary_values(stage):
     ent, _cond, api = _make_entity({"hum_stg": 1})
     await ent.async_set_humidifier_stage(stage)
@@ -637,33 +620,16 @@ def test_hvac_mode_truth_table(pwr_on, u_temp_room, damp_pos, expected_mode):
 
 
 @pytest.mark.asyncio
-async def test_set_hvac_mode_heat_from_off_uses_default_20():
-    """HEAT from off with no prior heat temp uses 20.0°C default."""
+async def test_set_hvac_mode_heat_from_off_uses_resolved_heat_target():
+    """HEAT from off powers on, then sends the resolved heat target.
+
+    Target resolution priority (u_temp_room > _last_heat_temp > 20.0) is
+    unit-tested via test_resolve_heat_target_priority below.
+    """
     ent, cond, api, runtime = _make_entity_with_runtime({"pwr_on": False, "u_temp_room": -1000})
     await ent.async_set_hvac_mode(HVACMode.HEAT)
     api.set_power.assert_awaited_once_with(1, True)
     api.set_target_temperature.assert_awaited_once_with(1, 20.0)
-    api.set_power_and_heat.assert_not_awaited()
-
-
-@pytest.mark.asyncio
-async def test_set_hvac_mode_heat_from_off_uses_last_heat_temp():
-    """HEAT from off with a prior heat temp remembered uses that temp."""
-    ent, cond, api, runtime = _make_entity_with_runtime({"pwr_on": False, "u_temp_room": -1000})
-    ent._last_heat_temp = 24.0
-    await ent.async_set_hvac_mode(HVACMode.HEAT)
-    api.set_power.assert_awaited_once_with(1, True)
-    api.set_target_temperature.assert_awaited_once_with(1, 24.0)
-    api.set_power_and_heat.assert_not_awaited()
-
-
-@pytest.mark.asyncio
-async def test_set_hvac_mode_heat_from_off_uses_current_u_temp_room():
-    """HEAT from off with a valid u_temp_room in state uses that temp."""
-    ent, cond, api, runtime = _make_entity_with_runtime({"pwr_on": False, "u_temp_room": 230})
-    await ent.async_set_hvac_mode(HVACMode.HEAT)
-    api.set_power.assert_awaited_once_with(1, True)
-    api.set_target_temperature.assert_awaited_once_with(1, 23.0)
     api.set_power_and_heat.assert_not_awaited()
 
 
@@ -708,20 +674,18 @@ async def test_set_hvac_mode_heat_from_on_calls_set_target_temperature():
     assert pending is not None and pending.value == 220
 
 
-def test_resolve_heat_target_prefers_current_u_temp_room():
-    ent, _, _ = _make_entity({"u_temp_room": 245})
-    assert ent._resolve_heat_target() == pytest.approx(24.5)
-
-
-def test_resolve_heat_target_falls_back_to_last_heat_temp():
-    ent, _, _ = _make_entity({"u_temp_room": -1000})
-    ent._last_heat_temp = 21.0
-    assert ent._resolve_heat_target() == pytest.approx(21.0)
-
-
-def test_resolve_heat_target_defaults_to_20():
-    ent, _, _ = _make_entity({"u_temp_room": -1000})
-    assert ent._resolve_heat_target() == pytest.approx(20.0)
+@pytest.mark.parametrize(
+    ("u_temp_room", "last_heat_temp", "expected"),
+    [
+        (245, None, 24.5),   # valid u_temp_room wins
+        (-1000, 21.0, 21.0), # sentinel falls back to last heat temp
+        (-1000, None, 20.0), # no history defaults to 20
+    ],
+)
+def test_resolve_heat_target_priority(u_temp_room, last_heat_temp, expected):
+    ent, _, _ = _make_entity({"u_temp_room": u_temp_room})
+    ent._last_heat_temp = last_heat_temp
+    assert ent._resolve_heat_target() == pytest.approx(expected)
 
 
 def test_remember_confirmed_heat_target_updates_last_heat_temp():
@@ -759,30 +723,6 @@ async def test_fan_only_from_off_tracks_power_and_heater_fields():
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("call", "field"),
-    [
-        (lambda ent: ent.async_set_temperature(temperature="bad"), "temperature"),
-        (lambda ent: ent.async_set_fan_mode("8"), "fan_mode"),
-        (lambda ent: ent.async_set_swing_mode("bad"), "swing_mode"),
-        (lambda ent: ent.async_set_humidifier_stage(4), "humidifier_stage"),
-    ],
-)
-async def test_climate_invalid_inputs_raise_translated_validation_error(call, field):
-    ent, _cond, api, _runtime = _make_entity_with_runtime()
-
-    with pytest.raises(ServiceValidationError) as raised:
-        await call(ent)
-
-    assert raised.value.translation_key == "invalid_command_value"
-    assert raised.value.translation_placeholders["field"] == field
-    api.set_power.assert_not_awaited()
-    api.set_fan_speed.assert_not_awaited()
-    api.set_breezer_mode.assert_not_awaited()
-    api.set_humid_stage.assert_not_awaited()
-
-
-@pytest.mark.asyncio
 async def test_missing_humidifier_raises_unsupported_feature():
     ent, cond, api, _runtime = _make_entity_with_runtime()
     cond.pop("hum_stg")
@@ -815,6 +755,10 @@ def test_target_temperature_property_is_pure_and_hook_records_target():
         (lambda ent: ent.async_set_temperature(temperature=math.inf), "temperature"),
         (lambda ent: ent.async_set_temperature(temperature=10**10000), "temperature"),
         (lambda ent: ent.async_set_temperature(temperature=object()), "temperature"),
+        (lambda ent: ent.async_set_temperature(temperature="bad"), "temperature"),
+        (lambda ent: ent.async_set_fan_mode("8"), "fan_mode"),
+        (lambda ent: ent.async_set_swing_mode("bad"), "swing_mode"),
+        (lambda ent: ent.async_set_humidifier_stage(4), "humidifier_stage"),
         (lambda ent: ent.async_set_humidity(True), "humidity"),
         (lambda ent: ent.async_set_humidity(math.nan), "humidity"),
         (lambda ent: ent.async_set_humidity(math.inf), "humidity"),

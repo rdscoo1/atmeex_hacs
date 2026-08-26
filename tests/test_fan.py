@@ -88,22 +88,11 @@ async def test_fan_speed_and_power_are_one_command_with_one_refresh(method):
 
 
 @pytest.mark.asyncio
-async def test_fan_rejects_out_of_range_percentage():
-    fan, _cond, api, coordinator = _make_fan_entity()
-
-    with pytest.raises(ServiceValidationError) as raised:
-        await fan.async_set_percentage(101)
-
-    assert raised.value.translation_key == "invalid_command_value"
-    api.set_fan_speed.assert_not_awaited()
-    api.set_power.assert_not_awaited()
-    coordinator.async_request_refresh.assert_not_awaited()
-
-
-@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("method", "percentage"),
     [
+        ("set_percentage", 101),
+        ("turn_on", 0),
         ("set_percentage", True),
         ("turn_on", False),
         ("set_percentage", None),
@@ -172,19 +161,6 @@ async def test_fan_positive_sub_percent_maps_to_minimum_speed(percentage):
     api.set_fan_speed.assert_awaited_once_with(1, 1)
     api.set_power.assert_awaited_once_with(1, True)
     coordinator.async_request_refresh.assert_awaited_once()
-
-
-@pytest.mark.asyncio
-async def test_fan_turn_on_rejects_zero_percentage():
-    fan, _cond, api, coordinator = _make_fan_entity()
-
-    with pytest.raises(ServiceValidationError) as raised:
-        await fan.async_turn_on(percentage=0)
-
-    assert raised.value.translation_key == "invalid_command_value"
-    api.set_fan_speed.assert_not_awaited()
-    api.set_power.assert_not_awaited()
-    coordinator.async_request_refresh.assert_not_awaited()
 
 
 @pytest.mark.asyncio

@@ -1332,132 +1332,103 @@ async def test_websocket_equivalent_delta_does_not_publish_but_touches_revision(
     assert update.changed is False
     assert runtime.state_store.data["states"]["1"]["pwr_on"] is True
 
-async def test_apply_condition_update_sets_online_always_true(monkeypatch):
-    """A WS condition message always marks the device as online, even without a time field."""
-    runtime, cb, _hass = await _build_ws_runtime(
-        monkeypatch, initial_condition={"online": False}
-    )
+@pytest.mark.parametrize(
+    ("initial_condition", "condition", "expected"),
+    [
+        pytest.param(
+            {"online": False},
+            {"pwr_on": 0},
+            {"online": True},
+            id="always-marks-online-even-without-time",
+        ),
+        pytest.param(None, {"no_water": 1}, {"no_water": True}, id="no-water-extracted"),
+        pytest.param(
+            {"fan_speed": 5, "damp_pos": 3},
+            {"pwr_on": 0},
+            # fan_speed API 5 → HA 6; absent fields must stay untouched
+            {"pwr_on": False, "fan_speed": 6, "damp_pos": 3},
+            id="absent-fields-not-overwritten",
+        ),
+        pytest.param(
+            None,
+            {"time": "2026-01-27 21:24:15"},
+            {"time": "2026-01-27 21:24:15"},
+            id="time-propagated-as-is",
+        ),
+    ],
+)
+async def test_ws_condition_update_normalizes_into_state(
+    monkeypatch, initial_condition, condition, expected
+):
+    kwargs = {} if initial_condition is None else {"initial_condition": initial_condition}
+    runtime, cb, _hass = await _build_ws_runtime(monkeypatch, **kwargs)
     await _fire_and_drain(
         runtime, cb,
-        {"type": "condition", "data": [{"id": 1, "condition": {"pwr_on": 0}}]},
-    )
-    assert runtime.coordinator.data["states"]["1"]["online"] is True
-
-async def test_apply_condition_update_no_water_field(monkeypatch):
-    """no_water is correctly extracted from a condition message."""
-    runtime, cb, _hass = await _build_ws_runtime(monkeypatch)
-    await _fire_and_drain(
-        runtime, cb,
-        {"type": "condition", "data": [{"id": 1, "condition": {"no_water": 1}}]},
-    )
-    assert runtime.coordinator.data["states"]["1"]["no_water"] is True
-
-async def test_apply_condition_update_only_present_fields_changed(monkeypatch):
-    """Fields absent from the condition payload are NOT overwritten."""
-    runtime, cb, _hass = await _build_ws_runtime(
-        monkeypatch, initial_condition={"fan_speed": 5, "damp_pos": 3}
-    )
-    # Send a message that only changes pwr_on — fan_speed and damp_pos must stay
-    await _fire_and_drain(
-        runtime, cb,
-        {"type": "condition", "data": [{"id": 1, "condition": {"pwr_on": 0}}]},
+        {"type": "condition", "data": [{"id": 1, "condition": condition}]},
     )
     state = runtime.coordinator.data["states"]["1"]
-    assert state["pwr_on"] is False
-    assert state["fan_speed"] == 6   # API 5 → HA 6 (unchanged)
-    assert state["damp_pos"] == 3    # unchanged
+    for key, value in expected.items():
+        assert state[key] == value
+        assert isinstance(state[key], bool) is isinstance(value, bool)
 
-async def test_apply_condition_update_time_field_propagated(monkeypatch):
-    """The 'time' field from a condition message is stored as-is."""
-    runtime, cb, _hass = await _build_ws_runtime(monkeypatch)
-    ts = "2026-01-27 21:24:15"
+
+@pytest.mark.parametrize(
+    ("initial_condition", "settings", "expected"),
+    [
+        pytest.param(
+            {"pwr_on": 1, "fan_speed": 2},
+            {"u_fan_speed": 4},
+            # API 4 → HA 5; fan_speed synced because device is on
+            {"u_fan_speed": 5, "fan_speed": 5},
+            id="fan-speed-synced-when-on",
+        ),
+        pytest.param(
+            {"pwr_on": 0, "fan_speed": 3},
+            {"u_fan_speed": 4},
+            # u_fan_speed updated, fan_speed (API 3 → HA 4) NOT overwritten while off
+            {"u_fan_speed": 5, "fan_speed": 4},
+            id="fan-speed-not-synced-when-off",
+        ),
+        pytest.param(
+            {"pwr_on": 0, "fan_speed": 2},
+            {"u_pwr_on": 1, "u_fan_speed": 4},
+            # fan_speed follows the new power state within one payload
+            {"pwr_on": True, "u_fan_speed": 5, "fan_speed": 5},
+            id="power-and-speed-in-single-payload",
+        ),
+        pytest.param(
+            None,
+            {"u_pwr_on": 0, "u_temp_room": "215", "u_hum_stg": 3, "u_damp_pos": 2},
+            {
+                "pwr_on": False,
+                "u_temp_room": 215,
+                "hum_stg": 3,
+                "damp_pos": 2,
+                "online": True,
+            },
+            id="all-settings-fields-applied",
+        ),
+        pytest.param(
+            {"online": False},
+            {"u_pwr_on": 1},
+            {"online": True},
+            id="always-marks-online",
+        ),
+    ],
+)
+async def test_ws_settings_update_normalizes_into_state(
+    monkeypatch, initial_condition, settings, expected
+):
+    kwargs = {} if initial_condition is None else {"initial_condition": initial_condition}
+    runtime, cb, _hass = await _build_ws_runtime(monkeypatch, **kwargs)
     await _fire_and_drain(
         runtime, cb,
-        {"type": "condition", "data": [{"id": 1, "condition": {"time": ts}}]},
-    )
-    assert runtime.coordinator.data["states"]["1"]["time"] == ts
-
-async def test_apply_settings_update_fan_speed_synced_when_pwr_on(monkeypatch):
-    """fan_speed in state is synced from u_fan_speed when the device is on."""
-    runtime, cb, _hass = await _build_ws_runtime(
-        monkeypatch, initial_condition={"pwr_on": 1, "fan_speed": 2}
-    )
-    await _fire_and_drain(
-        runtime, cb,
-        {"type": "settings", "data": [{"id": 1, "settings": {"u_fan_speed": 4}}]},
+        {"type": "settings", "data": [{"id": 1, "settings": settings}]},
     )
     state = runtime.coordinator.data["states"]["1"]
-    assert state["u_fan_speed"] == 5   # API 4 → HA 5
-    assert state["fan_speed"] == 5     # synced because pwr_on=True
-
-async def test_apply_settings_update_fan_speed_not_synced_when_pwr_off(monkeypatch):
-    """fan_speed in state is NOT touched when the device is off."""
-    runtime, cb, _hass = await _build_ws_runtime(
-        monkeypatch, initial_condition={"pwr_on": 0, "fan_speed": 3}
-    )
-    await _fire_and_drain(
-        runtime, cb,
-        {"type": "settings", "data": [{"id": 1, "settings": {"u_fan_speed": 4}}]},
-    )
-    state = runtime.coordinator.data["states"]["1"]
-    assert state["u_fan_speed"] == 5   # u_fan_speed updated
-    assert state["fan_speed"] == 4     # API 3 → HA 4 (NOT overwritten by u_fan_speed)
-
-async def test_apply_settings_update_power_and_speed_in_single_payload(monkeypatch):
-    """When payload contains u_pwr_on and u_fan_speed, fan_speed follows new power state."""
-    runtime, cb, _hass = await _build_ws_runtime(
-        monkeypatch, initial_condition={"pwr_on": 0, "fan_speed": 2}
-    )
-    await _fire_and_drain(
-        runtime,
-        cb,
-        {
-            "type": "settings",
-            "data": [{"id": 1, "settings": {"u_pwr_on": 1, "u_fan_speed": 4}}],
-        },
-    )
-    state = runtime.coordinator.data["states"]["1"]
-    assert state["pwr_on"] is True
-    assert state["u_fan_speed"] == 5
-    assert state["fan_speed"] == 5
-
-async def test_apply_settings_update_all_fields(monkeypatch):
-    """All settings fields (u_temp_room, u_hum_stg, u_damp_pos, u_pwr_on) are applied."""
-    runtime, cb, _hass = await _build_ws_runtime(monkeypatch)
-    await _fire_and_drain(
-        runtime, cb,
-        {
-            "type": "settings",
-            "data": [
-                {
-                    "id": 1,
-                    "settings": {
-                        "u_pwr_on": 0,
-                        "u_temp_room": "215",
-                        "u_hum_stg": 3,
-                        "u_damp_pos": 2,
-                    },
-                }
-            ],
-        },
-    )
-    state = runtime.coordinator.data["states"]["1"]
-    assert state["pwr_on"] is False
-    assert state["u_temp_room"] == 215
-    assert state["hum_stg"] == 3
-    assert state["damp_pos"] == 2
-    assert state["online"] is True
-
-async def test_apply_settings_update_sets_online_true(monkeypatch):
-    """A settings update always marks the device as online."""
-    runtime, cb, _hass = await _build_ws_runtime(
-        monkeypatch, initial_condition={"online": False}
-    )
-    await _fire_and_drain(
-        runtime, cb,
-        {"type": "settings", "data": [{"id": 1, "settings": {"u_pwr_on": 1}}]},
-    )
-    assert runtime.coordinator.data["states"]["1"]["online"] is True
+    for key, value in expected.items():
+        assert state[key] == value
+        assert isinstance(state[key], bool) is isinstance(value, bool)
 
 async def test_refresh_device_coalesces_parallel_requests(monkeypatch):
     created_apis = []

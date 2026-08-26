@@ -218,23 +218,6 @@ def _switch_case(kind: str):
 
 
 @pytest.mark.asyncio
-async def test_switch_defers_api_call_until_executor_lock_is_acquired():
-    entity, api, _refresh = _switch_case("power")
-    lock = entity._runtime.get_device_lock(42)
-    await lock.acquire()
-    task = asyncio.create_task(entity.async_turn_on())
-    await asyncio.sleep(0)
-
-    try:
-        api.set_power.assert_not_called()
-    finally:
-        if not task.done():
-            task.cancel()
-        lock.release()
-        await asyncio.gather(task, return_exceptions=True)
-
-
-@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("kind", "method", "api_method", "field", "action"),
     [

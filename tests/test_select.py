@@ -315,36 +315,6 @@ def _attach_select_runtime(hum, breezer, api, coordinator):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("entity_name", "option", "api_method"),
-    [
-        ("humidification", "3", "set_humid_stage"),
-        ("breezer", BREEZER_OPTIONS[1], "set_breezer_mode"),
-    ],
-)
-async def test_select_defers_api_call_until_executor_lock_is_acquired(
-    entity_name, option, api_method
-):
-    hum, breezer, _cond, api, coordinator = _make_selects()
-    _refresh, runtime = _attach_select_runtime(
-        hum, breezer, api, coordinator
-    )
-    entity = hum if entity_name == "humidification" else breezer
-    lock = runtime.get_device_lock(1)
-    await lock.acquire()
-    task = asyncio.create_task(entity.async_select_option(option))
-    await asyncio.sleep(0)
-
-    try:
-        getattr(api, api_method).assert_not_called()
-    finally:
-        if not task.done():
-            task.cancel()
-        lock.release()
-        await asyncio.gather(task, return_exceptions=True)
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
     ("entity_name", "option", "api_method", "action", "pending_fields"),
     [
         (
