@@ -124,8 +124,15 @@ class AtmeexConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     def async_get_options_flow(
         config_entry: ConfigEntry,
     ) -> AtmeexOptionsFlowHandler:
-        """Return the options flow handler."""
-        return AtmeexOptionsFlowHandler()
+        """Return the options flow handler.
+
+        The entry must be attached here: HA's OptionsFlowManager never sets
+        ``_config_entry`` on the handler, and cores older than 2024.11 have no
+        ``config_entry`` property of their own to fall back on.
+        """
+        handler = AtmeexOptionsFlowHandler()
+        handler._config_entry = config_entry
+        return handler
 
     # ---------- step routing ----------
 
@@ -565,13 +572,14 @@ class AtmeexConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 class AtmeexOptionsFlowHandler(config_entries.OptionsFlow):
     """Options flow handler for Atmeex Cloud.
 
-    Modern HA provides ``self.config_entry`` automatically — no need to
-    accept it in ``__init__``.
+    ``async_get_options_flow`` attaches ``_config_entry`` explicitly; the
+    property below resolves it on HA versions with and without the core
+    ``OptionsFlow.config_entry`` property (added in 2024.11).
     """
 
     @property
     def config_entry(self) -> ConfigEntry:
-        """Return the config entry. Shim for HA versions prior to 2024.x."""
+        """Return the config entry attached by ``async_get_options_flow``."""
         return self._config_entry  # type: ignore[attr-defined]
 
     async def async_step_init(self, user_input: dict[str, Any] | None = None) -> FlowResult:

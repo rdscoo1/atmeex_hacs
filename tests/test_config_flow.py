@@ -10,6 +10,7 @@ from custom_components.atmeex_cloud.config_flow import _clean_phone, _email_uniq
 from custom_components.atmeex_cloud.api import ApiError
 from custom_components.atmeex_cloud.const import (
     DOMAIN,
+    CONF_ENABLE_CO2,
     CONF_ENABLE_WEBSOCKET,
     CONF_UPDATE_INTERVAL,
     DEFAULT_ENABLE_WEBSOCKET,
@@ -406,6 +407,42 @@ async def test_options_flow_show_form_with_current_values():
 
     assert result["type"] == data_entry_flow.FlowResultType.FORM
     assert result["step_id"] == "init"
+
+
+@pytest.mark.asyncio
+async def test_options_flow_via_flow_manager_resolves_config_entry(
+    hass, enable_custom_integrations
+):
+    """Drive the options flow through HA's real OptionsFlowManager.
+
+    The manager builds the handler via ``async_get_options_flow(entry)`` and
+    never sets ``_config_entry`` itself, so the handler must attach the entry
+    on its own. Regression test for a Configure dialog that crashed with
+    AttributeError on the production path.
+    """
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        entry_id="entry-options-manager",
+        data={CONF_AUTH_METHOD: AUTH_METHOD_EMAIL},
+        options={CONF_UPDATE_INTERVAL: 45},
+    )
+    entry.add_to_hass(hass)
+
+    result = await hass.config_entries.options.async_init(entry.entry_id)
+    assert result["type"] == data_entry_flow.FlowResultType.FORM
+    assert result["step_id"] == "init"
+
+    result = await hass.config_entries.options.async_configure(
+        result["flow_id"],
+        user_input={
+            CONF_UPDATE_INTERVAL: 60,
+            CONF_ENABLE_WEBSOCKET: False,
+            CONF_ENABLE_CO2: True,
+        },
+    )
+    assert result["type"] == data_entry_flow.FlowResultType.CREATE_ENTRY
+    assert entry.options[CONF_UPDATE_INTERVAL] == 60
+    assert entry.options[CONF_ENABLE_WEBSOCKET] is False
 
 
 @pytest.mark.asyncio
