@@ -1,5 +1,7 @@
 # Testing Patterns
 
+> ⚠️ **Stale (2026-07-17):** this document predates the state-store / command-executor rework (v0.10.0). Concurrency is now handled by per-field revisions in `state_store.py`; commands run through `command_executor.py`. See `CLAUDE.md` and `CONCERNS.md` (addendum) for current facts; where this file disagrees with the code, the code wins.
+
 **Analysis Date:** 2026-05-02
 
 ## Test Framework

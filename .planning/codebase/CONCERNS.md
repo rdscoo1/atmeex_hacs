@@ -3,6 +3,7 @@
 **Analysis Date:** 2026-05-02
 **Validated:** 2026-05-02 — full code review completed, all findings resolved
 **Previous audit:** 2026-03-28
+**Addendum:** 2026-07-17 — pre-release review of the state-store rework (see bottom). Entries above the addendum describe the pre-rework architecture; several mechanisms they reference (timestamp dicts, `state_update_lock`) were replaced by per-field revisions in `state_store.py`.
 
 ---
 
@@ -81,6 +82,8 @@ Boolean flag was set to `True` on first WS auth failure and never reset, silentl
 **Fix:** Replaced with `ws_reauth_last_ts: float = float("-inf")` and a `_WS_REAUTH_COOLDOWN_SEC = 300.0` throttle. Subsequent failures after the cooldown re-trigger the reauth flow.
 
 **Files changed:** `__init__.py`
+
+**Superseded 2026-07-17:** the state-store rework deliberately replaced the cooldown with strict one-shot reauth per loaded runtime (`test_websocket_reauth_is_one_shot` pins it across the former 300 s boundary). Rationale: HTTP polling independently raises `ConfigEntryAuthFailed` on genuine credential failure, which re-prompts via HA's coordinator machinery, so the WS-side prompt no longer needs to repeat. See the addendum for the accepted residual.
 
 ---
 
@@ -274,5 +277,45 @@ The following items were verified against current code and remain correctly reso
 
 ---
 
-*Concerns audit: 2026-05-02*
-*All 21 concerns resolved (3 original + 17 code review + 1 follow-up cleanup)*
+## Addendum — 2026-07-17 pre-release review (state-store rework, v0.10.0)
+
+Full-integration review of the 25 commits since v0.9.5.
+
+### ~~HIGH: Options ("Configure") dialog crashed on the production path~~ FIXED
+
+`AtmeexOptionsFlowHandler.config_entry` returned `self._config_entry`, which nothing on the production path set — HA's `OptionsFlowManager` builds the handler via `async_get_options_flow(entry)` and never sets that attribute, and the override shadowed core's own property. Opening Configure raised `AttributeError` on every supported HA version. The unit tests masked it by injecting `flow._config_entry` manually.
+
+**Fix:** `async_get_options_flow` now attaches `handler._config_entry = config_entry`. New regression test `test_options_flow_via_flow_manager_resolves_config_entry` drives the flow through HA's real `OptionsFlowManager`.
+
+**Files changed:** `config_flow.py`, `tests/test_config_flow.py`
+
+### ~~MEDIUM: Release shipped without a version bump~~ FIXED
+
+`manifest.json` and `const.INTEGRATION_VERSION` both still said `0.9.5` (the released tag) after ~24k changed lines. Bumped to **0.10.0**; `tests/test_manifest.py` now fails if the two version locations ever drift; the User-Agent assertions in `test_api.py` derive from `INTEGRATION_VERSION` instead of a literal.
+
+**Files changed:** `manifest.json`, `const.py`, `tests/test_manifest.py` (new), `tests/test_api.py`
+
+### ~~MEDIUM: Anonymized log labels were dead code~~ FIXED
+
+Commit `cae5b9d` added `privacy.anonymous_device_label` but never wired it in; `__init__.py` logged raw device IDs. The targeted-refresh warning and the `set_fan_speed` debug line now use the label; `test_unexpected_refresh_failure_is_private_pending_and_recovered` asserts the label (and the absence of the raw ID) in the log text.
+
+**Files changed:** `__init__.py`, `api.py`, `tests/test_refresh_device.py`
+
+### ~~LOW: Unused `_inventory_refresh_lock`~~ FIXED
+
+Created in `AtmeexCoordinator.__init__`, never acquired. Removed.
+
+### ~~MEDIUM: CLAUDE.md / planning docs described the pre-rework architecture~~ FIXED
+
+CLAUDE.md's concurrency section documented the removed timestamp-dict mechanism as "the single mechanism" and required stale DummyCoordinator attributes. Rewritten for the per-field revision model; stale-notice added for the other `.planning/codebase/` docs.
+
+### Accepted / documented (no code change)
+
+- **WS reauth is one-shot per runtime** — deliberate re-design of the 2026-05-02 cooldown (see superseded note above). Residual: a *transient* WS-only 401 storm leaves the WebSocket disabled (polling-only) until reload, with a single possibly-spurious reauth prompt. Accepted: genuine credential failure re-prompts through polling's `ConfigEntryAuthFailed`, and keeping the manager alive would retry sign-in with known-bad credentials.
+- **Forward-compat coverage** — tests run against `homeassistant==2025.1.4`. Recommendation stands: a CI job that runs the suite against the latest `pytest-homeassistant-custom-component`/HA to catch API drift (the options-flow bug was exactly this class).
+- **Minor:** `climate.hvac_mode` reads `damp_pos` without the pending overlay (brief HEAT/FAN_ONLY flicker after a swing-mode command); `command_executor` monkey-patches `asyncio.Lock.release` and reads the private `_waiters` attribute (well-tested, but revisit on CPython upgrades); `runtime.py`/`sensor.py` still carry migration shims.
+
+---
+
+*Concerns audit: 2026-05-02; addendum 2026-07-17*
+*All 21 pre-rework concerns resolved (3 original + 17 code review + 1 follow-up cleanup); addendum: 5 fixed, 3 accepted/documented*
