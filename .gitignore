@@ -8,3 +8,11 @@ __pycache__/
 .ruff_cache
 .venv
 .vscode
+
+### Tooling & generated artifacts ###
+.coverage
+.pytest_cache/
+.ruff_cache/
+.claude/
+.serena/
+repomix-output.xml
