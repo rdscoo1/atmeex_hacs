@@ -113,7 +113,6 @@ class AtmeexCoordinator(DataUpdateCoordinator[AtmeexCoordinatorData]):
         self.avg_latency_ms: float | None = None
         self.request_retries = 0
         self._max_inventory_age_seconds = update_interval.total_seconds()
-        self._inventory_refresh_lock = asyncio.Lock()
         self._fire_logbook_event = fire_logbook_event
         self._api_error_last_ts = float("-inf")
         self._api_error_suppressed = 0
