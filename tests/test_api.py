@@ -22,7 +22,10 @@ from custom_components.atmeex_cloud.api import (
 from custom_components.atmeex_cloud.const import (
     API_AUTH_TIMEOUT_SEC,
     API_REQUEST_TIMEOUT_SEC,
+    INTEGRATION_VERSION,
 )
+
+EXPECTED_USER_AGENT = f"AtmeexCloudHomeAssistant/{INTEGRATION_VERSION}"
 
 
 def test_typed_api_errors_expose_only_sanitized_context():
@@ -531,7 +534,7 @@ async def test_user_agent_header_set_on_signin():
     await api.login("user@example.com", "pwd")
 
     _method, _url, _payload, headers, timeout = session.requests[0]
-    assert headers["User-Agent"] == "AtmeexCloudHomeAssistant/0.9.5"
+    assert headers["User-Agent"] == EXPECTED_USER_AGENT
 
 
 @pytest.mark.asyncio
@@ -546,7 +549,7 @@ async def test_user_agent_header_set_on_authorized_requests():
     await api.get_devices()
 
     _method, _url, _payload, headers, timeout = session.requests[0]
-    assert headers["User-Agent"] == "AtmeexCloudHomeAssistant/0.9.5"
+    assert headers["User-Agent"] == EXPECTED_USER_AGENT
 
 
 @pytest.mark.asyncio
@@ -562,7 +565,7 @@ async def test_request_sms_code_posts_signup_with_phone_code_grant():
     assert method == "POST"
     assert url == f"{API_BASE_URL}/auth/signup"
     assert payload == {"grant_type": "phone_code", "phone": "+79991234567"}
-    assert headers["User-Agent"] == "AtmeexCloudHomeAssistant/0.9.5"
+    assert headers["User-Agent"] == EXPECTED_USER_AGENT
 
 
 @pytest.mark.asyncio
