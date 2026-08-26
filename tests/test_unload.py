@@ -366,17 +366,31 @@ async def test_unload_hung_task_is_bounded_and_retained_for_diagnostics(
 ):
     runtime, entry, hass = _loaded_runtime(unload_result=True)
     gate = asyncio.Event()
+    entered = asyncio.Event()
 
     async def hung_task():
         try:
+            entered.set()
             await asyncio.Event().wait()
         finally:
-            await gate.wait()
+            # Unload cancels this task more than once: it is registered both
+            # as websocket_start_task and in runtime.tasks. Stay pending
+            # across every cancellation until the test opens the gate, so
+            # "exceeded the unload timeout" is what actually gets exercised.
+            while not gate.is_set():
+                try:
+                    await gate.wait()
+                except asyncio.CancelledError:
+                    pass
 
     task = runtime.track_task(asyncio.create_task(hung_task()))
     runtime.websocket_start_task = task
     runtime.refresh_tasks["1"] = task
-    await asyncio.sleep(0)
+    # Wait for the body to actually reach its suspension point. A bare
+    # sleep(0) is not enough on every Python version: if the task is still
+    # unstarted when unload cancels it, the try block never runs and the
+    # task finishes immediately instead of hanging.
+    await entered.wait()
     monkeypatch.setattr(atmeex_init, "_UNLOAD_TASK_TIMEOUT_SEC", 0.01)
 
     try:

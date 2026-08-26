@@ -797,7 +797,19 @@ async def _build_ws_runtime(monkeypatch, *, initial_condition=None):
     return runtime, _callbacks[0], hass
 
 
-@pytest.mark.parametrize("eager_tasks", [False, True])
+@pytest.mark.parametrize(
+    "eager_tasks",
+    [
+        False,
+        pytest.param(
+            True,
+            marks=pytest.mark.skipif(
+                not hasattr(asyncio, "eager_task_factory"),
+                reason="eager task factory requires Python 3.12+",
+            ),
+        ),
+    ],
+)
 async def test_burst_coalesces_later_fields_into_one_publication(
     monkeypatch,
     eager_tasks,

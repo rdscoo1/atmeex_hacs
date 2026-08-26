@@ -937,6 +937,10 @@ async def test_cleanup_bounds_websocket_disconnect(monkeypatch):
 
 
 @pytest.mark.asyncio
+@pytest.mark.skipif(
+    not hasattr(asyncio, "eager_task_factory"),
+    reason="eager task startup only happens on Python 3.12+",
+)
 async def test_listener_failure_cleans_eager_completed_startup(monkeypatch):
     entry, hass, manager = _setup_lifecycle_fakes(monkeypatch, [])
     loop = asyncio.get_running_loop()
