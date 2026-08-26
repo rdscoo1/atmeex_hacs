@@ -48,6 +48,7 @@ from .helpers import (
 )
 from .command_executor import AtmeexCommandExecutor, PendingCommand
 from .compat import async_create_background_task
+from .privacy import anonymous_device_label
 from .state_store import AtmeexStateStore
 
 _LOGGER = logging.getLogger(__name__)
@@ -339,7 +340,11 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         err: AtmeexApiError,
     ) -> None:
         """Publish one safe failure and schedule authoritative recovery."""
-        _LOGGER.warning("Failed to refresh device %s: %s", device_id, err)
+        _LOGGER.warning(
+            "Failed to refresh %s: %s",
+            anonymous_device_label(device_id),
+            err,
+        )
         coordinator._fire_api_error_event(
             {
                 "message": str(err),

@@ -22,6 +22,7 @@ from .helpers import (
     normalize_device_id,
     parse_atmeex_bool,
 )
+from .privacy import anonymous_device_label
 from .const import (
     API_AUTH_TIMEOUT_SEC,
     API_BASE_URL,
@@ -860,7 +861,7 @@ class AtmeexApi:
         
         _LOGGER.debug(
             "API set_fan_speed: device=%s HA_speed=%s → API_speed=%s",
-            device_id, speed_int, api_speed
+            anonymous_device_label(device_id), speed_int, api_speed
         )
         
         body = {"u_fan_speed": api_speed}

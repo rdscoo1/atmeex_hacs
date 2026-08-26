@@ -554,6 +554,12 @@ async def test_unexpected_refresh_failure_is_private_pending_and_recovered(
     assert payload["message"] == "get_device: unexpected client failure"
     assert secret not in caplog.text
     assert secret not in repr(hass.bus.async_fire.call_args_list)
+    # The warning must correlate the device via its anonymized label, never
+    # the raw cloud device ID.
+    from custom_components.atmeex_cloud.privacy import anonymous_device_label
+
+    assert f"Failed to refresh {anonymous_device_label(1)}" in caplog.text
+    assert "Failed to refresh device 1" not in caplog.text
 
 
 @pytest.mark.asyncio
