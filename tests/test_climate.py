@@ -939,9 +939,9 @@ async def test_temperature_avoids_compound_write_after_stale_power_on_confirmati
     release_first_confirmation.set()
     await asyncio.gather(first, queued)
 
-    # The first power-on succeeded (its pending value is still live), so the
-    # queued command does not repeat it.
-    assert api.set_power.await_args_list == [call(1, True)]
+    # The first confirmation failed, so the stored targets are untrusted and
+    # the queued command asserts power again.
+    assert api.set_power.await_args_list == [call(1, True), call(1, True)]
     assert api.set_target_temperature.await_args_list == [
         call(1, 20.0),
         call(1, 23.0),

@@ -1006,7 +1006,7 @@ async def test_settled_value_ignores_own_and_newer_generations():
 
 
 @pytest.mark.asyncio
-async def test_last_write_failed_until_next_success():
+async def test_targets_untrusted_until_a_confirmed_success():
     executor = AtmeexCommandExecutor(AsyncMock())
 
     async def failing() -> None:
@@ -1016,9 +1016,50 @@ async def test_last_write_failed_until_next_success():
         await executor.async_execute(
             1, failing, pending={"pwr_on": True}, translation_key="command_failed"
         )
-    assert executor.last_write_failed(1) is True
+    assert executor.targets_untrusted(1) is True
 
     await executor.async_execute(
         1, AsyncMock(), pending={"pwr_on": True}, translation_key="command_failed"
     )
-    assert executor.last_write_failed(1) is False
+    assert executor.targets_untrusted(1) is False
+
+
+@pytest.mark.asyncio
+async def test_is_busy_while_operation_runs_past_pending_expiry():
+    executor = AtmeexCommandExecutor(AsyncMock(), pending_ttl=0.01)
+    release = asyncio.Event()
+
+    async def slow() -> None:
+        await release.wait()
+
+    task = asyncio.create_task(
+        executor.async_execute(
+            1, slow, pending={"fan_speed": 5}, translation_key="command_failed"
+        )
+    )
+    await asyncio.sleep(0.05)
+
+    assert executor.has_pending(1) is False
+    assert executor.is_busy(1) is True
+
+    release.set()
+    await task
+    assert executor.is_busy(1) is False
+
+
+@pytest.mark.asyncio
+async def test_failed_confirmation_leaves_targets_untrusted():
+    refresh = AsyncMock(
+        side_effect=[ApiError("get_device", "confirmation failed", status=503), None]
+    )
+    executor = AtmeexCommandExecutor(refresh)
+
+    assert not await executor.async_execute(
+        1, AsyncMock(), pending={"pwr_on": True}, translation_key="command_failed"
+    )
+    assert executor.targets_untrusted(1) is True
+
+    assert await executor.async_execute(
+        1, AsyncMock(), pending={"pwr_on": True}, translation_key="command_failed"
+    )
+    assert executor.targets_untrusted(1) is False

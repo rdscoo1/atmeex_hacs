@@ -10,6 +10,7 @@ from custom_components.atmeex_cloud import AtmeexRuntimeData
 from custom_components.atmeex_cloud.fan import AtmeexFanEntity
 from custom_components.atmeex_cloud.fan import async_setup_entry
 from custom_components.atmeex_cloud.api import ApiError, AtmeexDevice
+from custom_components.atmeex_cloud.command_executor import AtmeexCommandExecutor
 
 
 def _make_fan_entity():
@@ -302,3 +303,51 @@ async def test_fan_repeated_identical_speed_sends_nothing():
     api.set_fan_speed.assert_not_awaited()
     api.set_power.assert_not_awaited()
     coordinator.async_request_refresh.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_fan_identical_speed_is_sent_while_slow_command_outlives_pending():
+    fan, api, coordinator = _fan_with_targets(u_pwr_on=True, u_fan_speed=2)
+
+    async def refresh(_device_id):
+        # The confirmation GET reports the target the cloud now stores.
+        coordinator.data["device_map"] = {
+            "1": AtmeexDevice.from_raw(
+                {"id": 1, "online": True, "condition": {},
+                 "settings": {"u_pwr_on": True, "u_fan_speed": sent[-1] - 1}}
+            )
+        }
+
+    fan._fallback_command_executor = AtmeexCommandExecutor(
+        refresh, pending_ttl=0.01
+    )
+    release = asyncio.Event()
+    sent: list[int] = []
+
+    async def set_fan_speed(_device_id, speed):
+        sent.append(speed)
+        if speed == 5:
+            await release.wait()
+
+    api.set_fan_speed.side_effect = set_fan_speed
+
+    slow = asyncio.create_task(fan.async_set_percentage(75))  # speed 5
+    await asyncio.sleep(0.05)  # its pending value has expired, PUT still open
+    # Matches the stored target, but the in-flight write will change it.
+    queued = asyncio.create_task(fan.async_set_percentage(43))  # speed 3
+    await asyncio.sleep(0)
+    release.set()
+    await asyncio.gather(slow, queued)
+
+    assert sent == [5, 3]
+
+
+@pytest.mark.asyncio
+async def test_fan_malformed_speed_target_counts_as_missing():
+    fan, api, _coordinator = _fan_with_targets(u_pwr_on=True, u_fan_speed="bogus")
+
+    # A lenient converter would read garbage as speed 1 and skip this write.
+    await fan.async_set_percentage(14)  # speed 1
+
+    api.set_fan_speed.assert_awaited_once_with(1, 1)
+    api.set_power.assert_not_awaited()

@@ -13,12 +13,25 @@ from .command_executor import (
     RecoveryRefresh,
 )
 from .const import DOMAIN
-from .helpers import api_to_fan_speed, parse_atmeex_bool
+from .helpers import parse_atmeex_bool
+
+
+def _api_fan_target(value: Any) -> int:
+    """Strictly convert a stored API fan speed (0..6) to the HA scale (1..7).
+
+    Malformed or out-of-range targets raise, so they count as missing and the
+    requested speed is sent.
+    """
+    speed = int(value)
+    if not 0 <= speed <= 6:
+        raise ValueError(value)
+    return speed + 1
+
 
 # State field -> (cloud settings key, converter into the state field's scale).
 _SETTING_FOR_FIELD: dict[str, tuple[str, Callable[[Any], Any]]] = {
     "pwr_on": ("u_pwr_on", parse_atmeex_bool),
-    "fan_speed": ("u_fan_speed", api_to_fan_speed),
+    "fan_speed": ("u_fan_speed", _api_fan_target),
     "u_temp_room": ("u_temp_room", int),
     "damp_pos": ("u_damp_pos", int),
     "hum_stg": ("u_hum_stg", int),
@@ -110,11 +123,12 @@ class AtmeexEntityMixin:
         Inside a command operation this compares against the target *before*
         that command (stored settings plus older unconfirmed writes), so a
         queued predecessor can never make this command skip a needed write.
-        After a failed write the stored targets may be stale, so everything
-        is sent until a command succeeds again.
+        Until a write is confirmed by a successful refresh (after a failed
+        write or a failed confirmation) the stored targets may be stale, so
+        everything is sent.
         """
         executor = self._command_executor
-        if executor.last_write_failed(self._device_id):
+        if executor.targets_untrusted(self._device_id):
             return dict(desired)
         return {
             field: value
@@ -131,7 +145,7 @@ class AtmeexEntityMixin:
         Lets repeated identical calls (e.g. an automation re-sending the same
         fan speed on every CO2 update) cost zero requests.
         """
-        return not self._command_executor.has_pending(
+        return not self._command_executor.is_busy(
             self._device_id
         ) and not self._fields_to_write(desired)
 
