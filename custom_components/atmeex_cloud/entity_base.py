@@ -13,6 +13,18 @@ from .command_executor import (
     RecoveryRefresh,
 )
 from .const import DOMAIN
+from .helpers import api_to_fan_speed, parse_atmeex_bool
+
+# State field -> (cloud settings key, converter into the state field's scale).
+_SETTING_FOR_FIELD: dict[str, tuple[str, Callable[[Any], Any]]] = {
+    "pwr_on": ("u_pwr_on", parse_atmeex_bool),
+    "fan_speed": ("u_fan_speed", api_to_fan_speed),
+    "u_temp_room": ("u_temp_room", int),
+    "damp_pos": ("u_damp_pos", int),
+    "hum_stg": ("u_hum_stg", int),
+    "u_auto": ("u_auto", parse_atmeex_bool),
+    "u_night": ("u_night", parse_atmeex_bool),
+}
 
 
 class AtmeexEntityMixin:
@@ -62,15 +74,9 @@ class AtmeexEntityMixin:
             confirmed_value,
         )
 
-    async def _execute_command(
-        self,
-        operation: CommandCoroutineFactory,
-        *,
-        pending: Mapping[str, Any],
-        translation_key: str = "command_failed",
-        translation_placeholders: Mapping[str, str] | None = None,
-    ) -> bool:
-        """Execute one lazy command through the entry-owned executor."""
+    @property
+    def _command_executor(self) -> AtmeexCommandExecutor:
+        """Entry-owned executor, or a lazily created per-entity fallback."""
         runtime = getattr(self, "_runtime", None)
         executor = getattr(runtime, "command_executor", None)
         if executor is None:
@@ -80,7 +86,91 @@ class AtmeexEntityMixin:
                     lambda _device_id: self._refresh()
                 )
                 self._fallback_command_executor = executor
-        return await executor.async_execute(
+        return executor
+
+    def _target_setting(self, field: str) -> Any:
+        """Return the cloud's stored target for a state field, or None.
+
+        Targets (settings.u_*) are updated by the cloud as soon as it accepts
+        a PUT and stay valid while the device is off, unlike the reported
+        condition, which lags until the device acknowledges.
+        """
+        settings_key, convert = _SETTING_FOR_FIELD[field]
+        raw = self._device.settings.get(settings_key)
+        if raw is None:
+            return None
+        try:
+            return convert(raw)
+        except (TypeError, ValueError):
+            return None
+
+    def _fields_to_write(self, desired: Mapping[str, Any]) -> dict[str, Any]:
+        """Return the desired fields whose cloud target differs.
+
+        Inside a command operation this compares against the target *before*
+        that command (stored settings plus older unconfirmed writes), so a
+        queued predecessor can never make this command skip a needed write.
+        After a failed write the stored targets may be stale, so everything
+        is sent until a command succeeds again.
+        """
+        executor = self._command_executor
+        if executor.last_write_failed(self._device_id):
+            return dict(desired)
+        return {
+            field: value
+            for field, value in desired.items()
+            if executor.settled_value(
+                self._device_id, field, self._target_setting(field)
+            )
+            != value
+        }
+
+    def _already_applied(self, desired: Mapping[str, Any]) -> bool:
+        """True when nothing is in flight and the device already matches.
+
+        Lets repeated identical calls (e.g. an automation re-sending the same
+        fan speed on every CO2 update) cost zero requests.
+        """
+        return not self._command_executor.has_pending(
+            self._device_id
+        ) and not self._fields_to_write(desired)
+
+    async def _apply_breezer_mode(self, mode: int) -> None:
+        """Set breezer mode 0..3, sending only what changes.
+
+        u_pwr_on rides in the combined body only when it actually changes; with
+        power unchanged the damper is sent alone, because the cloud drops
+        fields from a combined body whose u_pwr_on is unchanged (fa6b806).
+        """
+        power = mode != 3
+        damper = 0 if mode == 3 else mode
+        desired = {"pwr_on": power, "damp_pos": damper}
+        if self._already_applied(desired):
+            return
+
+        async def operation() -> None:
+            writes = self._fields_to_write(desired)
+            if "pwr_on" in writes:
+                await self.api.set_breezer_mode(self._device_id, mode)
+            elif "damp_pos" in writes:
+                await self.api.set_damper_position(self._device_id, damper)
+
+        await self._execute_command(
+            operation,
+            pending=desired,
+            translation_placeholders={"action": "set breezer mode"},
+        )
+
+    async def _execute_command(
+        self,
+        operation: CommandCoroutineFactory,
+        *,
+        pending: Mapping[str, Any],
+        translation_key: str = "command_failed",
+        translation_placeholders: Mapping[str, str] | None = None,
+    ) -> bool:
+        """Execute one lazy command through the entry-owned executor."""
+        return await self._command_executor.async_execute(
             self._device_id,
             operation,
             pending=pending,

@@ -1299,3 +1299,25 @@ async def test_set_power_and_heat_body(pwr_on, temp_c, expected_body):
     req = session.requests[0]
     assert req[0] == "PUT"
     assert req[2] == expected_body
+
+
+@pytest.mark.asyncio
+async def test_set_damper_position_sends_only_the_damper():
+    session = FakeSession()
+    session.queue_response(FakeResponse(200))
+    api = AtmeexApi(session)
+    api._token = "t"
+
+    await api.set_damper_position(1, 2)
+
+    assert session.requests[0][0] == "PUT"
+    assert session.requests[0][2] == {"u_damp_pos": 2}
+
+
+@pytest.mark.asyncio
+async def test_set_damper_position_rejects_virtual_supply_valve():
+    api = AtmeexApi(FakeSession())
+    api._token = "t"
+
+    with pytest.raises(AtmeexProtocolError, match="set_damper_position"):
+        await api.set_damper_position(1, 3)

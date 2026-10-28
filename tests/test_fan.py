@@ -270,3 +270,35 @@ async def test_async_setup_entry_adds_entities_for_new_devices():
 
     listeners[0]()
     assert len(entities) == 2
+
+
+def _fan_with_targets(**settings):
+    fan, cond, api, coordinator = _make_fan_entity()
+    coordinator.data["device_map"] = {
+        "1": AtmeexDevice.from_raw(
+            {"id": 1, "online": True, "condition": {}, "settings": settings}
+        )
+    }
+    return fan, api, coordinator
+
+
+@pytest.mark.asyncio
+async def test_fan_speed_change_while_on_skips_power_write():
+    fan, api, _coordinator = _fan_with_targets(u_pwr_on=True, u_fan_speed=2)
+
+    await fan.async_set_percentage(75)  # speed 5
+
+    api.set_fan_speed.assert_awaited_once_with(1, 5)
+    api.set_power.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_fan_repeated_identical_speed_sends_nothing():
+    # API speed 2 == HA speed 3 == 43%; e.g. a CO2 automation re-sending it.
+    fan, api, coordinator = _fan_with_targets(u_pwr_on=True, u_fan_speed=2)
+
+    await fan.async_set_percentage(43)
+
+    api.set_fan_speed.assert_not_awaited()
+    api.set_power.assert_not_awaited()
+    coordinator.async_request_refresh.assert_not_awaited()

@@ -106,6 +106,8 @@ class AtmeexHumidificationSelect(_BaseSelect):
         if not isinstance(option, str) or option not in HUM_OPTIONS:
             raise self._invalid_value("humidification_option", option)
         stage = 0 if option == "off" else int(option)
+        if self._already_applied({"hum_stg": stage}):
+            return
 
         async def operation() -> None:
             await self.api.set_humid_stage(self._device_id, stage)
@@ -148,15 +150,4 @@ class AtmeexBreezerSelect(_BaseSelect):
     async def async_select_option(self, option: str) -> None:
         if not isinstance(option, str) or option not in BREEZER_OPTIONS:
             raise self._invalid_value("breezer_option", option)
-        mode = BREEZER_OPTIONS.index(option)
-        power = mode != 3
-        damper = 0 if mode == 3 else mode
-
-        async def operation() -> None:
-            await self.api.set_breezer_mode(self._device_id, mode)
-
-        await self._execute_command(
-            operation,
-            pending={"pwr_on": power, "damp_pos": damper},
-            translation_placeholders={"action": "set breezer mode"},
-        )
+        await self._apply_breezer_mode(BREEZER_OPTIONS.index(option))

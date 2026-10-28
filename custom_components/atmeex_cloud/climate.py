@@ -231,6 +231,9 @@ class AtmeexClimateEntity(AtmeexEntityMixin, CoordinatorEntity, ClimateEntity):
             raise self._invalid_command_value("hvac_mode", hvac_mode)
 
         if hvac_mode == HVACMode.OFF:
+            if self._already_applied({"pwr_on": False}):
+                return
+
             async def operation() -> None:
                 await self.api.set_power(self._device_id, False)
 
@@ -242,27 +245,43 @@ class AtmeexClimateEntity(AtmeexEntityMixin, CoordinatorEntity, ClimateEntity):
             return
 
         if hvac_mode == HVACMode.FAN_ONLY:
-            async def operation() -> None:
-                await self.api.set_power(self._device_id, True)
-                await self.api.set_heater_off(self._device_id)
-
-            await self._execute_command(
-                operation,
-                pending={"pwr_on": True, "u_temp_room": -1000},
-                translation_placeholders={"action": "enter fan-only mode"},
-            )
+            await self._power_on_with_target(None, "enter fan-only mode")
             return
 
-        target_c = self._resolve_heat_target()
+        await self._power_on_with_target(
+            self._resolve_heat_target(), "enter heat mode"
+        )
+
+    async def _power_on_with_target(
+        self, temp_c: float | None, action: str
+    ) -> None:
+        """Power on with a heater target (None = heater off), skipping no-ops.
+
+        Separate PUTs on purpose: the cloud drops u_temp_room from a combined
+        body whose u_pwr_on is unchanged (fa6b806).
+        """
+        desired = {
+            "pwr_on": True,
+            "u_temp_room": -1000 if temp_c is None else c_to_deci(temp_c),
+        }
+        if self._already_applied(desired):
+            return
 
         async def operation() -> None:
-            await self.api.set_power(self._device_id, True)
-            await self.api.set_target_temperature(self._device_id, target_c)
+            writes = self._fields_to_write(desired)
+            if "pwr_on" in writes:
+                await self.api.set_power(self._device_id, True)
+            if "u_temp_room" not in writes:
+                return
+            if temp_c is None:
+                await self.api.set_heater_off(self._device_id)
+            else:
+                await self.api.set_target_temperature(self._device_id, temp_c)
 
         await self._execute_command(
             operation,
-            pending={"pwr_on": True, "u_temp_room": c_to_deci(target_c)},
-            translation_placeholders={"action": "enter heat mode"},
+            pending=desired,
+            translation_placeholders={"action": action},
         )
 
     # ---------- температура ----------
@@ -325,15 +344,7 @@ class AtmeexClimateEntity(AtmeexEntityMixin, CoordinatorEntity, ClimateEntity):
         ):
             raise self._invalid_command_value("temperature", value)
 
-        async def operation() -> None:
-            await self.api.set_power(self._device_id, True)
-            await self.api.set_target_temperature(self._device_id, target)
-
-        await self._execute_command(
-            operation,
-            pending={"pwr_on": True, "u_temp_room": c_to_deci(target)},
-            translation_placeholders={"action": "set target temperature"},
-        )
+        await self._power_on_with_target(target, "set target temperature")
 
     # ---------- влажность ----------
 
@@ -371,6 +382,8 @@ class AtmeexClimateEntity(AtmeexEntityMixin, CoordinatorEntity, ClimateEntity):
         ):
             raise self._invalid_command_value("humidity", humidity)
         stage = humidity_to_stage(humidity)
+        if self._already_applied({"hum_stg": stage}):
+            return
 
         async def operation() -> None:
             await self.api.set_humid_stage(self._device_id, stage)
@@ -414,6 +427,8 @@ class AtmeexClimateEntity(AtmeexEntityMixin, CoordinatorEntity, ClimateEntity):
         if not isinstance(fan_mode, str) or fan_mode not in FAN_MODES:
             raise self._invalid_command_value("fan_mode", fan_mode)
         speed = int(fan_mode)
+        if self._already_applied({"fan_speed": speed}):
+            return
         restore_intent_token = object()
         tracks_manual_baseline: bool | None = None
 
@@ -461,18 +476,7 @@ class AtmeexClimateEntity(AtmeexEntityMixin, CoordinatorEntity, ClimateEntity):
             or swing_mode not in BREEZER_SWING_MODES
         ):
             raise self._invalid_command_value("swing_mode", swing_mode)
-        mode = BREEZER_SWING_MODES.index(swing_mode)
-        power = mode != 3
-        damper = 0 if mode == 3 else mode
-
-        async def operation() -> None:
-            await self.api.set_breezer_mode(self._device_id, mode)
-
-        await self._execute_command(
-            operation,
-            pending={"pwr_on": power, "damp_pos": damper},
-            translation_placeholders={"action": "set breezer mode"},
-        )
+        await self._apply_breezer_mode(BREEZER_SWING_MODES.index(swing_mode))
 
     async def async_set_breezer_mode(self, mode: str) -> None:
         """Service handler: set damper/breezer mode by name."""
@@ -487,6 +491,8 @@ class AtmeexClimateEntity(AtmeexEntityMixin, CoordinatorEntity, ClimateEntity):
             or not 0 <= stage <= 3
         ):
             raise self._invalid_command_value("humidifier_stage", stage)
+        if self._already_applied({"hum_stg": stage}):
+            return
 
         async def operation() -> None:
             await self.api.set_humid_stage(self._device_id, stage)
@@ -608,19 +614,30 @@ class AtmeexClimateEntity(AtmeexEntityMixin, CoordinatorEntity, ClimateEntity):
             pending[_PRESET_RESTORE_FAN] = restore_fan
         if fan_target is not None:
             pending["fan_speed"] = fan_target
+        remote = {
+            key: pending[key]
+            for key in ("u_auto", "u_night", "fan_speed")
+            if key in pending
+        }
 
         async def operation() -> None:
+            # Local preset bookkeeping below still runs when nothing remote
+            # changes (e.g. BOOST while already at speed 7).
+            writes = self._fields_to_write(remote)
             if preset_mode == PRESET_AUTO:
-                await self.api.set_sleep_mode(self._device_id, False)
-                await self.api.set_auto_mode(self._device_id, True)
-            elif preset_mode == PRESET_SLEEP:
-                await self.api.set_auto_mode(self._device_id, False)
-                await self.api.set_sleep_mode(self._device_id, True)
+                if "u_night" in writes:
+                    await self.api.set_sleep_mode(self._device_id, False)
+                if "u_auto" in writes:
+                    await self.api.set_auto_mode(self._device_id, True)
             else:
-                await self.api.set_auto_mode(self._device_id, False)
-                await self.api.set_sleep_mode(self._device_id, False)
+                if "u_auto" in writes:
+                    await self.api.set_auto_mode(self._device_id, False)
+                if "u_night" in writes:
+                    await self.api.set_sleep_mode(
+                        self._device_id, preset_mode == PRESET_SLEEP
+                    )
 
-            if fan_target is not None:
+            if "fan_speed" in writes:
                 await self.api.set_fan_speed(self._device_id, fan_target)
 
             # Commit all local state together, after the final remote write and

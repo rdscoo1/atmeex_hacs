@@ -969,3 +969,56 @@ async def test_on_change_failure_never_fails_the_command():
     assert await executor.async_execute(
         1, AsyncMock(), pending={"pwr_on": True}, translation_key="command_failed"
     )
+
+
+@pytest.mark.asyncio
+async def test_settled_value_ignores_own_and_newer_generations():
+    executor = AtmeexCommandExecutor(AsyncMock())
+    executor.set_pending(1, "pwr_on", True)  # older, still unconfirmed
+    seen: list[object] = []
+    release = asyncio.Event()
+
+    async def first() -> None:
+        seen.append(executor.settled_value(1, "pwr_on", "confirmed"))
+        await release.wait()
+
+    owner = asyncio.create_task(
+        executor.async_execute(
+            1, first, pending={"pwr_on": False}, translation_key="command_failed"
+        )
+    )
+    await asyncio.sleep(0)
+    # A newer queued value must not leak into the running command's view.
+    queued = asyncio.create_task(
+        executor.async_execute(
+            1, AsyncMock(), pending={"pwr_on": None}, translation_key="command_failed"
+        )
+    )
+    await asyncio.sleep(0)
+    release.set()
+    await asyncio.gather(owner, queued)
+
+    assert seen == [True]
+    # Outside any operation it is simply the newest pending value.
+    executor.set_pending(1, "fan_speed", 4)
+    assert executor.settled_value(1, "fan_speed", 2) == 4
+    assert executor.settled_value(1, "hum_stg", 2) == 2
+
+
+@pytest.mark.asyncio
+async def test_last_write_failed_until_next_success():
+    executor = AtmeexCommandExecutor(AsyncMock())
+
+    async def failing() -> None:
+        raise ApiError("set_power", "rejected", status=503)
+
+    with pytest.raises(HomeAssistantError):
+        await executor.async_execute(
+            1, failing, pending={"pwr_on": True}, translation_key="command_failed"
+        )
+    assert executor.last_write_failed(1) is True
+
+    await executor.async_execute(
+        1, AsyncMock(), pending={"pwr_on": True}, translation_key="command_failed"
+    )
+    assert executor.last_write_failed(1) is False

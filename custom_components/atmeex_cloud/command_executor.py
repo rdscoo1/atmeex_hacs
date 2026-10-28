@@ -55,6 +55,10 @@ class AtmeexCommandExecutor:
         self._pending: dict[str, dict[str, list[PendingCommand]]] = {}
         self._executed_generations: set[int] = set()
         self._confirmation_ready_generations: set[int] = set()
+        # Generation whose operation currently holds each device lock.
+        self._running: dict[str, int] = {}
+        # Devices whose most recent operation failed part-way.
+        self._failed_last: set[str] = set()
 
     def _notify(self) -> None:
         """Ask entities to re-render so optimistic values show (or revert) now."""
@@ -256,6 +260,38 @@ class AtmeexCommandExecutor:
             expires_at=pending.expires_at,
         )
 
+    def last_write_failed(self, device_id: int | str) -> bool:
+        """Return whether the device's most recent operation failed."""
+        return self._device_key(device_id) in self._failed_last
+
+    def has_pending(self, device_id: int | str) -> bool:
+        """Return whether any unexpired command value exists for the device."""
+        key = self._device_key(device_id)
+        self._purge_expired(key)
+        return bool(self._pending.get(key))
+
+    def settled_value(
+        self,
+        device_id: int | str,
+        attribute: str,
+        confirmed: Any,
+    ) -> Any:
+        """Return the value a write should be compared against right now.
+
+        While an operation holds the device lock this ignores that command's
+        own pending value and anything queued after it, but still counts older
+        writes that succeeded without confirmation yet. Outside an operation
+        it is the newest pending value, else the confirmed one.
+        """
+        key = self._device_key(device_id)
+        running = self._running.get(key)
+        older = [
+            item
+            for item in self._live_stack(key, attribute)
+            if running is None or item.generation < running
+        ]
+        return deepcopy(older[-1].value) if older else confirmed
+
     def confirm(
         self,
         device_id: int | str,
@@ -317,6 +353,7 @@ class AtmeexCommandExecutor:
     def remove_device(self, device_id: int | str) -> None:
         """Clear one device without letting a command bypass its active lock."""
         key = self._device_key(device_id)
+        self._failed_last.discard(key)
         fields = self._pending.pop(key, {})
         generations = {
             item.generation for stack in fields.values() for item in stack
@@ -430,10 +467,13 @@ class AtmeexCommandExecutor:
         try:
             try:
                 async with lock:
+                    self._running[key] = generation
+                    succeeded = False
                     try:
                         # The factory is intentionally invoked only after the
                         # per-device lock has been acquired.
                         await operation()
+                        succeeded = True
                     except ApiError as err:
                         try:
                             await self._recover_after_write_failure(device_id)
@@ -458,6 +498,14 @@ class AtmeexCommandExecutor:
                         finally:
                             self._clear_generation(key, generation)
                         raise
+                    finally:
+                        self._running.pop(key, None)
+                        # A part-way failure may have applied some writes the
+                        # stored targets do not show yet.
+                        if succeeded:
+                            self._failed_last.discard(key)
+                        else:
+                            self._failed_last.add(key)
 
                     if self._generation_is_referenced(generation):
                         self._executed_generations.add(generation)

@@ -883,6 +883,14 @@ class AtmeexApi:
             raise AtmeexProtocolError("set_breezer_mode", "invalid mode")
         await self._put_params(device_id, body, "set_breezer_mode")
 
+    async def set_damper_position(self, device_id: int | str, position: int) -> None:
+        """Move the damper only (0 supply, 1 recirculation, 2 mixed)."""
+        if position not in (0, 1, 2):
+            raise AtmeexProtocolError("set_damper_position", "invalid position")
+        await self._put_params(
+            device_id, {"u_damp_pos": position}, "set_damper_position"
+        )
+
     async def set_heater_off(self, device_id: int | str) -> None:
         """Disable the heater by sending the device's off-sentinel target temp."""
         await self._put_params(device_id, {"u_temp_room": -1000}, "set_heater_off")

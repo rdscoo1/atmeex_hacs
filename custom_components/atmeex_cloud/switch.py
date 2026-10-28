@@ -73,6 +73,9 @@ class _BaseSwitch(AtmeexEntityMixin, CoordinatorEntity, SwitchEntity):
         value: bool,
         action: str,
     ) -> None:
+        if self._already_applied({attribute: value}):
+            return
+
         async def operation() -> None:
             await api_method(self._device_id, value)
 

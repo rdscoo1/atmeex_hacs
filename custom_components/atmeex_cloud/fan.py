@@ -181,22 +181,33 @@ class AtmeexFanEntity(AtmeexEntityMixin, CoordinatorEntity, FanEntity):
             if percentage is not None
             else None
         )
+        await self._turn_on_at(speed, "turn on the fan")
+
+    async def _turn_on_at(self, speed: int | None, action: str) -> None:
+        """Power on (optionally at a speed), sending only what changes."""
+        desired: dict[str, Any] = {"pwr_on": True}
+        if speed is not None:
+            desired["fan_speed"] = speed
+        if self._already_applied(desired):
+            return
 
         async def operation() -> None:
-            if speed is not None:
+            writes = self._fields_to_write(desired)
+            if "fan_speed" in writes:
                 await self.api.set_fan_speed(self._device_id, speed)
-            await self.api.set_power(self._device_id, True)
+            if "pwr_on" in writes:
+                await self.api.set_power(self._device_id, True)
 
-        pending: dict[str, Any] = {"pwr_on": True}
-        if speed is not None:
-            pending["fan_speed"] = speed
         await self._execute_command(
             operation,
-            pending=pending,
-            translation_placeholders={"action": "turn on the fan"},
+            pending=desired,
+            translation_placeholders={"action": action},
         )
 
     async def async_turn_off(self, **kwargs) -> None:
+        if self._already_applied({"pwr_on": False}):
+            return
+
         async def operation() -> None:
             await self.api.set_power(self._device_id, False)
 
@@ -211,18 +222,6 @@ class AtmeexFanEntity(AtmeexEntityMixin, CoordinatorEntity, FanEntity):
         if percentage == 0:
             await self.async_turn_off()
             return
-        speed = self._percentage_to_speed(percentage)
-
-        async def operation() -> None:
-            await self.api.set_fan_speed(self._device_id, speed)
-            # Always assert power after changing speed. The coordinator can be
-            # stale after a predecessor's successful write but failed
-            # confirmation refresh, so its confirmed power value cannot safely
-            # decide whether this idempotent write is needed.
-            await self.api.set_power(self._device_id, True)
-
-        await self._execute_command(
-            operation,
-            pending={"fan_speed": speed, "pwr_on": True},
-            translation_placeholders={"action": "set the fan speed"},
+        await self._turn_on_at(
+            self._percentage_to_speed(percentage), "set the fan speed"
         )

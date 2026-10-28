@@ -939,7 +939,9 @@ async def test_temperature_avoids_compound_write_after_stale_power_on_confirmati
     release_first_confirmation.set()
     await asyncio.gather(first, queued)
 
-    assert api.set_power.await_args_list == [call(1, True), call(1, True)]
+    # The first power-on succeeded (its pending value is still live), so the
+    # queued command does not repeat it.
+    assert api.set_power.await_args_list == [call(1, True)]
     assert api.set_target_temperature.await_args_list == [
         call(1, 20.0),
         call(1, 23.0),
@@ -1672,3 +1674,76 @@ def test_climate_targets_show_pending_command_values():
     assert ent.target_humidity == HUM_ALLOWED[3]
     # Pending recirculation also drives HEAT -> FAN_ONLY without waiting.
     assert ent.hvac_mode == HVACMode.FAN_ONLY
+
+
+def _with_targets(ent, **settings):
+    """Give the entity's device stored cloud targets (settings.u_*)."""
+    ent.coordinator.data["device_map"]["1"] = AtmeexDevice.from_raw(
+        {"id": 1, "name": "Test Device", "online": True,
+         "condition": {}, "settings": settings}
+    )
+
+
+@pytest.mark.asyncio
+async def test_temperature_skips_power_write_when_target_already_on():
+    ent, _cond, api, runtime = _make_entity_with_runtime()
+    _with_targets(ent, u_pwr_on=True, u_temp_room=225)
+
+    await ent.async_set_temperature(**{ATTR_TEMPERATURE: 23.0})
+
+    api.set_power.assert_not_awaited()
+    api.set_target_temperature.assert_awaited_once_with(1, 23.0)
+
+
+@pytest.mark.asyncio
+async def test_identical_temperature_sends_nothing():
+    ent, _cond, api, runtime = _make_entity_with_runtime()
+    _with_targets(ent, u_pwr_on=True, u_temp_room=225)
+
+    await ent.async_set_temperature(**{ATTR_TEMPERATURE: 22.5})
+
+    api.set_power.assert_not_awaited()
+    api.set_target_temperature.assert_not_awaited()
+    runtime.refresh_device.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_swing_change_while_on_sends_damper_alone():
+    ent, _cond, api, _runtime = _make_entity_with_runtime()
+    api.set_damper_position = AsyncMock()
+    _with_targets(ent, u_pwr_on=True, u_damp_pos=0)
+
+    await ent.async_set_swing_mode("recirculation")
+
+    # A combined body with an unchanged u_pwr_on can lose fields (fa6b806).
+    api.set_damper_position.assert_awaited_once_with(1, 1)
+    api.set_breezer_mode.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_swing_change_that_powers_on_uses_combined_mode_write():
+    ent, _cond, api, _runtime = _make_entity_with_runtime()
+    api.set_damper_position = AsyncMock()
+    _with_targets(ent, u_pwr_on=False, u_damp_pos=0)
+
+    await ent.async_set_swing_mode("recirculation")
+
+    api.set_breezer_mode.assert_awaited_once_with(1, 1)
+    api.set_damper_position.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_command_after_failed_write_sends_every_field():
+    ent, _cond, api, _runtime = _make_entity_with_runtime()
+    _with_targets(ent, u_pwr_on=True, u_temp_room=225)
+    api.set_target_temperature.side_effect = [
+        ApiError("set_target_temperature", "failed", status=503),
+        None,
+    ]
+
+    with pytest.raises(HomeAssistantError):
+        await ent.async_set_temperature(**{ATTR_TEMPERATURE: 23.0})
+    await ent.async_set_temperature(**{ATTR_TEMPERATURE: 23.0})
+
+    # Stored targets may be stale after a failure: power is asserted again.
+    api.set_power.assert_awaited_once_with(1, True)
