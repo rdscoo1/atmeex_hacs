@@ -233,3 +233,23 @@ def test_normalize_device_state_uses_settings_and_fan_fallback():
 
 def test_resolve_update_interval_invalid_input_falls_back_to_default():
     assert atmeex_init._resolve_update_interval_seconds({CONF_UPDATE_INTERVAL: "bad"}) == DEFAULT_UPDATE_INTERVAL
+
+
+@pytest.mark.parametrize(
+    ("damp_pos", "pwr_on", "expected"),
+    [
+        (0, True, "supply_ventilation"),
+        (1, True, "recirculation"),
+        (2, True, "mixed_mode"),
+        (0, False, "supply_valve"),
+        (1, False, None),
+        (0, None, None),
+        (3, True, None),
+        (True, True, None),
+        (None, True, None),
+    ],
+)
+def test_breezer_mode_from_state(damp_pos, pwr_on, expected):
+    from custom_components.atmeex_cloud.helpers import breezer_mode_from_state
+
+    assert breezer_mode_from_state(damp_pos, pwr_on) == expected

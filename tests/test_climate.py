@@ -1651,3 +1651,24 @@ async def test_sleep_fan_target_is_pending_during_blocked_confirmation():
     release_confirmation.set()
     await task
     assert fan_mode_during_confirmation == "2"
+
+
+def test_climate_swing_mode_matches_select_for_supply_valve():
+    # supply_valve is "power off + damper 0"; climate used to report
+    # supply_ventilation here while the select reported supply_valve.
+    ent, _cond, _api = _make_entity({"pwr_on": False, "damp_pos": 0})
+
+    assert ent.swing_mode == "supply_valve"
+
+
+def test_climate_targets_show_pending_command_values():
+    ent, _cond, _api, runtime = _make_entity_with_runtime()
+    runtime.set_pending(1, "u_temp_room", 240)
+    runtime.set_pending(1, "damp_pos", 1)
+    runtime.set_pending(1, "hum_stg", 3)
+
+    assert ent.target_temperature == 24.0
+    assert ent.swing_mode == "recirculation"
+    assert ent.target_humidity == HUM_ALLOWED[3]
+    # Pending recirculation also drives HEAT -> FAN_ONLY without waiting.
+    assert ent.hvac_mode == HVACMode.FAN_ONLY

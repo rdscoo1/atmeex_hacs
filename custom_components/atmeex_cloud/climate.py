@@ -4,7 +4,14 @@ from datetime import datetime, timezone
 import logging
 import math
 from typing import Any, Callable, Awaitable
-from .helpers import c_to_deci, deci_to_c, quantize_humidity, humidity_to_stage, HUM_ALLOWED
+from .helpers import (
+    HUM_ALLOWED,
+    breezer_mode_from_state,
+    c_to_deci,
+    deci_to_c,
+    humidity_to_stage,
+    quantize_humidity,
+)
 from .entity_base import (
     AtmeexEntityMixin,
     setup_dynamic_device_entities,
@@ -211,7 +218,9 @@ class AtmeexClimateEntity(AtmeexEntityMixin, CoordinatorEntity, ClimateEntity):
             confirmed_temp,
         )
         temp_valid = isinstance(effective_temp, (int, float)) and effective_temp >= 100
-        damp_pos = self._device_state.get("damp_pos")
+        damp_pos = self._state_with_pending(
+            "damp_pos", self._device_state.get("damp_pos")
+        )
         recirculation = damp_pos == 1
         if temp_valid and not recirculation:
             return HVACMode.HEAT
@@ -264,7 +273,11 @@ class AtmeexClimateEntity(AtmeexEntityMixin, CoordinatorEntity, ClimateEntity):
 
     @property
     def target_temperature(self) -> float | None:
-        target = deci_to_c(self._device_state.get("u_temp_room"))
+        target = deci_to_c(
+            self._state_with_pending(
+                "u_temp_room", self._device_state.get("u_temp_room")
+            )
+        )
         if (
             target is not None
             and self._attr_min_temp <= target <= self._attr_max_temp
@@ -339,7 +352,9 @@ class AtmeexClimateEntity(AtmeexEntityMixin, CoordinatorEntity, ClimateEntity):
         """
         if not self._has_humidifier():
             return None
-        stg = self._device_state.get("hum_stg")
+        stg = self._state_with_pending(
+            "hum_stg", self._device_state.get("hum_stg")
+        )
         if not isinstance(stg, (int, float)):
             stg = 0
         stg = max(0, min(3, int(stg)))
@@ -430,11 +445,15 @@ class AtmeexClimateEntity(AtmeexEntityMixin, CoordinatorEntity, ClimateEntity):
 
     @property
     def swing_mode(self) -> str | None:
-        """Текущий режим заслонки / бризера."""
-        pos = self._device_state.get("damp_pos")
-        if isinstance(pos, int) and 0 <= pos <= 3:
-            return BREEZER_SWING_MODES[pos]
-        return None
+        """Current breezer mode; same mapping as the breezer-mode select."""
+        return breezer_mode_from_state(
+            self._state_with_pending(
+                "damp_pos", self._device_state.get("damp_pos")
+            ),
+            self._state_with_pending(
+                "pwr_on", self._device_state.get("pwr_on")
+            ),
+        )
 
     async def async_set_swing_mode(self, swing_mode: str) -> None:
         if (

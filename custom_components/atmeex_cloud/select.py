@@ -7,6 +7,7 @@ from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from .api import AtmeexDevice
 from .entity_base import AtmeexEntityMixin, setup_dynamic_device_entities, supports_humidifier
+from .helpers import breezer_mode_from_state
 
 from .const import BREEZER_MODES, HUMIDIFICATION_OPTIONS
 from . import AtmeexRuntimeData
@@ -135,23 +136,14 @@ class AtmeexBreezerSelect(_BaseSelect):
 
     @property
     def current_option(self) -> str | None:
-        position = self._state_with_pending(
-            "damp_pos", self._device_state.get("damp_pos")
+        return breezer_mode_from_state(
+            self._state_with_pending(
+                "damp_pos", self._device_state.get("damp_pos")
+            ),
+            self._state_with_pending(
+                "pwr_on", self._device_state.get("pwr_on")
+            ),
         )
-        power = self._state_with_pending(
-            "pwr_on", self._device_state.get("pwr_on")
-        )
-        if not isinstance(position, int) or isinstance(position, bool):
-            return None
-        if position == 0:
-            if power is False:
-                return BREEZER_OPTIONS[3]
-            if power is True:
-                return BREEZER_OPTIONS[0]
-            return None
-        if power is True and 0 < position < 3:
-            return BREEZER_OPTIONS[position]
-        return None
 
     async def async_select_option(self, option: str) -> None:
         if not isinstance(option, str) or option not in BREEZER_OPTIONS:

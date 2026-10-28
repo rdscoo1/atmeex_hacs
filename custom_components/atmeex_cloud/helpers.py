@@ -4,6 +4,8 @@ import logging
 from collections.abc import Mapping
 from typing import Any
 
+from .const import BREEZER_MODES
+
 _LOGGER = logging.getLogger(__name__)
 
 FAN_MIN = 1
@@ -133,6 +135,25 @@ def humidity_to_stage(val: int | float | None) -> int:
     q = quantize_humidity(val)
     # quantize_humidity guarantees a value in HUM_ALLOWED, so index() is safe here.
     return HUM_ALLOWED.index(q)
+
+
+def breezer_mode_from_state(damp_pos: Any, pwr_on: Any) -> str | None:
+    """Map damper position + power to the app's breezer mode name.
+
+    supply_valve is virtual: power off with the damper at 0 (see
+    AtmeexApi.set_breezer_mode). Unknown combinations map to None.
+    """
+    if not isinstance(damp_pos, int) or isinstance(damp_pos, bool):
+        return None
+    if damp_pos == 0:
+        if pwr_on is False:
+            return BREEZER_MODES[3]
+        if pwr_on is True:
+            return BREEZER_MODES[0]
+        return None
+    if pwr_on is True and 0 < damp_pos < 3:
+        return BREEZER_MODES[damp_pos]
+    return None
 
 
 _TRUE_LITERALS = frozenset({"1", "true", "on", "yes"})
