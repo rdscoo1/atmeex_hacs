@@ -5,6 +5,7 @@ import asyncio
 from collections.abc import Awaitable, Callable, Mapping
 from copy import deepcopy
 from dataclasses import dataclass
+import logging
 import time
 from typing import Any
 
@@ -13,6 +14,8 @@ from homeassistant.exceptions import HomeAssistantError
 from .api import ApiError
 from .const import DOMAIN
 from .helpers import normalize_device_id
+
+_LOGGER = logging.getLogger(__name__)
 
 CommandCoroutineFactory = Callable[[], Awaitable[None]]
 RecoveryRefresh = Callable[[int | str], Awaitable[None]]
@@ -35,9 +38,11 @@ class AtmeexCommandExecutor:
         refresh_device: RecoveryRefresh,
         *,
         pending_ttl: float = 10.0,
+        on_change: Callable[[], None] | None = None,
     ) -> None:
         self._refresh_device = refresh_device
         self._pending_ttl = pending_ttl
+        self._on_change = on_change
         self._generation = 0
         self._locks: dict[str, asyncio.Lock] = {}
         self._lock_users: dict[str, int] = {}
@@ -50,6 +55,15 @@ class AtmeexCommandExecutor:
         self._pending: dict[str, dict[str, list[PendingCommand]]] = {}
         self._executed_generations: set[int] = set()
         self._confirmation_ready_generations: set[int] = set()
+
+    def _notify(self) -> None:
+        """Ask entities to re-render so optimistic values show (or revert) now."""
+        if self._on_change is None:
+            return
+        try:
+            self._on_change()
+        except Exception:  # noqa: BLE001 - a UI refresh must never fail a command
+            _LOGGER.debug("Atmeex pending-state notification failed")
 
     @staticmethod
     def _device_key(device_id: int | str) -> str:
@@ -409,6 +423,8 @@ class AtmeexCommandExecutor:
         key = self._device_key(device_id)
         generation = self._next_generation()
         self._install_pending(key, generation, pending)
+        # Show the optimistic value now, not after the PUT + confirmation GET.
+        self._notify()
         lock = self._retain_lock(key)
 
         try:
@@ -467,3 +483,5 @@ class AtmeexCommandExecutor:
                 raise
         finally:
             self._release_lock(key, lock)
+            # Success, failure or cancellation may have retired pending values.
+            self._notify()

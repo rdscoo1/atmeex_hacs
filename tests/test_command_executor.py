@@ -913,3 +913,59 @@ async def test_api_error_translation_preserves_key_placeholders_and_cause():
     assert raised.value.translation_key == "command_failed"
     assert raised.value.translation_placeholders == {"action": "set fan speed"}
     assert raised.value.__cause__ is api_error
+
+
+@pytest.mark.asyncio
+async def test_on_change_publishes_pending_before_the_write_and_after_it():
+    seen: list[object] = []
+    executor: AtmeexCommandExecutor
+
+    def on_change() -> None:
+        pending = executor.get_pending(1, "fan_speed")
+        seen.append(None if pending is None else pending.value)
+
+    executor = AtmeexCommandExecutor(AsyncMock(), on_change=on_change)
+
+    async def operation() -> None:
+        seen.append("write")
+
+    await executor.async_execute(
+        1, operation, pending={"fan_speed": 5}, translation_key="command_failed"
+    )
+
+    # Optimistic value is published before the remote write starts.
+    assert seen[:2] == [5, "write"]
+    assert len(seen) == 3
+
+
+@pytest.mark.asyncio
+async def test_on_change_publishes_revert_after_failed_write():
+    seen: list[object] = []
+    executor: AtmeexCommandExecutor
+
+    def on_change() -> None:
+        pending = executor.get_pending(1, "pwr_on")
+        seen.append(None if pending is None else pending.value)
+
+    executor = AtmeexCommandExecutor(AsyncMock(), on_change=on_change)
+
+    async def failing() -> None:
+        raise ApiError("set_power", "rejected", status=400)
+
+    with pytest.raises(HomeAssistantError):
+        await executor.async_execute(
+            1, failing, pending={"pwr_on": True}, translation_key="command_failed"
+        )
+
+    assert seen == [True, None]
+
+
+@pytest.mark.asyncio
+async def test_on_change_failure_never_fails_the_command():
+    executor = AtmeexCommandExecutor(
+        AsyncMock(), on_change=MagicMock(side_effect=RuntimeError("boom"))
+    )
+
+    assert await executor.async_execute(
+        1, AsyncMock(), pending={"pwr_on": True}, translation_key="command_failed"
+    )

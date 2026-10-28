@@ -1149,6 +1149,9 @@ async def test_failed_confirmation_serializes_recovery_and_preserves_executed_ab
     executor = runtime.command_executor
     assert executor is not None
 
+    # This test counts recovery publications; keep the executor's own
+    # optimistic-state notifications out of that count.
+    executor._on_change = None
     scheduled: list[asyncio.Task] = []
 
     def create_task(coro, **kwargs):

@@ -765,6 +765,7 @@ def _setup_lifecycle_fakes(monkeypatch, order):
             self.config_entry_id = config_entry_id
             self.data = state_store.data
             self.async_request_refresh = AsyncMock()
+            self.async_update_listeners = MagicMock()
 
         async def async_config_entry_first_refresh(self):
             return

@@ -53,6 +53,7 @@ class DummyCoordinator:
         self.request_retries = 0
         # Extra counter used by some WS tests
         self.update_calls = 0
+        self.listener_updates = 0
         self._fire_logbook_event = fire_logbook_event
         self._api_error_last_ts = float("-inf")
         self._api_error_suppressed = 0
@@ -92,6 +93,9 @@ class DummyCoordinator:
     def async_set_updated_data(self, data):
         self.update_calls += 1
         self.data = data
+
+    def async_update_listeners(self):
+        self.listener_updates += 1
 
     async def async_request_refresh(self):
         inventory_success_before = self.last_inventory_success_mono

@@ -420,7 +420,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             timeout=_REFRESH_TASK_TIMEOUT_SEC,
         )
 
-    command_executor = AtmeexCommandExecutor(refresh_device)
+    command_executor = AtmeexCommandExecutor(
+        refresh_device,
+        on_change=coordinator.async_update_listeners,
+    )
     runtime_data = AtmeexRuntimeData(
         api=api,
         coordinator=coordinator,
