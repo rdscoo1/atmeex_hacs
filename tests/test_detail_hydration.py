@@ -307,25 +307,24 @@ async def test_transient_detail_failure_uses_canonical_previous_and_list_delta(
 
 
 @pytest.mark.asyncio
-async def test_transient_detail_failure_without_previous_aborts_refresh(
+async def test_detail_failure_without_previous_publishes_list_item(
     hass,
 ) -> None:
+    # One breezer's failed detail fetch must not fail every device (or, on
+    # the first refresh, the whole config entry).
     api = AsyncMock()
-    api.get_devices.return_value = [_device(1)]
+    api.get_devices.return_value = [_device(1), _complete(2)]
     api.get_device.side_effect = AtmeexConnectionError(
         "get_device",
         "detail unavailable",
     )
-    store = AtmeexStateStore()
-    prior = store.data
-    coordinator = _coordinator(hass, api, store=store)
+    coordinator = _coordinator(hass, api, store=AtmeexStateStore())
 
-    with pytest.raises(UpdateFailed, match="get_device failed"):
-        await coordinator._async_update_data()
+    result = await coordinator._async_update_data()
 
-    assert store.data is prior
-    assert coordinator.last_success_ts is None
-    assert coordinator.last_inventory_success_mono is None
+    assert set(result["device_map"]) == {"1", "2"}
+    assert coordinator.last_inventory_success_mono is not None
+    assert isinstance(coordinator.last_api_error, AtmeexConnectionError)
 
 
 @pytest.mark.asyncio

@@ -258,7 +258,9 @@ class AtmeexCoordinator(DataUpdateCoordinator[AtmeexCoordinatorData]):
         ) as err:
             previous = self._previous_device(listed)
             if previous is None:
-                raise
+                # No earlier detail to reuse: publish the list item as-is
+                # rather than failing every device (and, at startup, setup).
+                return listed, err
             return self._merge_detail_source(listed, previous), err
 
     @staticmethod
