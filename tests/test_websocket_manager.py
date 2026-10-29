@@ -1037,38 +1037,49 @@ async def test_unauthorized_triggers_reauth_after_max_failures():
 
 
 @pytest.mark.asyncio
-async def test_reconnect_backoff_resets_on_success_even_after_prior_auth_failure():
-    """Backoff delay must reset to minimum on every successful connection.
+async def test_immediately_closed_connection_grows_backoff():
+    """A server that accepts and then closes must not be retried every second."""
 
-    Transport backoff resets independently from application authentication.
-    """
-    connected = asyncio.Event()
-
-    class _SuccessfulSession:
+    class _AcceptThenCloseSession:
         async def ws_connect(self, *args, **kwargs):
-            connected.set()
-            return _FakeWebSocket()
+            return _FakeWebSocket()  # iteration ends at once
 
     cfg = WebSocketConfig(reconnect_delay_min=1.0, reconnect_delay_max=60.0)
-    manager = _manager(
-        _SuccessfulSession(),
-        on_message=AsyncMock(),
-        config=cfg,
-    )
+    manager = _manager(_AcceptThenCloseSession(), config=cfg)
+    manager._transport_failures = 3
+    manager._reconnect_delay = 8.0
 
-    # Simulate that a prior auth failure bumped the counter and the backoff
+    assert await manager._connect_once() is True
+    await manager._listen_task
+
+    assert manager._reconnect_delay == 16.0
+    assert manager._transport_failures == 4
+    await manager.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_backoff_resets_after_stable_connection_even_after_prior_auth_failure():
+    """Transport backoff resets independently from application authentication."""
+
+    class _AcceptThenCloseSession:
+        async def ws_connect(self, *args, **kwargs):
+            return _FakeWebSocket()
+
+    cfg = WebSocketConfig(
+        reconnect_delay_min=1.0,
+        reconnect_delay_max=60.0,
+        stable_connection=0.0,  # any lifetime counts as stable here
+    )
+    manager = _manager(_AcceptThenCloseSession(), config=cfg)
     manager._application_unauthorized_count = 2
     manager._transport_failures = 3
-    manager._reconnect_delay = 30.0  # elevated from prior failures
+    manager._reconnect_delay = 30.0
 
-    result = await manager._connect_once()
+    assert await manager._connect_once() is True
+    await manager._listen_task
 
-    assert result is True
-    # A successful transport does not prove application authentication.
-    assert manager._reconnect_delay == cfg.reconnect_delay_min, (
-        f"Backoff not reset: {manager._reconnect_delay} != {cfg.reconnect_delay_min}"
-    )
+    assert manager._reconnect_delay == cfg.reconnect_delay_min
     assert manager._transport_failures == 0
+    # A stable transport does not prove application authentication.
     assert manager._application_unauthorized_count == 2
-
     await manager.disconnect()

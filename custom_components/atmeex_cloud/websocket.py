@@ -34,6 +34,10 @@ WS_RECONNECT_DELAY_MAX = 60.0  # seconds
 WS_PING_INTERVAL = 30.0  # seconds
 WS_PING_TIMEOUT = 10.0  # seconds
 WS_MAX_UNAUTHORIZED_BEFORE_REAUTH = 5
+# A connection must stay up this long before the reconnect backoff resets;
+# a server that accepts and immediately closes would otherwise be retried
+# every WS_RECONNECT_DELAY_MIN seconds forever.
+WS_STABLE_CONNECTION_SEC = 60.0
 
 MessageCallback = Callable[[dict[str, Any]], bool]
 TokenRecoveryCallback = Callable[[], Awaitable[None]]
@@ -65,6 +69,7 @@ class WebSocketConfig:
     reconnect_delay_max: float = WS_RECONNECT_DELAY_MAX
     ping_interval: float = WS_PING_INTERVAL
     ping_timeout: float = WS_PING_TIMEOUT
+    stable_connection: float = WS_STABLE_CONNECTION_SEC
 
 
 class WebSocketManager:
@@ -157,8 +162,6 @@ class WebSocketManager:
             self._record_transport_failure()
             return False
 
-        self._transport_failures = 0
-        self._reconnect_delay = self._config.reconnect_delay_min
         self._ws = ws
         listen_coro = self._listen(ws)
         self._listen_task = None
@@ -257,6 +260,7 @@ class WebSocketManager:
 
     async def _listen(self, ws: ClientWebSocketResponse) -> None:
         """Listen on one captured WebSocket until it closes."""
+        connected_at = time.monotonic()
         try:
             async for msg in ws:
                 if not self._running:
@@ -285,8 +289,13 @@ class WebSocketManager:
         except asyncio.CancelledError:
             raise
         except (aiohttp.ClientError, asyncio.TimeoutError):
-            self._record_transport_failure()
+            pass  # counted below like any other short-lived connection
         finally:
+            if time.monotonic() - connected_at >= self._config.stable_connection:
+                self._transport_failures = 0
+                self._reconnect_delay = self._config.reconnect_delay_min
+            else:
+                self._record_transport_failure()
             try:
                 if not ws.closed:
                     await ws.close()
