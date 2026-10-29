@@ -58,7 +58,7 @@ class FakeApi:
         # первый полный опрос — список устройств (включённое)
         self.get_devices = AsyncMock(return_value=[self._dev_initial])
 
-        def _get_device_side_effect(device_id):
+        def _get_device_side_effect(device_id, **_kwargs):
             """Targeted refresh returns the newer device snapshot."""
             return self._dev_refreshed
 
@@ -125,7 +125,7 @@ async def test_refresh_device_updates_coordinator_data(monkeypatch):
         translation_key="command_failed",
     )
 
-    runtime.api.get_device.assert_awaited_once_with(1)
+    runtime.api.get_device.assert_awaited_once_with(1, quick=True)
     assert runtime.coordinator.data["states"]["1"]["pwr_on"] is False
 
 
@@ -164,7 +164,7 @@ async def test_refresh_device_preserves_newer_websocket_field(monkeypatch):
             self.login = AsyncMock()
             self.get_devices = AsyncMock(return_value=[initial])
 
-        async def get_device(self, _device_id):
+        async def get_device(self, _device_id, **_kwargs):
             get_started.set()
             await release_get.wait()
             return stale_refresh

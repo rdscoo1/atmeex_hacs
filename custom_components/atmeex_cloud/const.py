@@ -13,6 +13,8 @@ API_BASE_URL = "https://api.iot.atmeex.com"
 INTEGRATION_VERSION = "0.10.0"
 USER_AGENT = f"AtmeexCloudHomeAssistant/{INTEGRATION_VERSION}"
 API_REQUEST_TIMEOUT_SEC = 20
+# Post-command confirmation GET: best effort, so one short attempt.
+API_CONFIRM_TIMEOUT_SEC = 10
 API_AUTH_TIMEOUT_SEC = 20
 RETRY_MAX_ATTEMPTS = 3
 RETRY_BASE_DELAY_SEC = 1.0

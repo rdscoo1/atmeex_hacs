@@ -21,6 +21,7 @@ from custom_components.atmeex_cloud.api import (
 )
 from custom_components.atmeex_cloud.const import (
     API_AUTH_TIMEOUT_SEC,
+    API_CONFIRM_TIMEOUT_SEC,
     API_REQUEST_TIMEOUT_SEC,
     INTEGRATION_VERSION,
 )
@@ -1321,3 +1322,80 @@ async def test_set_damper_position_rejects_virtual_supply_valve():
 
     with pytest.raises(AtmeexProtocolError, match="set_damper_position"):
         await api.set_damper_position(1, 3)
+
+
+@pytest.mark.asyncio
+async def test_quick_get_device_is_one_short_attempt(monkeypatch):
+    session = FakeSession()
+    session.queue_response(FakeResponse(503))
+    api = AtmeexApi(session)
+    api._token = "t"
+    monkeypatch.setattr(asyncio, "sleep", AsyncMock())
+
+    with pytest.raises(AtmeexConnectionError):
+        await api.get_device(1, quick=True)
+
+    assert len(session.requests) == 1
+    assert session.requests[0][4] == API_CONFIRM_TIMEOUT_SEC
+
+
+def _connector_error():
+    from aiohttp import ClientConnectorError
+
+    return ClientConnectorError(MagicMock(), OSError("connection refused"))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "first_failure",
+    [FakeResponse(503), FakeResponse(502), FakeResponse(429), "connector"],
+    ids=["503", "502", "429", "connect-refused"],
+)
+async def test_put_is_resent_once_when_provably_undelivered(monkeypatch, first_failure):
+    session = FakeSession()
+    session.queue_response(
+        _connector_error() if first_failure == "connector" else first_failure
+    )
+    session.queue_response(FakeResponse(200))
+    api = AtmeexApi(session)
+    api._token = "t"
+    monkeypatch.setattr(asyncio, "sleep", AsyncMock())
+
+    await api.set_fan_speed(1, 3)
+
+    assert [request[0] for request in session.requests] == ["PUT", "PUT"]
+    assert session.requests[1][2] == {"u_fan_speed": 2}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "failure",
+    [FakeResponse(500), FakeResponse(504), asyncio.TimeoutError(), ClientError()],
+    ids=["500", "504", "timeout", "client-error"],
+)
+async def test_put_is_not_resent_when_it_may_have_applied(monkeypatch, failure):
+    session = FakeSession()
+    session.queue_response(failure)
+    api = AtmeexApi(session)
+    api._token = "t"
+    monkeypatch.setattr(asyncio, "sleep", AsyncMock())
+
+    with pytest.raises(AtmeexConnectionError):
+        await api.set_fan_speed(1, 3)
+
+    assert len(session.requests) == 1
+
+
+@pytest.mark.asyncio
+async def test_put_is_resent_at_most_once(monkeypatch):
+    session = FakeSession()
+    session.queue_response(FakeResponse(503))
+    session.queue_response(FakeResponse(503))
+    api = AtmeexApi(session)
+    api._token = "t"
+    monkeypatch.setattr(asyncio, "sleep", AsyncMock())
+
+    with pytest.raises(AtmeexConnectionError):
+        await api.set_fan_speed(1, 3)
+
+    assert len(session.requests) == 2

@@ -12,7 +12,7 @@ import time
 from typing import Any
 from urllib.parse import quote
 
-from aiohttp import ClientSession, ClientError, ClientResponse
+from aiohttp import ClientConnectorError, ClientSession, ClientError, ClientResponse
 from yarl import URL
 
 from .helpers import (
@@ -26,6 +26,7 @@ from .privacy import anonymous_device_label
 from .const import (
     API_AUTH_TIMEOUT_SEC,
     API_BASE_URL,
+    API_CONFIRM_TIMEOUT_SEC,
     API_REQUEST_TIMEOUT_SEC,
     RETRY_BASE_DELAY_SEC,
     RETRY_MAX_ATTEMPTS,
@@ -137,6 +138,15 @@ def _error_for_status(
             operation, "cloud service unavailable", status=status
         )
     return AtmeexProtocolError(operation, "request rejected", status=status)
+
+
+def _provably_undelivered(err: AtmeexApiError) -> bool:
+    """True when the cloud cannot have applied the request, so resending is safe."""
+    return (
+        isinstance(err, AtmeexRateLimitError)
+        or err.status in (502, 503)
+        or isinstance(err.__cause__, ClientConnectorError)
+    )
 
 
 def _device_url(device_id: int | str, suffix: str = "") -> URL:
@@ -616,6 +626,7 @@ class AtmeexApi:
         snapshot: _TokenSnapshot,
         json_body: Any | None,
         expect_json: bool,
+        timeout: float,
     ) -> Any:
         request_url = path if isinstance(path, URL) else f"{API_BASE_URL}{path}"
         try:
@@ -624,7 +635,7 @@ class AtmeexApi:
                 request_url,
                 json=json_body,
                 headers=self._headers_for(snapshot),
-                timeout=API_REQUEST_TIMEOUT_SEC,
+                timeout=timeout,
             ) as response:
                 return await self._consume_response(
                     response,
@@ -644,9 +655,12 @@ class AtmeexApi:
         operation: str,
         json_body: Any | None = None,
         expect_json: bool = True,
+        max_attempts: int | None = None,
+        timeout: float = API_REQUEST_TIMEOUT_SEC,
     ) -> Any:
         await self._ensure_token()
-        max_attempts = RETRY_MAX_ATTEMPTS if method == "GET" else 2
+        if max_attempts is None:
+            max_attempts = RETRY_MAX_ATTEMPTS if method == "GET" else 2
         retry_delay = RETRY_BASE_DELAY_SEC
         recovered_auth = False
 
@@ -660,6 +674,7 @@ class AtmeexApi:
                     snapshot=snapshot,
                     json_body=json_body,
                     expect_json=expect_json,
+                    timeout=timeout,
                 )
             except AtmeexAuthenticationError as err:
                 if err.status != 401:
@@ -674,7 +689,12 @@ class AtmeexApi:
                     await self._recover_locked(snapshot, err.status or 401)
                 recovered_auth = True
             except (AtmeexConnectionError, AtmeexRateLimitError) as err:
-                if method != "GET" or attempt == max_attempts:
+                # Writes are resent only when the cloud provably never applied
+                # them; after a timeout or a 500 a late duplicate could race
+                # the user's next command.
+                if attempt == max_attempts or (
+                    method != "GET" and not _provably_undelivered(err)
+                ):
                     raise
                 self._retry_count += 1
                 wait = (
@@ -799,13 +819,21 @@ class AtmeexApi:
             )
         return devices
 
-    async def get_device(self, device_id: int | str) -> AtmeexDevice:
+    async def get_device(
+        self,
+        device_id: int | str,
+        *,
+        quick: bool = False,
+    ) -> AtmeexDevice:
+        """Fetch one device; quick=True makes one short attempt (confirmation)."""
         canonical_id = normalize_device_id(device_id)
         payload = await self._request(
             "GET",
             _device_url(device_id),
             operation="get_device",
             expect_json=True,
+            max_attempts=1 if quick else None,
+            timeout=API_CONFIRM_TIMEOUT_SEC if quick else API_REQUEST_TIMEOUT_SEC,
         )
         if not isinstance(payload, dict):
             raise AtmeexProtocolError(

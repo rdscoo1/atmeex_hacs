@@ -57,10 +57,10 @@ _LOGGER = logging.getLogger(__name__)
 # asyncio.wait returns after this limit even if the task is stuck in finally.
 _UNLOAD_TASK_TIMEOUT_SEC: float = 5.0
 
-# Upper-bound for awaiting a coalesced in-flight refresh_device task.
-# Sized to cover all retries (RETRY_MAX_ATTEMPTS=3 × 20 s timeout + headroom).
+# Upper-bound for awaiting a coalesced in-flight refresh_device task. The
+# confirmation GET is one 10 s attempt; headroom covers a token sign-in (20 s).
 # Module-level so tests can monkeypatch it without touching the closure.
-_REFRESH_TASK_TIMEOUT_SEC: float = 65.0
+_REFRESH_TASK_TIMEOUT_SEC: float = 35.0
 
 from .runtime import AtmeexRuntimeData
 
@@ -366,7 +366,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         baseline = runtime_data.state_store.capture_device(device_id)
         unexpected_failure: AtmeexProtocolError | None = None
         try:
-            full: AtmeexDevice = await api.get_device(device_id)
+            full: AtmeexDevice = await api.get_device(device_id, quick=True)
         except AtmeexApiError as err:
             _report_targeted_failure(device_id, err)
             raise

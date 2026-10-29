@@ -196,7 +196,7 @@ async def test_websocket_batch_message_updates_coordinator_once(monkeypatch):
             self._devices = [dev1, dev2]
             self.get_devices = AsyncMock(return_value=self._devices)
 
-            async def _get_device(device_id):
+            async def _get_device(device_id, **_kwargs):
                 for dev in self._devices:
                     if dev.id == int(device_id):
                         return dev
@@ -1102,7 +1102,7 @@ async def test_cancelled_refresh_waiter_does_not_cancel_owner(monkeypatch):
     api.release = asyncio.Event()
     api.get_device_calls = 0
 
-    async def blocked_get_device(device_id):
+    async def blocked_get_device(device_id, **_kwargs):
         api.get_device_calls += 1
         api.started.set()
         await api.release.wait()
@@ -1470,7 +1470,7 @@ async def test_refresh_device_coalesces_parallel_requests(monkeypatch):
             self.get_devices = AsyncMock(return_value=[self._dev])
             self.get_device_calls = 0
 
-            async def _get_device(_device_id):
+            async def _get_device(_device_id, **_kwargs):
                 self.get_device_calls += 1
                 if self._block_get_device:
                     await self._gate.wait()
@@ -1552,7 +1552,7 @@ async def test_refresh_device_hung_task_times_out_for_second_caller(monkeypatch)
             # requests; the first targeted refresh should block for this test.
             self._get_device_calls = 0
 
-            async def _gate_get_device(_device_id):
+            async def _gate_get_device(_device_id, **_kwargs):
                 self._get_device_calls += 1
                 if self._get_device_calls >= 1:
                     task_started.set()  # notify that we reached the blocking point
