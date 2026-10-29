@@ -44,4 +44,8 @@ MIN_UPDATE_INTERVAL = 10
 # Entities go unavailable only after this many update intervals without a
 # successful inventory poll (one failed poll must not block every command).
 STALE_INVENTORY_INTERVALS = 3
+# A device missing from the account is shown offline after two missed polls
+# but only retired (HA device + entities deleted) after this grace period, so
+# resetting and re-adding a breezer does not wipe its Home Assistant setup.
+DEVICE_RETIRE_GRACE_SEC = 7 * 24 * 3600
 MAX_UPDATE_INTERVAL = 300

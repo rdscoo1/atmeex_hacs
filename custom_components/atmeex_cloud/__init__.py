@@ -779,9 +779,9 @@ async def async_remove_config_entry_device(
 ) -> bool:
     """Authoritatively allow device removal only when the cloud confirms absence.
 
-    A device is refused while it is still in the authoritative inventory (and
-    throughout the one-miss grace period, since the store keeps publishing it
-    until the second successful absence). An absent device is allowed, and its
+    A device is refused while the authoritative inventory still lists it,
+    including its first missed poll. Once two consecutive polls missed it the
+    user may remove it without waiting for automatic retirement. Its
     per-device executor state is dropped so it doesn't accumulate across
     add/remove cycles.
     """
@@ -799,7 +799,11 @@ async def async_remove_config_entry_device(
 
     state_store = getattr(runtime, "state_store", None)
     current_ids = (
-        set(state_store.data.get("device_map", {}))
+        {
+            key
+            for key in state_store.data.get("device_map", {})
+            if not state_store.is_confirmed_absent(key)
+        }
         if state_store is not None
         else set()
     )

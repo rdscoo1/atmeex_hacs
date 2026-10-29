@@ -43,7 +43,9 @@ def _coordinator(hass, api, entry_id="entry-1") -> AtmeexCoordinator:
 
 
 @pytest.mark.asyncio
-async def test_confirmed_stale_device_loses_config_entry_association(hass) -> None:
+async def test_confirmed_stale_device_loses_config_entry_association(
+    hass, no_retire_grace
+) -> None:
     config_entry = MockConfigEntry(domain=DOMAIN, entry_id="entry-1")
     config_entry.add_to_hass(hass)
     entry_id = config_entry.entry_id
@@ -73,7 +75,8 @@ async def test_confirmed_stale_device_loses_config_entry_association(hass) -> No
 async def test_manual_removal_refuses_active_and_allows_absent_device(hass) -> None:
     runtime = SimpleNamespace(
         state_store=SimpleNamespace(
-            data={"devices": [], "device_map": {"7": _device(7)}, "states": {}}
+            data={"devices": [], "device_map": {"7": _device(7)}, "states": {}},
+            is_confirmed_absent=lambda _device_id: False,
         ),
         command_executor=None,
     )
@@ -83,3 +86,24 @@ async def test_manual_removal_refuses_active_and_allows_absent_device(hass) -> N
 
     assert await async_remove_config_entry_device(hass, entry, active) is False
     assert await async_remove_config_entry_device(hass, entry, absent) is True
+
+
+@pytest.mark.asyncio
+async def test_manual_removal_allowed_once_confirmed_absent_before_retirement(
+    hass,
+) -> None:
+    store = AtmeexStateStore()
+    store.apply_inventory([_device(7)], store.capture_all(), now_mono=0.0)
+    store.apply_inventory([], store.capture_all(), now_mono=30.0)
+    entry = SimpleNamespace(
+        runtime_data=SimpleNamespace(state_store=store, command_executor=None)
+    )
+    device_entry = SimpleNamespace(identifiers={(DOMAIN, "7")})
+
+    # One missed poll: still refused.
+    assert await async_remove_config_entry_device(hass, entry, device_entry) is False
+
+    store.apply_inventory([], store.capture_all(), now_mono=60.0)
+    # Confirmed absent but kept for the grace period: the user may delete it.
+    assert "7" in store.data["device_map"]
+    assert await async_remove_config_entry_device(hass, entry, device_entry) is True

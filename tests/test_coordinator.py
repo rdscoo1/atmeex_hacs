@@ -175,7 +175,9 @@ async def test_malformed_nested_inventory_maps_to_update_failed_and_preserves_sn
 
 
 @pytest.mark.asyncio
-async def test_authoritative_absence_removes_device_after_two_successful_polls():
+async def test_authoritative_absence_removes_device_after_two_successful_polls(
+    no_retire_grace,
+):
     device = AtmeexDevice.from_raw(
         {
             "id": 1,
@@ -199,7 +201,7 @@ async def test_authoritative_absence_removes_device_after_two_successful_polls()
 
 
 @pytest.mark.asyncio
-async def test_failed_poll_does_not_advance_authoritative_absence():
+async def test_failed_poll_does_not_advance_authoritative_absence(no_retire_grace):
     device = AtmeexDevice.from_raw(
         {
             "id": 1,

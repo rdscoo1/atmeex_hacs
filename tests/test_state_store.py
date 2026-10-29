@@ -401,7 +401,9 @@ def test_refresh_copies_only_the_changed_target_state():
     assert update.data["states"]["2"] is before_unaffected
 
 
-def test_device_is_removed_only_after_two_successful_absent_inventories():
+def test_device_is_removed_only_after_two_successful_absent_inventories(
+    no_retire_grace,
+):
     store = seed_store(device())
 
     first = store.apply_inventory([], store.capture_all())
@@ -413,7 +415,9 @@ def test_device_is_removed_only_after_two_successful_absent_inventories():
     assert second.data == {"devices": [], "device_map": {}, "states": {}}
 
 
-def test_targeted_refresh_does_not_reset_authoritative_absence_count():
+def test_targeted_refresh_does_not_reset_authoritative_absence_count(
+    no_retire_grace,
+):
     current = device()
     store = seed_store(current)
 
@@ -471,7 +475,9 @@ def test_inventory_reappearance_resets_consecutive_absence_count():
     assert store._absence_counts == {"1": 1}
 
 
-def test_inventory_absence_count_is_not_reset_by_websocket_updates():
+def test_inventory_absence_count_is_not_reset_by_websocket_updates(
+    no_retire_grace,
+):
     store = seed_store(device())
 
     first = store.apply_inventory([], store.capture_all())
@@ -522,3 +528,35 @@ def test_inventory_owns_new_devices_under_canonical_keys():
     assert set(update.data["device_map"]) == {"7"}
     assert set(update.data["states"]) == {"7"}
     assert stored.condition["history"] == {"samples": [18]}
+
+
+def test_absent_device_stays_offline_until_retire_grace_expires():
+    from custom_components.atmeex_cloud.const import DEVICE_RETIRE_GRACE_SEC
+
+    store = seed_store(device())
+    first = store.apply_inventory([], store.capture_all(), now_mono=0.0)
+    assert first.data["states"]["1"]["online"] is True  # one miss: no change
+
+    second = store.apply_inventory([], store.capture_all(), now_mono=60.0)
+    # Missing from the account (e.g. mid re-pairing): kept, but offline.
+    assert "1" in second.data["device_map"]
+    assert second.data["states"]["1"]["online"] is False
+    assert second.removed_device_ids == frozenset()
+    assert store.is_confirmed_absent(1)
+
+    retired = store.apply_inventory(
+        [], store.capture_all(), now_mono=float(DEVICE_RETIRE_GRACE_SEC)
+    )
+    assert retired.removed_device_ids == frozenset({"1"})
+    assert "1" not in retired.data["device_map"]
+
+
+def test_returning_device_comes_back_online_and_clears_absence():
+    store = seed_store(device())
+    store.apply_inventory([], store.capture_all(), now_mono=0.0)
+    store.apply_inventory([], store.capture_all(), now_mono=60.0)
+
+    back = store.apply_inventory([device()], store.capture_all(), now_mono=120.0)
+
+    assert back.data["states"]["1"]["online"] is True
+    assert not store.is_confirmed_absent(1)

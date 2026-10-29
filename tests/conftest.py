@@ -124,6 +124,14 @@ class DummyCoordinator:
             )
 
 
+@pytest.fixture
+def no_retire_grace(monkeypatch):
+    """Retire absent devices on the second missed poll (no grace period)."""
+    import custom_components.atmeex_cloud.state_store as state_store_module
+
+    monkeypatch.setattr(state_store_module, "DEVICE_RETIRE_GRACE_SEC", 0)
+
+
 def make_fake_api_class(
     *,
     devices: list[dict] | None = None,

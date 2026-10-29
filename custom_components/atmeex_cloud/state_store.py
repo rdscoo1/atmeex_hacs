@@ -3,10 +3,12 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from copy import deepcopy
 from dataclasses import dataclass
+import time
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any
 
 from .api import AtmeexDevice, AtmeexState
+from .const import DEVICE_RETIRE_GRACE_SEC
 from .helpers import normalize_device_id
 
 if TYPE_CHECKING:
@@ -79,10 +81,15 @@ class AtmeexStateStore:
         self._revision = 0
         self._field_revisions: dict[str, dict[str, int]] = {}
         self._absence_counts: dict[str, int] = {}
+        self._absent_since: dict[str, float] = {}
 
     @property
     def data(self) -> AtmeexCoordinatorData:
         return self._data
+
+    def is_confirmed_absent(self, device_id: int | str) -> bool:
+        """True once two consecutive successful polls missed the device."""
+        return self._absence_counts.get(normalize_device_id(device_id), 0) >= 2
 
     def capture_device(self, device_id: int | str) -> FieldRevisionBaseline:
         key = normalize_device_id(device_id)
@@ -260,10 +267,14 @@ class AtmeexStateStore:
         self,
         devices: Sequence[AtmeexDevice],
         baselines: Mapping[str, FieldRevisionBaseline],
+        *,
+        now_mono: float | None = None,
     ) -> StateStoreUpdate:
+        now = time.monotonic() if now_mono is None else now_mono
         device_map = dict(self._data.get("device_map", {}))
         states = dict(self._data.get("states", {}))
         absence_counts = dict(self._absence_counts)
+        absent_since = dict(self._absent_since)
         canonical_baselines = {
             normalize_device_id(device_id): baseline
             for device_id, baseline in baselines.items()
@@ -288,6 +299,7 @@ class AtmeexStateStore:
             changed.update(item_changed)
             touched.update(item_touched)
             absence_counts[key] = 0
+            absent_since.pop(key, None)
 
         removed: set[str] = set()
         for key in tuple(device_map):
@@ -295,12 +307,23 @@ class AtmeexStateStore:
                 continue
             count = absence_counts.get(key, 0) + 1
             absence_counts[key] = count
+            first_missed = absent_since.setdefault(key, now)
             if count < 2:
                 continue
-            device_map.pop(key, None)
-            states.pop(key, None)
-            absence_counts.pop(key, None)
-            removed.add(key)
+            if now - first_missed >= DEVICE_RETIRE_GRACE_SEC:
+                device_map.pop(key, None)
+                states.pop(key, None)
+                absence_counts.pop(key, None)
+                absent_since.pop(key, None)
+                removed.add(key)
+                continue
+            # Missing from the account (e.g. while being re-paired): keep the
+            # HA device and its entities, but show it offline.
+            state = states.get(key, {})
+            if state.get("online") is not False:
+                states[key] = {**state, "online": False}
+                changed.add((key, "state.online"))
+                touched.add((key, "state.online"))
 
         update = self._commit(
             device_map,
@@ -310,4 +333,5 @@ class AtmeexStateStore:
             removed=frozenset(removed),
         )
         self._absence_counts = absence_counts
+        self._absent_since = absent_since
         return update
