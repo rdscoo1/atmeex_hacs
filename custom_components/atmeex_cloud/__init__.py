@@ -59,8 +59,9 @@ _UNLOAD_TASK_TIMEOUT_SEC: float = 5.0
 
 # Upper-bound for awaiting a coalesced in-flight refresh_device task. The
 # confirmation GET is one 10 s attempt; a token recovery can push it past this
-# bound, which is harmless: confirmation is best-effort and a timed-out owner
-# is evicted so later callers start a fresh refresh.
+# bound, which is harmless: confirmation is best-effort, a timed-out owner is
+# evicted so later callers start a fresh refresh, and an evicted owner that a
+# newer refresh superseded drops its result instead of applying it.
 # Module-level so tests can monkeypatch it without touching the closure.
 _REFRESH_TASK_TIMEOUT_SEC: float = 35.0
 
@@ -383,6 +384,11 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             _report_targeted_failure(device_id, unexpected_failure)
             raise unexpected_failure
         if runtime_data.stopping:
+            return
+        current = runtime_data.refresh_tasks.get(normalize_device_id(device_id))
+        if current is not None and current is not asyncio.current_task():
+            # Evicted by a timed-out waiter and superseded by a newer refresh:
+            # applying this older response would block the newer one's data.
             return
         update = runtime_data.state_store.apply_refresh(full, baseline)
         if not update.changed:

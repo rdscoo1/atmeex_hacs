@@ -1682,4 +1682,89 @@ async def test_refresh_device_after_timeout_starts_new_owner(monkeypatch):
         assert runtime.api.get_device_calls == 2
     finally:
         gate.set()
-        await asyncio.sleep(0)
+        await asyncio.gather(*list(runtime.tasks), return_exceptions=True)
+
+
+async def test_superseded_refresh_owner_does_not_apply_stale_result(monkeypatch):
+    """An evicted owner's late response must not block its successor's data.
+
+    R_A (evicted after its waiter timed out) returns OLD state after R_B has
+    captured its baseline; applying R_A would bump revisions and make R_B's
+    NEW state be rejected field-by-field.
+    """
+    gate_a = asyncio.Event()
+    gate_b = asyncio.Event()
+    started_b = asyncio.Event()
+
+    def _dev(fan_speed):
+        return AtmeexDevice.from_raw({
+            "id": 1, "name": "Dev1", "model": "m",
+            "online": True, "condition": {"pwr_on": 1, "fan_speed": fan_speed},
+            "settings": {},
+        })
+
+    class FakeApi:
+        def __init__(self, session, *, on_refresh_token_changed=None):
+            self.async_init = AsyncMock()
+            self.refresh_token = None
+            self.login = AsyncMock()
+            self.get_devices = AsyncMock(return_value=[_dev(2)])
+            self.get_device_calls = 0
+
+        async def get_device(self, _device_id, **_kwargs):
+            self.get_device_calls += 1
+            if self.get_device_calls == 1:
+                await gate_a.wait()
+                return _dev(3)  # OLD (HA speed 4)
+            started_b.set()
+            await gate_b.wait()
+            return _dev(5)  # NEW (HA speed 6)
+
+        @property
+        def token(self):
+            return "tok"
+
+    monkeypatch.setattr(atmeex_init, "AtmeexApi", FakeApi)
+    monkeypatch.setattr(atmeex_init, "async_get_clientsession", lambda hass: object())
+    monkeypatch.setattr(atmeex_init, "_REFRESH_TASK_TIMEOUT_SEC", 0.05)
+    monkeypatch.setattr(atmeex_init, "AtmeexCoordinator", _IntegrationCoordinatorFake)
+
+    hass = SimpleNamespace(
+        data={},
+        async_create_task=asyncio.create_task,
+        config_entries=SimpleNamespace(
+            async_forward_entry_setups=AsyncMock(),
+            async_unload_platforms=AsyncMock(return_value=True),
+        ),
+    )
+    entry = SimpleNamespace(
+        data={"email": "user@example.com", "password": "pwd"},
+        options={"update_interval": 30, "enable_websocket": False},
+        entry_id="entry1",
+        add_update_listener=lambda _listener: (lambda: None),
+        async_on_unload=lambda _cb: None,
+    )
+
+    assert await atmeex_init.async_setup_entry(hass, entry) is True
+    runtime = entry.runtime_data
+    try:
+        with pytest.raises(asyncio.TimeoutError):
+            await runtime.refresh_device(1)
+        owner_a = next(iter(runtime.tasks))
+        assert "1" not in runtime.refresh_tasks  # evicted, still running
+
+        caller_b = asyncio.create_task(runtime.refresh_device(1))
+        await asyncio.wait_for(started_b.wait(), timeout=1)
+
+        gate_a.set()
+        await asyncio.wait({owner_a}, timeout=1)
+        assert owner_a.done()
+
+        gate_b.set()
+        await asyncio.wait_for(caller_b, timeout=1)
+
+        assert runtime.state_store.data["states"]["1"]["fan_speed"] == 6
+    finally:
+        gate_a.set()
+        gate_b.set()
+        await asyncio.gather(*list(runtime.tasks), return_exceptions=True)
