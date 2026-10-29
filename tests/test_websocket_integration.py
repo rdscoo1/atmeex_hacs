@@ -1128,7 +1128,9 @@ async def test_cancelled_refresh_waiter_does_not_cancel_owner(monkeypatch):
         with pytest.raises(asyncio.TimeoutError):
             await runtime.refresh_device(1)
         assert api.get_device_calls == 1
-        assert runtime.refresh_tasks["1"] is owner
+        # A timed-out waiter evicts the owner (later callers must not join it)
+        # but never cancels it.
+        assert "1" not in runtime.refresh_tasks
         assert owner.cancelled() is False
 
         api.release.set()
