@@ -111,15 +111,18 @@ The per-field revision map inside `AtmeexStateStore` is the single mechanism pre
 
 Other invariants:
 
-- A device is retired only after **two consecutive successful** polls report it absent (`_absence_counts`); a failed poll can never retire a device.
-- `async_set_updated_data` (WS/refresh publications) reschedules HA's poll timer, so busy WS traffic would postpone polls forever — the **inventory watchdog** (`async_inventory_watchdog`) forces an authoritative refresh when the inventory is older than the update interval.
+- A device missing from **two consecutive successful** polls is marked `online=False` but kept (store's `_absence_counts`, `_absent_since`); it is retired (HA device + entities deleted) only after `DEVICE_RETIRE_GRACE_SEC` (7 days), so re-pairing a breezer keeps its HA setup. A failed poll never advances absence. The grace clock is in-memory (monotonic): it restarts on every HA restart, and a device that vanished *before* a restart is never in the store, so it is never auto-retired — removal is manual (the removal gate allows deleting a device absent from the inventory).
+- Detail hydration: a device whose detail fetch fails and that never had real detail is published from its list item with `online: False` (unavailable, never a guessed "off") until a detail succeeds.
+- `setup_dynamic_device_entities` forgets a unique_id only once its entity-registry entry is gone, so a returning device whose entities were deleted gets them re-added, while unloaded/disabled/aborted entities stay known.
+- `async_set_updated_data` (WS/refresh publications) reschedules HA's poll timer, so busy WS traffic would postpone polls forever — the **inventory watchdog** (`async_inventory_watchdog`) forces an authoritative refresh when no poll was *attempted* within the update interval (attempt, not success, so an outage is not polled twice as often).
+- Entity availability uses `coordinator.inventory_stale` (no successful inventory for `STALE_INVENTORY_INTERVALS` × interval), **not** `last_update_success`: HA silently drops service calls to unavailable entities, so one failed poll must not block commands. `_async_update_data` calls `_notify_listeners_safely()` on every failure because HA only notifies when success flips; a listener exception is logged, never allowed to mask the typed error.
 - Poll failures are typed: auth → `ConfigEntryAuthFailed`, transport/rate-limit/protocol → `UpdateFailed`. Never mask one as the other.
 
 ---
 
 ## DummyCoordinator — keep it in sync
 
-`tests/conftest.py` has the single `DummyCoordinator` used by integration-level tests (other files import it from there). It must have every attribute that `__init__.py` and diagnostics access on the real coordinator (`last_api_error`, `last_success_ts`, `last_inventory_success_mono`, `avg_latency_ms`, `request_retries`, the `_api_error_*` throttle fields, `_last_detail_*`), and it borrows several real `AtmeexCoordinator` methods via `getattr`. **Whenever you add an attribute to `AtmeexCoordinator.__init__`, mirror it in `DummyCoordinator`.**
+`tests/conftest.py` has the single `DummyCoordinator` used by integration-level tests (other files import it from there). It must have every attribute that `__init__.py` and diagnostics access on the real coordinator (`last_api_error`, `last_success_ts`, `last_inventory_success_mono`, `last_inventory_attempt_mono`, `_max_inventory_age_seconds`, `avg_latency_ms`, `request_retries`, the `_api_error_*` throttle fields, `_last_detail_*`, plus `async_update_listeners`, `_notify_listeners_safely` and the `inventory_stale` property), and it borrows several real `AtmeexCoordinator` methods via `getattr`. **Whenever you add an attribute to `AtmeexCoordinator.__init__`, mirror it in `DummyCoordinator`.**
 
 ---
 
@@ -201,7 +204,11 @@ Use Serena for navigation (finding where things are defined or referenced) rathe
 
 **`_request()` 401 recovery path** — token recovery goes through `_recover_locked(snapshot, status)` under `self._lock`, keyed by the token *generation* captured before the failure. After acquiring the lock, a newer generation means someone else already recovered — return without a new sign-in. Never call `_sign_in()`/`_signin_refresh()` outside this mechanism.
 
-**Set commands don't retry on transport errors** — non-GET requests in `_request` use `max_attempts = 2`, and the transport/rate-limit retry branch is GET-only. The second attempt exists solely for the single 401→recover→replay cycle. This is intentional: retrying a non-idempotent PUT after a timeout can race with user input.
+**Set commands are resent at most once, and only when provably undelivered** — non-GET requests in `_request` use `max_attempts = 2`, shared by the 401→recover→replay cycle and `_provably_undelivered` failures (429, 503, `ClientConnectorError`). Timeouts, 500, 502 (a proxy can return it after the upstream applied the write) and 504 are never resent: a late duplicate could race the user's next command. The post-command confirmation GET (`get_device(quick=True)`) is one 10 s attempt for transport/rate-limit errors, but still does the single 401 recover+replay.
+
+**Targeted refresh coalescing** — concurrent `refresh_device` calls for one device join the owner task in `refresh_tasks`. A waiter that times out *evicts* the owner (does not cancel it) so later callers start fresh; an evicted owner that a newer owner superseded drops its result instead of applying it, because its older data would otherwise bump field revisions and block the newer refresh.
+
+**Commands send only what changes — decided inside the lock** — entity commands call `_already_applied(desired)` at call time (skip entirely only when `executor.is_busy(device)` is False — no command queued, running or awaiting confirmation, and no unexpired pending value — and the cloud's stored targets, `settings.u_*`, already match) and `_fields_to_write(desired)` *inside* the operation, where `executor.settled_value` ignores the running command's own pending value and anything queued after it. Never decide writes before `_execute_command`: a queued predecessor may still fail. `executor.targets_untrusted(device)` is set after every write operation and cleared only by a successful confirmation refresh; while set (failed write, failed or cancelled confirmation) everything is sent. Target converters are strict (e.g. fan speed outside 0–6): a malformed stored target counts as missing, so the field is sent. `u_pwr_on` may share a PUT body only when it actually changes — the cloud drops fields from a combined body with an unchanged `u_pwr_on` (commit `fa6b806`), which is why the damper goes alone via `set_damper_position`.
 
 **Version lives in two places** — `manifest.json` and `const.INTEGRATION_VERSION` must be bumped together; `tests/test_manifest.py` fails if they drift.
 

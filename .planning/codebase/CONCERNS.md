@@ -317,5 +317,28 @@ CLAUDE.md's concurrency section documented the removed timestamp-dict mechanism 
 
 ---
 
-*Concerns audit: 2026-05-02; addendum 2026-07-17*
+## Addendum — 2026-10-29 command reliability and offline resilience (`fix/command-reliability`)
+
+### Shipped fixes
+
+- ~~Optimistic command values reached the UI only after the API call~~ FIXED — published immediately; climate shows pending targets; breezer-mode mapping unified.
+- ~~Every command re-sent all fields~~ FIXED — only fields whose cloud target (`settings.u_*`) differs are written, decided inside the device lock; identical repeats cost zero requests when the executor is idle and targets are trusted (`targets_untrusted` until a successful confirmation).
+- ~~Undelivered writes were lost~~ FIXED — writes are resent once on 429/503/`ClientConnectorError` only; the confirmation GET is a quick single attempt that still recovers a 401.
+- ~~A timed-out refresh waiter could keep joining a hung owner, and a stale owner result could block newer data~~ FIXED — the waiter evicts the owner; a superseded owner drops its result.
+- ~~One failed poll made every entity unavailable (HA drops service calls to unavailable entities)~~ FIXED — availability keyed on `inventory_stale`; listeners notified on failure via `_notify_listeners_safely()`.
+- ~~One device's failed detail fetch failed the whole poll / showed a guessed "off"~~ FIXED — list item published; never-hydrated device stays unavailable.
+- ~~WebSocket backoff reset on every connect~~ FIXED — reset only after a stable connection.
+- ~~Inventory watchdog keyed on last success polled twice as often during outages~~ FIXED — keyed on last attempt.
+- ~~Absent breezers deleted after two polls (re-pairing lost the HA setup)~~ FIXED — kept offline for a 7-day in-memory grace; entities re-added when a removed device returns (unique_id forgotten only once its registry entry is gone).
+
+### Open / to verify on real hardware
+
+- **Damper-only PUT** `{"u_damp_pos": N}` (`set_damper_position`) is not yet verified against the real cloud.
+- **Re-paired device id** — unknown whether a reset + re-paired breezer keeps the same cloud device id; the 7-day grace only helps if it does.
+- **`settings.u_*` in `/devices`** — unverified whether the real list payload carries the targets; if not, write filtering falls back to sending everything.
+- **Residual:** a WebSocket push without power state for a never-hydrated device can mark it online showing a defaulted `pwr_on=False` until the next successful detail.
+
+---
+
+*Concerns audit: 2026-05-02; addenda 2026-07-17, 2026-10-29*
 *All 21 pre-rework concerns resolved (3 original + 17 code review + 1 follow-up cleanup); addendum: 5 fixed, 3 accepted/documented*
