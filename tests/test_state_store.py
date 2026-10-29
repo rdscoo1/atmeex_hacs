@@ -560,3 +560,15 @@ def test_returning_device_comes_back_online_and_clears_absence():
 
     assert back.data["states"]["1"]["online"] is True
     assert not store.is_confirmed_absent(1)
+
+
+def test_offline_absent_device_is_forced_offline_again_after_websocket_online():
+    store = seed_store(device())
+    store.apply_inventory([], store.capture_all(), now_mono=0.0)
+    store.apply_inventory([], store.capture_all(), now_mono=60.0)
+    online = store.apply_websocket_delta(1, state_delta={"online": True})
+    assert online.data["states"]["1"]["online"] is True
+
+    third = store.apply_inventory([], store.capture_all(), now_mono=90.0)
+
+    assert third.data["states"]["1"]["online"] is False

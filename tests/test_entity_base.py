@@ -347,3 +347,53 @@ def test_available_honors_inventory_staleness_and_online(stale, online, expected
     coordinator, dev = _availability_coordinator(stale=stale, online=online)
     entity = _BareEntity(coordinator, 1, dev)
     assert entity.available is expected
+
+
+
+def test_dynamic_entities_are_re_added_when_a_removed_device_returns():
+    from types import SimpleNamespace
+
+    from homeassistant.helpers.entity import Entity
+
+    from custom_components.atmeex_cloud.entity_base import (
+        setup_dynamic_device_entities,
+    )
+
+    def _build(dev):
+        entity = Entity()
+        entity._attr_unique_id = f"{dev.id}_x"
+        return [entity]
+
+    listeners: list = []
+    coordinator = SimpleNamespace(
+        data={
+            "device_map": {
+                "1": AtmeexDevice.from_raw({"id": 1}),
+                "2": AtmeexDevice.from_raw({"id": 2}),
+            }
+        },
+        async_add_listener=lambda cb: listeners.append(cb) or (lambda: None),
+    )
+    added: list = []
+    setup_dynamic_device_entities(
+        entry=SimpleNamespace(async_on_unload=lambda cb: None),
+        coordinator=coordinator,
+        async_add_entities=added.extend,
+        build_entities=_build,
+    )
+    first, disabled = added
+    assert [first.unique_id, disabled.unique_id] == ["1_x", "2_x"]
+
+    # Device 1 removed together with its entities (HA runs on-remove callbacks);
+    # device 2's entity is disabled, so HA aborted adding it.
+    first._call_on_remove_callbacks()
+    disabled.registry_entry = SimpleNamespace(disabled=True)
+    disabled._call_on_remove_callbacks()
+    added.clear()
+
+    # Device 1 returns with the same cloud ID: its entities are added again,
+    # while the disabled entity is not re-submitted on every update.
+    listeners[0]()
+    assert [e.unique_id for e in added] == ["1_x"]
+    listeners[0]()
+    assert len(added) == 1

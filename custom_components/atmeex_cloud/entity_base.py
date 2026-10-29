@@ -277,6 +277,20 @@ def setup_dynamic_device_entities(
                 if unique_key in known_unique_ids:
                     continue
                 known_unique_ids.add(unique_key)
+                # Entities removed with their device must be re-added if the
+                # device returns. HA also runs these callbacks when it aborts
+                # adding a disabled entity; keep those known so every update
+                # doesn't re-submit them.
+                if callable(getattr(entity, "async_on_remove", None)):
+                    entity.async_on_remove(
+                        lambda key=unique_key, ent=entity: (
+                            None
+                            if getattr(
+                                getattr(ent, "registry_entry", None), "disabled", False
+                            )
+                            else known_unique_ids.discard(key)
+                        )
+                    )
                 new_entities.append(entity)
 
         if new_entities:
