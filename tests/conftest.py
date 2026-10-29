@@ -20,6 +20,8 @@ class DummyCoordinator:
     avoids the full HA machinery.
     """
 
+    inventory_stale = AtmeexCoordinator.inventory_stale
+
     def __init__(
         self,
         hass=None,
@@ -38,6 +40,9 @@ class DummyCoordinator:
         self.logger = logger
         self.name = name
         self.update_interval = update_interval
+        self._max_inventory_age_seconds = (
+            update_interval.total_seconds() if update_interval else 30.0
+        )
         self.api = api
         self.state_store = state_store
         self.config_entry_id = config_entry_id

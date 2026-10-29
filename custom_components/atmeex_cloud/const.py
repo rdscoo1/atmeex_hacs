@@ -41,4 +41,7 @@ DEFAULT_UPDATE_INTERVAL = 30
 DEFAULT_ENABLE_WEBSOCKET = True
 DEFAULT_ENABLE_CO2 = True
 MIN_UPDATE_INTERVAL = 10
+# Entities go unavailable only after this many update intervals without a
+# successful inventory poll (one failed poll must not block every command).
+STALE_INVENTORY_INTERVALS = 3
 MAX_UPDATE_INTERVAL = 300

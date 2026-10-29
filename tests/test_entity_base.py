@@ -322,26 +322,28 @@ class _BareEntity(AtmeexEntityMixin):
         self._device_meta = meta
 
 
-def _availability_coordinator(*, success: bool, online: bool):
+def _availability_coordinator(*, stale: bool, online: bool):
     dev = AtmeexDevice.from_raw(
         {"id": 1, "online": online, "condition": {}, "settings": {}}
     )
     return SimpleNamespace(
         data={"states": {"1": {"online": online}}, "device_map": {"1": dev}},
-        last_update_success=success,
+        # A single failed poll flips this to False; it must not matter.
+        last_update_success=False,
+        inventory_stale=stale,
     ), dev
 
 
 @pytest.mark.parametrize(
-    ("success", "online", "expected"),
+    ("stale", "online", "expected"),
     [
-        (True, True, True),    # healthy + online -> available
-        (True, False, False),  # healthy + offline -> unavailable
-        (False, True, False),  # coordinator unhealthy -> unavailable regardless
-        (False, False, False),
+        (False, True, True),   # fresh inventory + online -> available
+        (False, False, False), # fresh inventory + offline -> unavailable
+        (True, True, False),   # sustained outage -> unavailable regardless
+        (True, False, False),
     ],
 )
-def test_available_honors_coordinator_health_and_online(success, online, expected):
-    coordinator, dev = _availability_coordinator(success=success, online=online)
+def test_available_honors_inventory_staleness_and_online(stale, online, expected):
+    coordinator, dev = _availability_coordinator(stale=stale, online=online)
     entity = _BareEntity(coordinator, 1, dev)
     assert entity.available is expected

@@ -348,3 +348,31 @@ def test_fire_api_error_event_throttles_repeated_events(monkeypatch):
         EVENT_API_ERROR,
         {"message": "third", "suppressed_errors": 1},
     )
+
+
+def test_inventory_stale_tolerates_a_short_outage():
+    coord, _api = _make_coordinator()  # 30 s interval -> stale after 90 s
+
+    coord.last_inventory_success_mono = time.monotonic() - 89
+    assert coord.inventory_stale is False
+    coord.last_inventory_success_mono = time.monotonic() - 91
+    assert coord.inventory_stale is True
+    coord.last_inventory_success_mono = None
+    assert coord.inventory_stale is True
+
+
+@pytest.mark.asyncio
+async def test_failed_poll_renotifies_entities_to_recheck_availability():
+    coord, api = _make_coordinator()
+    await coord._async_update_data()
+    coord.async_update_listeners = MagicMock()
+    api.get_devices = AsyncMock(
+        side_effect=AtmeexConnectionError("get_devices", "offline")
+    )
+
+    with pytest.raises(UpdateFailed):
+        await coord._async_update_data()
+
+    # HA skips listeners on a second consecutive failure; we must not.
+    coord.async_update_listeners.assert_called_once_with()
+    assert coord.inventory_stale is False  # one failure is tolerated

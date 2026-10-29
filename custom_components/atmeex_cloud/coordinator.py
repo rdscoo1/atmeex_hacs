@@ -29,7 +29,12 @@ from .api import (
     AtmeexProtocolError,
     AtmeexRateLimitError,
 )
-from .const import DOMAIN, EVENT_API_ERROR, WS_LOGBOOK_MIN_INTERVAL_SEC
+from .const import (
+    DOMAIN,
+    EVENT_API_ERROR,
+    STALE_INVENTORY_INTERVALS,
+    WS_LOGBOOK_MIN_INTERVAL_SEC,
+)
 from .helpers import normalize_device_id, parse_atmeex_bool
 from .state_store import AtmeexStateStore
 
@@ -118,6 +123,19 @@ class AtmeexCoordinator(DataUpdateCoordinator[AtmeexCoordinatorData]):
         self._api_error_suppressed = 0
         self._last_detail_error: AtmeexApiError | None = None
         self._last_detail_failure_count = 0
+
+    @property
+    def inventory_stale(self) -> bool:
+        """True once no authoritative inventory has succeeded for too long.
+
+        A single failed poll must not mark every breezer unavailable: Home
+        Assistant silently drops service calls to unavailable entities.
+        """
+        last = self.last_inventory_success_mono
+        return last is None or (
+            time.monotonic() - last
+            > STALE_INVENTORY_INTERVALS * self._max_inventory_age_seconds
+        )
 
     def _fire_api_error_event(self, data: dict[str, Any]) -> None:
         """Emit one throttled API-error event without masking the API error."""
@@ -404,6 +422,9 @@ class AtmeexCoordinator(DataUpdateCoordinator[AtmeexCoordinatorData]):
         except AtmeexAuthenticationError as err:
             self.last_api_error = err
             self._fire_api_error_event(self._safe_error_event(err))
+            # HA notifies listeners only when success flips, so re-check
+            # entity availability (inventory_stale) on every failure.
+            self.async_update_listeners()
             raise ConfigEntryAuthFailed(
                 f"{err.operation} failed"
             ) from err
@@ -414,6 +435,7 @@ class AtmeexCoordinator(DataUpdateCoordinator[AtmeexCoordinatorData]):
         ) as err:
             self.last_api_error = err
             self._fire_api_error_event(self._safe_error_event(err))
+            self.async_update_listeners()
             raise UpdateFailed(f"{err.operation} failed") from err
 
         # Disassociate only devices the store confirmed absent across two
