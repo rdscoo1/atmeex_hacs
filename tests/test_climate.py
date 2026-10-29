@@ -1696,6 +1696,18 @@ async def test_temperature_skips_power_write_when_target_already_on():
 
 
 @pytest.mark.asyncio
+async def test_temperature_powers_on_when_target_on_but_device_shows_off():
+    # The cloud stores u_pwr_on=True but the device never acknowledged it.
+    ent, _cond, api, _runtime = _make_entity_with_runtime({"pwr_on": False})
+    _with_targets(ent, u_pwr_on=True, u_temp_room=225)
+
+    await ent.async_set_temperature(**{ATTR_TEMPERATURE: 23.0})
+
+    api.set_power.assert_awaited_once_with(1, True)
+    api.set_target_temperature.assert_awaited_once_with(1, 23.0)
+
+
+@pytest.mark.asyncio
 async def test_identical_temperature_sends_nothing():
     ent, _cond, api, runtime = _make_entity_with_runtime()
     _with_targets(ent, u_pwr_on=True, u_temp_room=225)

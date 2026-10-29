@@ -781,7 +781,9 @@ async def async_remove_config_entry_device(
 
     A device is refused while the authoritative inventory still lists it,
     including its first missed poll. Once two consecutive polls missed it the
-    user may remove it without waiting for automatic retirement. Its
+    user may remove it without waiting for automatic retirement; dynamic
+    entity discovery skips confirmed-absent devices, so the removal sticks
+    until the device returns. Its
     per-device executor state is dropped so it doesn't accumulate across
     add/remove cycles.
     """

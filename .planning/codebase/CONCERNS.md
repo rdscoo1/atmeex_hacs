@@ -322,14 +322,14 @@ CLAUDE.md's concurrency section documented the removed timestamp-dict mechanism 
 ### Shipped fixes
 
 - ~~Optimistic command values reached the UI only after the API call~~ FIXED — published immediately; climate shows pending targets; breezer-mode mapping unified.
-- ~~Every command re-sent all fields~~ FIXED — only fields whose cloud target (`settings.u_*`) differs are written, decided inside the device lock; identical repeats cost zero requests when the executor is idle and targets are trusted (`targets_untrusted` until a successful confirmation).
+- ~~Every command re-sent all fields~~ FIXED — a field is skipped only when both its cloud target (`settings.u_*`) and the confirmed displayed state already match (a target alone could silently drop a request the UI does not reflect), decided inside the device lock; identical repeats cost zero requests when the executor is idle and targets are trusted (`targets_untrusted` until a successful confirmation).
 - ~~Undelivered writes were lost~~ FIXED — writes are resent once on 429/503/`ClientConnectorError` only; the confirmation GET is a quick single attempt that still recovers a 401.
 - ~~A timed-out refresh waiter could keep joining a hung owner, and a stale owner result could block newer data~~ FIXED — the waiter evicts the owner; a superseded owner drops its result.
 - ~~One failed poll made every entity unavailable (HA drops service calls to unavailable entities)~~ FIXED — availability keyed on `inventory_stale`; listeners notified on failure via `_notify_listeners_safely()`.
 - ~~One device's failed detail fetch failed the whole poll / showed a guessed "off"~~ FIXED — list item published; never-hydrated device stays unavailable.
 - ~~WebSocket backoff reset on every connect~~ FIXED — reset only after a stable connection.
 - ~~Inventory watchdog keyed on last success polled twice as often during outages~~ FIXED — keyed on last attempt.
-- ~~Absent breezers deleted after two polls (re-pairing lost the HA setup)~~ FIXED — kept offline for a 7-day in-memory grace; entities re-added when a removed device returns (unique_id forgotten only once its registry entry is gone).
+- ~~Absent breezers deleted after two polls (re-pairing lost the HA setup)~~ FIXED — kept offline for a 7-day in-memory grace; entities re-added when a removed device returns (unique_id forgotten only once its registry entry is gone); confirmed-absent devices are not re-synced, so a manual removal during the grace sticks.
 
 ### Open / to verify on real hardware
 
@@ -341,4 +341,4 @@ CLAUDE.md's concurrency section documented the removed timestamp-dict mechanism 
 ---
 
 *Concerns audit: 2026-05-02; addenda 2026-07-17, 2026-10-29*
-*All 21 pre-rework concerns resolved (3 original + 17 code review + 1 follow-up cleanup); addendum: 5 fixed, 3 accepted/documented*
+*All 21 pre-rework concerns resolved (3 original + 17 code review + 1 follow-up cleanup); 2026-07-17 addendum: 5 fixed, 3 accepted/documented; 2026-10-29 addendum: 9 fixed, 4 open/to verify*

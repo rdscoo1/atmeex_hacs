@@ -306,6 +306,19 @@ async def test_fan_repeated_identical_speed_sends_nothing():
 
 
 @pytest.mark.asyncio
+async def test_fan_speed_matching_target_but_not_displayed_state_is_sent():
+    # The target says API 1 (HA 2), but the device shows HA speed 5 (e.g. auto
+    # mode drove it): asking for speed 2 must not be silently dropped.
+    fan, api, coordinator = _fan_with_targets(u_pwr_on=True, u_fan_speed=1)
+    coordinator.data["states"]["1"]["fan_speed"] = 5
+
+    await fan.async_set_percentage(29)  # speed 2
+
+    api.set_fan_speed.assert_awaited_once_with(1, 2)
+    api.set_power.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_fan_identical_speed_is_sent_while_slow_command_outlives_pending():
     fan, api, coordinator = _fan_with_targets(u_pwr_on=True, u_fan_speed=2)
 

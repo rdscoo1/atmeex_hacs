@@ -119,22 +119,30 @@ class AtmeexEntityMixin:
             return None
 
     def _fields_to_write(self, desired: Mapping[str, Any]) -> dict[str, Any]:
-        """Return the desired fields whose cloud target differs.
+        """Return the desired fields not already applied.
 
-        Inside a command operation this compares against the target *before*
-        that command (stored settings plus older unconfirmed writes), so a
-        queued predecessor can never make this command skip a needed write.
-        Until a write is confirmed by a successful refresh (after a failed
-        write or a failed confirmation) the stored targets may be stale, so
-        everything is sent.
+        A field is skipped only when BOTH its settled cloud target and the
+        confirmed displayed state (condition) already equal the desired value.
+        The target alone is not enough: auto mode, a physical button or an
+        unacknowledged power target can leave the device showing something
+        else, and the user's request must not be silently dropped.
+
+        Inside a command operation the target is the one *before* that command
+        (stored settings plus older unconfirmed writes), so a queued
+        predecessor can never make this command skip a needed write. Until a
+        write is confirmed by a successful refresh (after a failed write or a
+        failed confirmation) the stored targets may be stale, so everything is
+        sent.
         """
         executor = self._command_executor
         if executor.targets_untrusted(self._device_id):
             return dict(desired)
+        displayed = self._device_state
         return {
             field: value
             for field, value in desired.items()
-            if executor.settled_value(
+            if displayed.get(field) != value
+            or executor.settled_value(
                 self._device_id, field, self._target_setting(field)
             )
             != value
@@ -266,8 +274,15 @@ def setup_dynamic_device_entities(
         data = getattr(coordinator, "data", None) or {}
         device_map = data.get("device_map", {}) or {}
         new_entities: list[Any] = []
+        store = getattr(coordinator, "state_store", None)
+        is_absent = getattr(store, "is_confirmed_absent", None)
 
         for dev in device_map.values():
+            # A confirmed-absent device stays in device_map for the retirement
+            # grace; skip it so a manual removal in that window is not undone.
+            # A returning device clears its absence and is re-added.
+            if callable(is_absent) and is_absent(dev.id):
+                continue
             for entity in build_entities(dev):
                 unique_id = getattr(entity, "unique_id", None) or getattr(
                     entity, "_attr_unique_id", None

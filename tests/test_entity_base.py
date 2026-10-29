@@ -351,7 +351,9 @@ def test_available_honors_inventory_staleness_and_online(stale, online, expected
 
 
 
-async def _dynamic_platform(hass, *, enabled_default: bool = True):
+async def _dynamic_platform(
+    hass, *, enabled_default: bool = True, coordinator=None
+):
     from types import SimpleNamespace
 
     from homeassistant.helpers.entity import Entity
@@ -375,9 +377,12 @@ async def _dynamic_platform(hass, *, enabled_default: bool = True):
         return [entity]
 
     listeners: list = []
-    coordinator = SimpleNamespace(
-        data={"device_map": {"1": AtmeexDevice.from_raw({"id": 1})}},
-        async_add_listener=lambda cb: listeners.append(cb) or (lambda: None),
+    if coordinator is None:
+        coordinator = SimpleNamespace(
+            data={"device_map": {"1": AtmeexDevice.from_raw({"id": 1})}}
+        )
+    coordinator.async_add_listener = (
+        lambda cb: listeners.append(cb) or (lambda: None)
     )
     setup_dynamic_device_entities(
         entry=SimpleNamespace(async_on_unload=lambda cb: None),
@@ -408,6 +413,53 @@ async def test_dynamic_entities_are_re_added_when_removed_from_registry(hass):
     await hass.async_block_till_done()
     assert [e.unique_id for e in submitted] == ["1_x"]
     assert registry.async_get_entity_id("sensor", DOMAIN, "1_x") is not None
+
+
+async def test_confirmed_absent_device_is_not_re_added_after_manual_removal(hass):
+    from homeassistant.helpers import entity_registry as er
+
+    from custom_components.atmeex_cloud.state_store import AtmeexStateStore
+
+    store = AtmeexStateStore()
+    device = AtmeexDevice.from_raw({"id": 1})
+    store.apply_inventory([device], {})
+
+    class _Coordinator:
+        state_store = store
+
+        @property
+        def data(self):
+            return store.data
+
+    _platform, submitted, sync = await _dynamic_platform(
+        hass, coordinator=_Coordinator()
+    )
+    registry = er.async_get(hass)
+    entity_id = registry.async_get_entity_id("sensor", DOMAIN, "1_x")
+    assert entity_id is not None
+    submitted.clear()
+
+    # Two successful polls miss it: confirmed absent, still in device_map
+    # during the retirement grace, so the user may remove it manually.
+    store.apply_inventory([], {})
+    store.apply_inventory([], {})
+    assert store.is_confirmed_absent(1)
+    assert "1" in store.data["device_map"]
+    registry.async_remove(entity_id)
+    await hass.async_block_till_done()
+
+    # The manual removal sticks.
+    sync()
+    await hass.async_block_till_done()
+    assert submitted == []
+    assert registry.async_get_entity_id("sensor", DOMAIN, "1_x") is None
+
+    # The device returns: absence clears and its entity is added again.
+    store.apply_inventory([device], {})
+    assert not store.is_confirmed_absent(1)
+    sync()
+    await hass.async_block_till_done()
+    assert [e.unique_id for e in submitted] == ["1_x"]
 
 
 async def test_dynamic_entities_stay_known_when_removed_with_registry_entry(hass):
