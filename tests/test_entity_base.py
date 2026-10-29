@@ -350,14 +350,23 @@ def test_available_honors_inventory_staleness_and_online(stale, online, expected
 
 
 
-def test_dynamic_entities_are_re_added_when_a_removed_device_returns():
+
+async def _dynamic_platform(hass):
     from types import SimpleNamespace
 
     from homeassistant.helpers.entity import Entity
+    from pytest_homeassistant_custom_component.common import MockEntityPlatform
 
     from custom_components.atmeex_cloud.entity_base import (
         setup_dynamic_device_entities,
     )
+
+    platform = MockEntityPlatform(hass, domain="sensor", platform_name=DOMAIN)
+    submitted: list = []
+
+    def _add(new_entities):
+        submitted.extend(new_entities)
+        hass.async_create_task(platform.async_add_entities(new_entities))
 
     def _build(dev):
         entity = Entity()
@@ -366,34 +375,51 @@ def test_dynamic_entities_are_re_added_when_a_removed_device_returns():
 
     listeners: list = []
     coordinator = SimpleNamespace(
-        data={
-            "device_map": {
-                "1": AtmeexDevice.from_raw({"id": 1}),
-                "2": AtmeexDevice.from_raw({"id": 2}),
-            }
-        },
+        data={"device_map": {"1": AtmeexDevice.from_raw({"id": 1})}},
         async_add_listener=lambda cb: listeners.append(cb) or (lambda: None),
     )
-    added: list = []
     setup_dynamic_device_entities(
         entry=SimpleNamespace(async_on_unload=lambda cb: None),
         coordinator=coordinator,
-        async_add_entities=added.extend,
+        async_add_entities=_add,
         build_entities=_build,
     )
-    first, disabled = added
-    assert [first.unique_id, disabled.unique_id] == ["1_x", "2_x"]
+    await hass.async_block_till_done()
+    return platform, submitted, listeners[0]
 
-    # Device 1 removed together with its entities (HA runs on-remove callbacks);
-    # device 2's entity is disabled, so HA aborted adding it.
-    first._call_on_remove_callbacks()
-    disabled.registry_entry = SimpleNamespace(disabled=True)
-    disabled._call_on_remove_callbacks()
-    added.clear()
 
-    # Device 1 returns with the same cloud ID: its entities are added again,
-    # while the disabled entity is not re-submitted on every update.
-    listeners[0]()
-    assert [e.unique_id for e in added] == ["1_x"]
-    listeners[0]()
-    assert len(added) == 1
+async def test_dynamic_entities_are_re_added_when_removed_from_registry(hass):
+    from homeassistant.helpers import entity_registry as er
+
+    _platform, submitted, sync = await _dynamic_platform(hass)
+    registry = er.async_get(hass)
+    entity_id = registry.async_get_entity_id("sensor", DOMAIN, "1_x")
+    assert entity_id is not None
+    submitted.clear()
+
+    # Device removal deletes the registry entry, which removes the entity.
+    registry.async_remove(entity_id)
+    await hass.async_block_till_done()
+    assert hass.states.get(entity_id) is None
+
+    # The device returns with the same cloud ID: its entity is added again.
+    sync()
+    await hass.async_block_till_done()
+    assert [e.unique_id for e in submitted] == ["1_x"]
+    assert registry.async_get_entity_id("sensor", DOMAIN, "1_x") is not None
+
+
+async def test_dynamic_entities_stay_known_when_removed_with_registry_entry(hass):
+    from homeassistant.helpers import entity_registry as er
+
+    platform, submitted, sync = await _dynamic_platform(hass)
+    submitted.clear()
+
+    # Unload: entities are removed but their registry entries stay.
+    await platform.async_reset()
+    assert er.async_get(hass).async_get_entity_id("sensor", DOMAIN, "1_x")
+
+    # A publication during teardown must not re-submit them.
+    sync()
+    await hass.async_block_till_done()
+    assert submitted == []

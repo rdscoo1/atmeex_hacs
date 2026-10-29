@@ -4,6 +4,7 @@ from collections.abc import Mapping
 from typing import Any, Callable, Iterable
 
 from homeassistant.exceptions import ServiceValidationError
+from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.device_registry import DeviceInfo
 
 from .api import AtmeexDevice
@@ -277,20 +278,27 @@ def setup_dynamic_device_entities(
                 if unique_key in known_unique_ids:
                     continue
                 known_unique_ids.add(unique_key)
-                # Entities removed with their device must be re-added if the
-                # device returns. HA also runs these callbacks when it aborts
-                # adding a disabled entity; keep those known so every update
-                # doesn't re-submit them.
+                # Forget the id only once its entity-registry entry is gone (the
+                # device or entity was removed), so a returning device gets its
+                # entities re-added. Unload, disabled entities and aborted adds
+                # keep their registry entry, so they stay known and are not
+                # re-submitted to a platform that is tearing down or skipping them.
                 if callable(getattr(entity, "async_on_remove", None)):
-                    entity.async_on_remove(
-                        lambda key=unique_key, ent=entity: (
-                            None
-                            if getattr(
-                                getattr(ent, "registry_entry", None), "disabled", False
+
+                    def _forget(key: str = unique_key, ent: Any = entity) -> None:
+                        hass = getattr(ent, "hass", None)
+                        platform = getattr(ent, "platform", None)
+                        if hass is None or platform is None:
+                            return
+                        if (
+                            er.async_get(hass).async_get_entity_id(
+                                platform.domain, platform.platform_name, key
                             )
-                            else known_unique_ids.discard(key)
-                        )
-                    )
+                            is None
+                        ):
+                            known_unique_ids.discard(key)
+
+                    entity.async_on_remove(_forget)
                 new_entities.append(entity)
 
         if new_entities:
