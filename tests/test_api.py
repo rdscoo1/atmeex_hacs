@@ -4,7 +4,7 @@ from dataclasses import FrozenInstanceError
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-from aiohttp import ClientError
+from aiohttp import ClientError, ServerDisconnectedError
 
 from custom_components.atmeex_cloud.api import (
     API_BASE_URL,
@@ -1339,6 +1339,45 @@ async def test_quick_get_device_is_one_short_attempt(monkeypatch):
     assert session.requests[0][4] == API_CONFIRM_TIMEOUT_SEC
 
 
+@pytest.mark.asyncio
+async def test_quick_get_device_recovers_401_once(monkeypatch):
+    session = FakeSession()
+    session.queue_response(FakeResponse(401, text_data="expired"))
+    session.queue_response(FakeResponse(200, json_data={"access_token": "new"}))
+    session.queue_response(FakeResponse(200, json_data={"id": 1}))
+    monkeypatch.setattr(asyncio, "sleep", AsyncMock())
+    api = AtmeexApi(session)
+    api._token = "old"
+    api._email = "user@example.com"
+    api._password = "password"
+
+    device = await api.get_device(1, quick=True)
+
+    assert device.id == 1
+    methods = [request[0] for request in session.requests]
+    assert methods == ["GET", "POST", "GET"]
+    assert session.requests[2][4] == API_CONFIRM_TIMEOUT_SEC
+
+
+@pytest.mark.asyncio
+async def test_put_resend_and_401_share_two_attempt_budget(monkeypatch):
+    session = FakeSession()
+    session.queue_response(FakeResponse(503))
+    session.queue_response(FakeResponse(401, text_data="expired"))
+    session.queue_response(FakeResponse(200, json_data={"access_token": "new"}))
+    session.queue_response(FakeResponse(200))
+    monkeypatch.setattr(asyncio, "sleep", AsyncMock())
+    api = AtmeexApi(session)
+    api._token = "t"
+    api._email = "user@example.com"
+    api._password = "password"
+
+    with pytest.raises(AtmeexAuthenticationError):
+        await api.set_fan_speed(1, 3)
+
+    assert [request[0] for request in session.requests] == ["PUT", "PUT"]
+
+
 def _connector_error():
     from aiohttp import ClientConnectorError
 
@@ -1348,8 +1387,8 @@ def _connector_error():
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "first_failure",
-    [FakeResponse(503), FakeResponse(502), FakeResponse(429), "connector"],
-    ids=["503", "502", "429", "connect-refused"],
+    [FakeResponse(503), FakeResponse(429), "connector"],
+    ids=["503", "429", "connect-refused"],
 )
 async def test_put_is_resent_once_when_provably_undelivered(monkeypatch, first_failure):
     session = FakeSession()
@@ -1370,8 +1409,15 @@ async def test_put_is_resent_once_when_provably_undelivered(monkeypatch, first_f
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "failure",
-    [FakeResponse(500), FakeResponse(504), asyncio.TimeoutError(), ClientError()],
-    ids=["500", "504", "timeout", "client-error"],
+    [
+        FakeResponse(500),
+        FakeResponse(502),
+        FakeResponse(504),
+        asyncio.TimeoutError(),
+        ClientError(),
+        ServerDisconnectedError(),
+    ],
+    ids=["500", "502", "504", "timeout", "client-error", "server-disconnected"],
 )
 async def test_put_is_not_resent_when_it_may_have_applied(monkeypatch, failure):
     session = FakeSession()

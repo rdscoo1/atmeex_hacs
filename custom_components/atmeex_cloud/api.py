@@ -141,10 +141,13 @@ def _error_for_status(
 
 
 def _provably_undelivered(err: AtmeexApiError) -> bool:
-    """True when the cloud cannot have applied the request, so resending is safe."""
+    """True when the cloud cannot have applied the request, so resending is safe.
+
+    502 is excluded: a proxy can return it after the upstream applied the write.
+    """
     return (
         isinstance(err, AtmeexRateLimitError)
-        or err.status in (502, 503)
+        or err.status == 503
         or isinstance(err.__cause__, ClientConnectorError)
     )
 
@@ -655,12 +658,12 @@ class AtmeexApi:
         operation: str,
         json_body: Any | None = None,
         expect_json: bool = True,
-        max_attempts: int | None = None,
-        timeout: float = API_REQUEST_TIMEOUT_SEC,
+        quick: bool = False,
     ) -> Any:
+        """quick=True: one short attempt, plus the single 401 recover+replay."""
         await self._ensure_token()
-        if max_attempts is None:
-            max_attempts = RETRY_MAX_ATTEMPTS if method == "GET" else 2
+        max_attempts = RETRY_MAX_ATTEMPTS if method == "GET" and not quick else 2
+        timeout = API_CONFIRM_TIMEOUT_SEC if quick else API_REQUEST_TIMEOUT_SEC
         retry_delay = RETRY_BASE_DELAY_SEC
         recovered_auth = False
 
@@ -692,7 +695,7 @@ class AtmeexApi:
                 # Writes are resent only when the cloud provably never applied
                 # them; after a timeout or a 500 a late duplicate could race
                 # the user's next command.
-                if attempt == max_attempts or (
+                if quick or attempt == max_attempts or (
                     method != "GET" and not _provably_undelivered(err)
                 ):
                     raise
@@ -832,8 +835,7 @@ class AtmeexApi:
             _device_url(device_id),
             operation="get_device",
             expect_json=True,
-            max_attempts=1 if quick else None,
-            timeout=API_CONFIRM_TIMEOUT_SEC if quick else API_REQUEST_TIMEOUT_SEC,
+            quick=quick,
         )
         if not isinstance(payload, dict):
             raise AtmeexProtocolError(

@@ -1529,8 +1529,8 @@ async def test_refresh_device_coalesces_parallel_requests(monkeypatch):
 async def test_refresh_device_hung_task_times_out_for_second_caller(monkeypatch):
     """A hung in-flight refresh must not block the second caller indefinitely.
 
-    The timeout applies to each shielded waiter without cancelling or evicting
-    the shared owner. This test patches the timeout constant to a tiny value.
+    The timeout applies to each shielded waiter without cancelling the shared
+    owner. This test patches the timeout constant to a tiny value.
     """
     gate = asyncio.Event()          # open in cleanup so inner tasks can finish
     task_started = asyncio.Event()  # signals that the explicit refresh task reached gate.wait()
@@ -1614,3 +1614,70 @@ async def test_refresh_device_hung_task_times_out_for_second_caller(monkeypatch)
     # Unblock the inner task so t1 can finish (avoids lingering tasks)
     gate.set()
     await asyncio.gather(t1, return_exceptions=True)
+
+
+async def test_refresh_device_after_timeout_starts_new_owner(monkeypatch):
+    """A caller arriving after a waiter timed out must not join the stale owner.
+
+    The stale owner may have started before the later caller's write.
+    """
+    gate = asyncio.Event()
+    started = asyncio.Event()
+
+    class FakeApi:
+        def __init__(self, session, *, on_refresh_token_changed=None):
+            self.async_init = AsyncMock()
+            self.refresh_token = None
+            self.login = AsyncMock()
+            self._dev = AtmeexDevice.from_raw({
+                "id": 1, "name": "Dev1", "model": "m",
+                "online": True, "condition": {"pwr_on": 1, "fan_speed": 2}, "settings": {},
+            })
+            self.get_devices = AsyncMock(return_value=[self._dev])
+            self.get_device_calls = 0
+
+        async def get_device(self, _device_id, **_kwargs):
+            self.get_device_calls += 1
+            if self.get_device_calls == 1:
+                started.set()
+                await gate.wait()
+            return self._dev
+
+        @property
+        def token(self):
+            return "tok"
+
+    monkeypatch.setattr(atmeex_init, "AtmeexApi", FakeApi)
+    monkeypatch.setattr(atmeex_init, "async_get_clientsession", lambda hass: object())
+    monkeypatch.setattr(atmeex_init, "_REFRESH_TASK_TIMEOUT_SEC", 0.05)
+    monkeypatch.setattr(atmeex_init, "AtmeexCoordinator", _IntegrationCoordinatorFake)
+
+    hass = SimpleNamespace(
+        data={},
+        async_create_task=asyncio.create_task,
+        config_entries=SimpleNamespace(
+            async_forward_entry_setups=AsyncMock(),
+            async_unload_platforms=AsyncMock(return_value=True),
+        ),
+    )
+    entry = SimpleNamespace(
+        data={"email": "user@example.com", "password": "pwd"},
+        options={"update_interval": 30, "enable_websocket": False},
+        entry_id="entry1",
+        add_update_listener=lambda _listener: (lambda: None),
+        async_on_unload=lambda _cb: None,
+    )
+
+    assert await atmeex_init.async_setup_entry(hass, entry) is True
+    runtime = entry.runtime_data
+    try:
+        with pytest.raises(asyncio.TimeoutError):
+            await runtime.refresh_device(1)
+        assert started.is_set()
+
+        await runtime.refresh_device(1)
+
+        assert runtime.api.get_device_calls == 2
+    finally:
+        gate.set()
+        await asyncio.sleep(0)

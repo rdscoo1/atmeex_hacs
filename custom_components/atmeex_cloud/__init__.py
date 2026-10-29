@@ -58,7 +58,9 @@ _LOGGER = logging.getLogger(__name__)
 _UNLOAD_TASK_TIMEOUT_SEC: float = 5.0
 
 # Upper-bound for awaiting a coalesced in-flight refresh_device task. The
-# confirmation GET is one 10 s attempt; headroom covers a token sign-in (20 s).
+# confirmation GET is one 10 s attempt; a token recovery can push it past this
+# bound, which is harmless: confirmation is best-effort and a timed-out owner
+# is evicted so later callers start a fresh refresh.
 # Module-level so tests can monkeypatch it without touching the closure.
 _REFRESH_TASK_TIMEOUT_SEC: float = 35.0
 
@@ -415,10 +417,17 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                     done.exception()
 
             owner.add_done_callback(remove_owner)
-        await asyncio.wait_for(
-            asyncio.shield(owner),
-            timeout=_REFRESH_TASK_TIMEOUT_SEC,
-        )
+        try:
+            await asyncio.wait_for(
+                asyncio.shield(owner),
+                timeout=_REFRESH_TASK_TIMEOUT_SEC,
+            )
+        except TimeoutError:
+            # The owner may have started before a later caller's write, so a
+            # later caller must never join it.
+            if runtime_data.refresh_tasks.get(key) is owner:
+                runtime_data.refresh_tasks.pop(key, None)
+            raise
 
     command_executor = AtmeexCommandExecutor(
         refresh_device,
