@@ -80,6 +80,7 @@ class _SetupCoordinatorFake:
             "_hydrate_one",
             "_hydrate_devices",
             "_remove_confirmed_stale_devices",
+            "_notify_listeners_safely",
             "_async_update_data",
         ):
             setattr(
@@ -196,6 +197,11 @@ async def test_async_setup_entry_happy_path(monkeypatch):
     assert runtime.state_store.data["states"]["1"]["pwr_on"] is True
     assert runtime.coordinator.data["states"]["1"]["pwr_on"] is True
     assert runtime.coordinator.data["states"]["1"]["fan_speed"] == 4  # API 3 → HA 4
+    # Optimistic pending values must re-render entities via the coordinator.
+    assert (
+        runtime.command_executor._on_change
+        == runtime.coordinator.async_update_listeners
+    )
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(

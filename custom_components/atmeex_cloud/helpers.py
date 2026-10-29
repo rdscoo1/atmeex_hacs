@@ -142,6 +142,9 @@ def breezer_mode_from_state(damp_pos: Any, pwr_on: Any) -> str | None:
 
     supply_valve is virtual: power off with the damper at 0 (see
     AtmeexApi.set_breezer_mode). Unknown combinations map to None.
+    A plain power-off with the damper at 0 is indistinguishable from
+    supply_valve, so it is reported as supply_valve (matching the official
+    app); this is intentional, not a bug.
     """
     if not isinstance(damp_pos, int) or isinstance(damp_pos, bool):
         return None

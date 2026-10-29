@@ -68,7 +68,7 @@ class AtmeexCommandExecutor:
         try:
             self._on_change()
         except Exception:  # noqa: BLE001 - a UI refresh must never fail a command
-            _LOGGER.debug("Atmeex pending-state notification failed")
+            _LOGGER.debug("Atmeex pending-state notification failed", exc_info=True)
 
     @staticmethod
     def _device_key(device_id: int | str) -> str:

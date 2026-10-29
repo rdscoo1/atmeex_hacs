@@ -310,6 +310,28 @@ async def test_update_data_maps_typed_auth_error_to_config_entry_auth_failed():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("error", "expected"),
+    [
+        (AtmeexConnectionError("get_devices", "offline"), UpdateFailed),
+        (
+            AtmeexAuthenticationError("get_devices", "rejected", status=401),
+            ConfigEntryAuthFailed,
+        ),
+    ],
+)
+async def test_failing_listener_does_not_mask_typed_poll_error(error, expected):
+    coord, api = _make_coordinator()
+    api.get_devices = AsyncMock(side_effect=error)
+    coord.async_update_listeners = MagicMock(side_effect=RuntimeError("boom"))
+
+    with pytest.raises(expected, match="get_devices failed"):
+        await coord._async_update_data()
+
+    coord.async_update_listeners.assert_called_once_with()
+
+
+@pytest.mark.asyncio
 async def test_primary_unexpected_exception_propagates():
     """A non-network exception from the primary get_devices call must propagate.
 

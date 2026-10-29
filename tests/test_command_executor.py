@@ -935,7 +935,7 @@ async def test_on_change_publishes_pending_before_the_write_and_after_it():
 
     # Optimistic value is published before the remote write starts.
     assert seen[:2] == [5, "write"]
-    assert len(seen) == 3
+    assert seen == [5, "write", 5]
 
 
 @pytest.mark.asyncio

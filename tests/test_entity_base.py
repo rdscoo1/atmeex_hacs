@@ -351,7 +351,7 @@ def test_available_honors_inventory_staleness_and_online(stale, online, expected
 
 
 
-async def _dynamic_platform(hass):
+async def _dynamic_platform(hass, *, enabled_default: bool = True):
     from types import SimpleNamespace
 
     from homeassistant.helpers.entity import Entity
@@ -371,6 +371,7 @@ async def _dynamic_platform(hass):
     def _build(dev):
         entity = Entity()
         entity._attr_unique_id = f"{dev.id}_x"
+        entity._attr_entity_registry_enabled_default = enabled_default
         return [entity]
 
     listeners: list = []
@@ -423,3 +424,20 @@ async def test_dynamic_entities_stay_known_when_removed_with_registry_entry(hass
     sync()
     await hass.async_block_till_done()
     assert submitted == []
+
+
+async def test_disabled_dynamic_entity_is_submitted_only_once(hass):
+    from homeassistant.helpers import entity_registry as er
+
+    _platform, submitted, sync = await _dynamic_platform(
+        hass, enabled_default=False
+    )
+    # The platform skips the disabled entity but keeps its registry entry.
+    assert er.async_get(hass).async_get_entity_id("sensor", DOMAIN, "1_x")
+
+    sync()
+    await hass.async_block_till_done()
+    sync()
+    await hass.async_block_till_done()
+
+    assert [e.unique_id for e in submitted] == ["1_x"]

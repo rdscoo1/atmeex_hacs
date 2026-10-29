@@ -82,6 +82,7 @@ class DummyCoordinator:
             "_hydrate_one",
             "_hydrate_devices",
             "_remove_confirmed_stale_devices",
+            "_notify_listeners_safely",
             "_async_update_data",
         ):
             setattr(

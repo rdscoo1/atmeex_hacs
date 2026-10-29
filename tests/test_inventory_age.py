@@ -7,6 +7,9 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+from homeassistant.helpers.update_coordinator import UpdateFailed
+
+from custom_components.atmeex_cloud.api import AtmeexConnectionError
 from custom_components.atmeex_cloud.coordinator import AtmeexCoordinator
 from custom_components.atmeex_cloud.state_store import AtmeexStateStore
 
@@ -73,3 +76,17 @@ async def test_failing_polls_are_not_doubled_by_the_watchdog(hass) -> None:
 
     assert forced is False
     coordinator.async_request_refresh.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_failed_poll_still_stamps_inventory_attempt(hass) -> None:
+    coordinator = _coordinator(hass)
+    coordinator.api.get_devices = AsyncMock(
+        side_effect=AtmeexConnectionError("get_devices", "offline")
+    )
+
+    with pytest.raises(UpdateFailed):
+        await coordinator._async_update_data()
+
+    assert coordinator.last_inventory_attempt_mono is not None
+    assert coordinator.last_inventory_success_mono is None

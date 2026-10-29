@@ -1058,6 +1058,31 @@ async def test_immediately_closed_connection_grows_backoff():
 
 
 @pytest.mark.asyncio
+async def test_transport_error_while_listening_is_counted_once():
+    """A ClientError mid-listen is one transport failure, not two."""
+
+    class _ErroringWebSocket(_FakeWebSocket):
+        async def __anext__(self):
+            raise aiohttp.ClientError("reset")
+
+    class _ErroringSession:
+        async def ws_connect(self, *args, **kwargs):
+            return _ErroringWebSocket()
+
+    cfg = WebSocketConfig(reconnect_delay_min=1.0, reconnect_delay_max=60.0)
+    manager = _manager(_ErroringSession(), config=cfg)
+    manager._transport_failures = 3
+    manager._reconnect_delay = 8.0
+
+    assert await manager._connect_once() is True
+    await manager._listen_task
+
+    assert manager._transport_failures == 4
+    assert manager._reconnect_delay == 16.0
+    await manager.disconnect()
+
+
+@pytest.mark.asyncio
 async def test_backoff_resets_after_stable_connection_even_after_prior_auth_failure():
     """Transport backoff resets independently from application authentication."""
 

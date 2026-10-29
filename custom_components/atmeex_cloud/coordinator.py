@@ -415,6 +415,16 @@ class AtmeexCoordinator(DataUpdateCoordinator[AtmeexCoordinatorData]):
             await asyncio.sleep(interval)
             await self.async_ensure_inventory_fresh()
 
+    def _notify_listeners_safely(self) -> None:
+        """Notify listeners without letting a listener mask the poll error."""
+        try:
+            self.async_update_listeners()
+        except Exception as err:  # noqa: BLE001
+            self.logger.warning(
+                "Atmeex listener update failed: %s",
+                type(err).__name__,
+            )
+
     async def _async_update_data(self) -> AtmeexCoordinatorData:
         """Fetch one authoritative inventory or report a truthful failure."""
         self.last_inventory_attempt_mono = time.monotonic()
@@ -434,7 +444,7 @@ class AtmeexCoordinator(DataUpdateCoordinator[AtmeexCoordinatorData]):
             self._fire_api_error_event(self._safe_error_event(err))
             # HA notifies listeners only when success flips, so re-check
             # entity availability (inventory_stale) on every failure.
-            self.async_update_listeners()
+            self._notify_listeners_safely()
             raise ConfigEntryAuthFailed(
                 f"{err.operation} failed"
             ) from err
@@ -445,7 +455,7 @@ class AtmeexCoordinator(DataUpdateCoordinator[AtmeexCoordinatorData]):
         ) as err:
             self.last_api_error = err
             self._fire_api_error_event(self._safe_error_event(err))
-            self.async_update_listeners()
+            self._notify_listeners_safely()
             raise UpdateFailed(f"{err.operation} failed") from err
 
         # Disassociate only devices the store confirmed absent across two
