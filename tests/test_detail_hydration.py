@@ -325,6 +325,38 @@ async def test_detail_failure_without_previous_publishes_list_item(
     assert set(result["device_map"]) == {"1", "2"}
     assert coordinator.last_inventory_success_mono is not None
     assert isinstance(coordinator.last_api_error, AtmeexConnectionError)
+    # Unknown power state must not read as a real "off".
+    assert result["states"]["1"]["online"] is False
+    assert result["states"]["2"]["online"] is True
+    assert coordinator._last_detail_failure_count == 1
+
+
+@pytest.mark.asyncio
+async def test_list_only_device_stays_offline_until_detail_succeeds(
+    hass,
+) -> None:
+    api = AsyncMock()
+    api.get_devices.return_value = [_device(1)]
+    api.get_device.side_effect = AtmeexConnectionError(
+        "get_device",
+        "detail unavailable",
+    )
+    coordinator = _coordinator(hass, api, store=AtmeexStateStore())
+
+    result = await coordinator._async_update_data()
+    assert result["states"]["1"]["online"] is False
+
+    # A second failure must not re-overlay the list's online=True onto the
+    # list-only item published by the first poll.
+    result = await coordinator._async_update_data()
+    assert result["states"]["1"]["online"] is False
+
+    api.get_device.side_effect = None
+    api.get_device.return_value = _complete(1, fan_speed=4)
+    result = await coordinator._async_update_data()
+    assert result["states"]["1"]["online"] is True
+    assert result["states"]["1"]["pwr_on"] is True
+    assert result["states"]["1"]["fan_speed"] == 5  # API speed 4 -> HA speed 5
 
 
 @pytest.mark.asyncio

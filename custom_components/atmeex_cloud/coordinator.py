@@ -257,10 +257,14 @@ class AtmeexCoordinator(DataUpdateCoordinator[AtmeexCoordinatorData]):
             AtmeexProtocolError,
         ) as err:
             previous = self._previous_device(listed)
-            if previous is None:
-                # No earlier detail to reuse: publish the list item as-is
-                # rather than failing every device (and, at startup, setup).
-                return listed, err
+            if previous is None or self._needs_detail(previous):
+                # No real detail yet: publish the list item rather than
+                # failing every device (and, at startup, setup), but keep it
+                # unavailable instead of showing a guessed "off" state.
+                return (
+                    AtmeexDevice.from_raw({**listed.to_ha_dict(), "online": False}),
+                    err,
+                )
             return self._merge_detail_source(listed, previous), err
 
     @staticmethod
