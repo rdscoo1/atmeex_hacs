@@ -115,6 +115,7 @@ class AtmeexCoordinator(DataUpdateCoordinator[AtmeexCoordinatorData]):
         self.last_api_error: AtmeexApiError | None = None
         self.last_success_ts: float | None = None
         self.last_inventory_success_mono: float | None = None
+        self.last_inventory_attempt_mono: float | None = None
         self.avg_latency_ms: float | None = None
         self.request_retries = 0
         self._max_inventory_age_seconds = update_interval.total_seconds()
@@ -379,17 +380,19 @@ class AtmeexCoordinator(DataUpdateCoordinator[AtmeexCoordinatorData]):
         *,
         now_mono: float | None = None,
     ) -> bool:
-        """Force an authoritative refresh if the inventory is older than the age cap.
+        """Force an authoritative refresh if no poll was attempted recently.
 
         Continuous WebSocket push traffic keeps device *state* fresh without any
         authoritative ``/devices`` poll, so a removed or renamed device could
-        otherwise linger indefinitely. Returns True when a refresh was requested.
+        otherwise linger indefinitely. Keyed on the last *attempt*, so a cloud
+        outage (scheduled polls failing) is not polled twice as often.
+        Returns True when a refresh was requested.
         """
         now = time.monotonic() if now_mono is None else now_mono
-        last_success = self.last_inventory_success_mono
+        last_attempt = self.last_inventory_attempt_mono
         if (
-            last_success is not None
-            and now - last_success < self._max_inventory_age_seconds
+            last_attempt is not None
+            and now - last_attempt < self._max_inventory_age_seconds
         ):
             return False
         await self.async_request_refresh()
@@ -414,6 +417,7 @@ class AtmeexCoordinator(DataUpdateCoordinator[AtmeexCoordinatorData]):
 
     async def _async_update_data(self) -> AtmeexCoordinatorData:
         """Fetch one authoritative inventory or report a truthful failure."""
+        self.last_inventory_attempt_mono = time.monotonic()
         baselines = self.state_store.capture_all()
         started = time.perf_counter()
         self._last_detail_error = None

@@ -54,6 +54,7 @@ class DummyCoordinator:
         self.last_api_error = kwargs.get("last_api_error")
         self.last_success_ts = kwargs.get("last_success_ts")
         self.last_inventory_success_mono = None
+        self.last_inventory_attempt_mono = None
         self.avg_latency_ms = None
         self.request_retries = 0
         # Extra counter used by some WS tests
