@@ -10,7 +10,7 @@ BREEZER_MODES = [
 HUMIDIFICATION_OPTIONS = ["off", "1", "2", "3"]
 
 API_BASE_URL = "https://api.iot.atmeex.com"
-INTEGRATION_VERSION = "0.10.0"
+INTEGRATION_VERSION = "0.11.0"
 USER_AGENT = f"AtmeexCloudHomeAssistant/{INTEGRATION_VERSION}"
 API_REQUEST_TIMEOUT_SEC = 20
 # Post-command confirmation GET: best effort, so one short attempt.
